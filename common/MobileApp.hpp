@@ -1,0 +1,118 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#pragma once
+
+#if MOBILEAPP
+
+#include <wsd/Storage.hpp>
+
+#include <memory>
+#include <optional>
+
+#ifdef IOS
+#import "CODocument.h"
+#import <set>
+#import <string>
+#endif
+
+// On iOS at least we want to be able to have several documents open in the same app process.
+
+// It is somewhat complicated to make sure we access the same COKit object for the document
+// in both the iOS-specific Objective-C++ code and in the mostly generic Online C++ code.
+
+// We pass around a numeric ever-increasing document identifier that gets bumped for each document
+// the system asks the app to open.
+
+// On iOS the counter is the static std::atomic<unsigned> appDocIdCounter in CODocument.mm,
+// on Android it is the static appDocIdCounter in androidapp.cpp.
+
+// In practice it will probably be equivalent to the DocumentBroker::DocBrokerId or the number that
+// the core SfxViewShell::GetDocId() returns, but there might be situations where multi-threading
+// and opening of several documents in sequence very quickly might cause discrepancies, so it is
+// better to use a different counter to be sure. Patches to use just one counter welcome.
+
+struct COKitDocument;
+
+class DocumentData
+{
+private:
+public:
+    DocumentData() :
+        loKitDocument(nullptr)
+#ifdef IOS
+        , coDocument(nil)
+#endif
+    {
+    }
+
+    /// The engine document, null until the kit's load has returned it and after a failed load.
+    COKitDocument *loKitDocument;
+
+    static DocumentData &allocate(unsigned docId);
+    static DocumentData &get(unsigned docId);
+    static DocumentData *getIfExists(unsigned docId);
+    static COKitDocument *loadedKitDocument(unsigned docId);
+    /// A copy of this document's entry, or nothing. The copy outlives the entry.
+    static std::optional<DocumentData> getCopy(unsigned docId);
+    static void deallocate(unsigned docId);
+    static int count();
+
+#ifdef IOS
+    CODocument *coDocument;
+#endif
+    std::weak_ptr<DocumentBroker> docBroker;
+    // Set for a document that is open in an integrator's editor frame (whose page comes from the
+    // remote server's origin):
+    bool inEditorFrame = false;
+};
+
+#if !ENABLE_WOPI
+
+/// Stub/Dummy WOPI types/interface.
+class WOPIFileInfo final : public StorageBase::FileInfo
+{
+public:
+    enum class TriState : std::uint8_t
+    {
+        False,
+        True,
+        Unset
+    };
+
+    std::string getTemplateSource() const { return std::string(); }
+    std::vector<std::string> getThumbnailSizes() const { return {}; }
+
+    bool getDisablePrint() const { return false; }
+    bool getDisableExport() const { return false; }
+    bool getDisableCopy() const { return false; }
+    bool getEnableOwnerTermination() const { return false; }
+    bool getIsUserRestricted() const { return false; }
+    std::string getRestrictedCommands() const { return std::string(); }
+    std::string getWatermarkText() const { return std::string(); }
+    bool allowsCleanExport() const { return true; }
+
+    TriState getDisableChangeTrackingShow() const { return TriState::Unset; }
+    TriState getDisableChangeTrackingRecord() const { return TriState::Unset; }
+    TriState getHideChangeTrackingControls() const { return TriState::Unset; }
+};
+
+class WopiStorage : public StorageBase
+{
+public:
+    using WOPIFileInfo = ::WOPIFileInfo;
+};
+
+#endif // !ENABLE_WOPI
+
+#endif
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

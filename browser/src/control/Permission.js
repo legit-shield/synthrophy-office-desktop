@@ -1,0 +1,993 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+/*
+ * Document permission handler
+ */
+/* global app $ _ */
+window.L.Map.include({
+	readonlyStartingFormats: {
+		'txt': { canEdit: true, odfFormat: 'odt' },
+		'csv': { canEdit: true, odfFormat: 'ods' },
+		'xlsb': { canEdit: false, odfFormat: 'ods' }
+	},
+
+	setPermission: function (perm) {
+		var button = $('#mobile-edit-button');
+		button.off('click');
+		button.attr('tabindex', 0);
+		button.attr('role', 'button');
+		button.attr('title', _('Edit document'));
+		button.attr('aria-label', _('Edit document'));
+		// app.file.fileBasedView is new view that has continuous scrolling
+		// used for PDF and we don't permit editing for PDFs
+		// this._shouldStartReadOnly() is a check for files that should start in readonly mode and even on desktop browser
+		// we warn the user about loosing the rich formatting and offer an option to
+		// save as ODF instead of the current format
+		//
+		// For mobile we need to display the edit button for all the cases except for PDF (which is read-only)
+		// we offer save-as to another place where the user can edit the document
+		// The mobile apps use local storage not WOPI, so BaseFileName will be empty.
+		// Fall back to the document URL which ends with the file name.
+		var fileName = this['wopi'].BaseFileName || this.options.doc || '';
+		var isPDF = fileName.toLowerCase().endsWith('.pdf');
+		// A hybrid PDF, which carries the document it was made from, opens read-only like any PDF
+		// until the server finds that document. The first edit permission after that is when the
+		// document really opens, so it gets the same start as any other document.
+		const hybridPDFOpens = app.file.isHybridPDF && perm === 'edit' && !this._hybridPDFOpened;
+		if (hybridPDFOpens)
+			this._hybridPDFOpened = true;
+		const viewOnlyPDF = isPDF && !app.file.isHybridPDF;
+		const mobileLayout = window.mode.isSmallScreenDevice() || window.mode.isTablet();
+		if (!viewOnlyPDF && mobileLayout) {
+			button.css('display', 'flex');
+		} else {
+			button.hide();
+		}
+		var that = this;
+		if (perm === 'edit') {
+			// The opt-in gate applies when the doc is first opened. Later
+			// calls honor what was asked, except that on a mobile layout a
+			// view in the read-only stage stays there with its edit button.
+			const firstOpen = this._permission === undefined || hybridPDFOpens;
+			const stayReadOnly = !firstOpen && this._permission === 'readonly' && mobileLayout;
+			if (this.options.canTryLock) {
+				// This is a success response to an attempt to lock using mobile-edit-button
+				this._switchToEditMode();
+			}
+			else if ((firstOpen && (this._shouldStartReadOnly() || mobileLayout)) || stayReadOnly) {
+				button.on('click', function () {
+					that._switchToEditMode();
+				});
+
+				// temporarily, before the user touches the floating action button
+				this._enterReadOnlyMode('readonly');
+			}
+			else {
+				// Edit mode has no use for the button.
+				button.hide();
+				this._sendEditingStarted();
+				this._enterEditMode(perm);
+			}
+		}
+		else if (perm === 'view' || perm === 'readonly') {
+			// View mode during an outage or a migration ends with the
+			// reconnect, which chooses the mode again. The button stays
+			// hidden until then.
+			const reconnectPending = window.migrating || (app.socket && !app.socket.connected());
+			if (perm === 'view' && reconnectPending) {
+				button.hide();
+			}
+			else if (this.isLockedReadOnlyUser()) {
+				button.on('click', function () {
+					that.openUnlockPopup();
+				});
+			}
+			else if (window.ThisIsTheAndroidApp) {
+				button.on('click', function () {
+					that._requestFileCopy();
+				});
+			} else if (!window.ThisIsAnApp && !this['wopi'].UserCanWrite) {
+				$('#mobile-edit-button').hide();
+			} else if (mobileLayout) {
+				// Writeable user stepped back from edit to readonly: keep the FAB
+				// visible so they can re-enter edit mode.
+				button.on('click', function () {
+					that._switchToEditMode();
+				});
+			}
+
+			this._enterReadOnlyMode(perm);
+		}
+	},
+
+	onLockFailed: function(reason) {
+		if (this.options.canTryLock === undefined) {
+			// This is the initial notification. This status is not permanent.
+			// Allow to try to lock the file for edit again.
+			this.options.canTryLock = true;
+
+			var alertMsg = _('The document could not be locked, and is opened in read-only mode.');
+			if (reason) {
+				alertMsg += '\n' + _('Server returned this reason:') + '\n"' + reason + '"';
+			}
+			this.uiManager.showConfirmModal('lock_failed_message', '', alertMsg, _('OK'), function() {
+				app.socket.sendMessage('attemptlock');
+			}, true);
+		}
+		else if (this.options.canTryLock) {
+			// This is a failed response to an attempt to lock using mobile-edit-button
+			alertMsg = _('The document could not be locked.');
+			if (reason) {
+				alertMsg += '\n' + _('Server returned this reason:') + '\n"' + reason + '"';
+			}
+			this.uiManager.showConfirmModal('lock_failed_message', '', alertMsg, _('OK'), null, true);
+		}
+		// do nothing if this.options.canTryLock is defined and is false
+	},
+
+	_getFileExtension: function (filename) {
+		return filename.substring(filename.lastIndexOf('.') + 1);
+	},
+
+	_shouldStartReadOnly: function () {
+		if (this.isLockedReadOnlyUser())
+			return true;
+		if (window.coolParams.get('startreadonly') === 'true') {
+			return true;
+		}
+		var fileName = this['wopi'].BaseFileName;
+		// use this feature for only integration.
+		if (!fileName) return false;
+		var extension = this._getFileExtension(fileName).toLowerCase();
+		
+		// Check if this is a view mode format from server configuration
+		if (app.isViewModeExtension(extension)) return true;
+		
+		if (!Object.prototype.hasOwnProperty.call(this.readonlyStartingFormats, extension))
+			return false;
+		return true;
+	},
+
+	_proceedEditMode: function() {
+		var fileName = this['wopi'].BaseFileName;
+		if (fileName) {
+			var extension = this._getFileExtension(fileName);
+			var extensionInfo = this.readonlyStartingFormats[extension];
+			if (extensionInfo && !extensionInfo.canEdit)
+				return;
+		}
+
+		// The document has a separate password for editing, and each view has to enter it itself.
+		if (this._docHasPasswordToModify && !this._modifyPasswordProvided) {
+			this._askForPasswordToModify(false);
+			return;
+		}
+
+		this.options.canTryLock = false; // don't respond to lockfailed anymore
+		$('#mobile-edit-button').hide();
+		this._enterEditMode('edit');
+		if (window.mode.isSmallScreenDevice() || window.mode.isTablet() || window.mode.isCODesktop()) {
+			this.fire('editorgotfocus');
+			this.fire('closemobilewizard');
+		}
+
+		// Defer focus until the layouting queue drains; on desktop the
+		// notebookbar dropdown queues a task on close that would otherwise
+		// steal focus back. In the iOS/android app, just clicking the
+		// mobile-edit-button is not reason enough to pop up the on-screen
+		// keyboard, so skip the focus there. With a physical keyboard there is
+		// no on-screen keyboard to pop up, and taking the focus is what lets
+		// typing reach the document straight away.
+		const holdBackFocusForOnscreenKeyboard =
+			(window.ThisIsTheiOSApp || window.ThisIsTheAndroidApp)
+			&& !window.keyboard.hardwareKeyboardAttached;
+		if (!holdBackFocusForOnscreenKeyboard)
+			app.layoutingService.onDrain(this.focus.bind(this));
+	},
+
+	// Ask for the password that makes the document editable, and continue into
+	// edit mode once it is sent.
+	_askForPasswordToModify: function (wrongPassword) {
+		const msg = wrongPassword
+			? _('Wrong password provided. Please try again.')
+			: _('Document requires a password to edit.');
+
+		const that = this;
+
+		// On a retry after a wrong password the button was hidden when edit
+		// mode was first entered. The document is read-only while this prompt
+		// is open, so bring the edit button back.
+		if (window.mode.isSmallScreenDevice() || window.mode.isTablet()) {
+			const button = $('#mobile-edit-button');
+			button.css('display', 'flex');
+			button.off('click');
+			button.on('click', function () {
+				that._switchToEditMode();
+			});
+		}
+
+		this.uiManager.showInputModal(
+			'modify-password-popup',
+			'',
+			msg,
+			'',
+			_('OK'),
+			function (data) {
+				if (data) {
+					app.socket.sendMessage(
+						'editwithpassword password=' + encodeURIComponent(data),
+					);
+				} else {
+					setTimeout(function() {
+						that._askForPasswordToModify(true);
+					}, 0);
+				}
+			},
+			true,
+		);
+	},
+
+	_offerSaveAs: function() {
+		var fileName = this['wopi'].BaseFileName;
+		if (!fileName) return false;
+		var extension = this._getFileExtension(fileName);
+		var extensionInfo = this.readonlyStartingFormats[extension];
+		var saveAsFormat = extensionInfo.odfFormat;
+
+		this.wopi.requestSaveAsName(fileName, saveAsFormat, this.saveAs.bind(this));
+	},
+
+	// Show dialog when in WASM mode asking user to choose between
+	// editing locally (WASM) or joining collaborative editing (server).
+	// Show a two-column "card" dialog with a title, a subtitle,
+	// and two side-by-side options each with a heading, a short
+	// description, and a button.  If @p titleAvatar is a non-empty
+	// URL, it is rendered as a circular image to the left of the
+	// title (used for "X started editing").  Styling is applied by
+	// CSS via the #collab-choice-dialog id.
+	// @p title may be either a plain string or an object
+	//   { name: '...', rest: '...' }
+	// In the latter case, and when @p titleAvatar is set,
+	// the avatar + name are wrapped in a pill and the rest
+	// of the title text follows outside the pill.
+	_showTwoCardDialog: function (id, title, subtitle, cards, titleAvatar) {
+		var dialogId = this.uiManager.generateModalId(id);
+		// The same dialog again (as when a user joins and starts editing at once) keeps the one
+		// that is shown or still being built (as a second build would replace its wired cards):
+		if (document.getElementById(dialogId)
+			|| (this.jsdialog && this.jsdialog.dialogs[dialogId]))
+		{
+			return;
+		}
+		var that = this;
+
+		var titleChildren = [];
+		if (typeof title === 'object' && titleAvatar) {
+			titleChildren.push({
+				id: 'collab-choice-pill',
+				type: 'container',
+				vertical: false,
+				children: [
+					{
+						id: 'collab-choice-avatar',
+						type: 'image',
+						image: titleAvatar,
+						text: ''
+					},
+					{
+						id: 'collab-choice-name',
+						type: 'fixedtext',
+						text: title.name
+					}
+				]
+			});
+			titleChildren.push({
+				id: 'collab-choice-title',
+				type: 'fixedtext',
+				text: title.rest
+			});
+		}
+		else {
+			if (titleAvatar) {
+				titleChildren.push({
+					id: 'collab-choice-avatar',
+					type: 'image',
+					image: titleAvatar,
+					text: ''
+				});
+			}
+			titleChildren.push({
+				id: 'collab-choice-title',
+				type: 'fixedtext',
+				text: (typeof title === 'object' ?
+					(title.name + ' ' + title.rest) : title)
+			});
+		}
+
+		// Icon paths in c.icon are theme-agnostic stems
+		// ('images/coda-collab-<name>'); pick the dark or light
+		// variant once, here at build time, based on the current
+		// dark-theme pref.  The dialog is modal and short-lived, so
+		// a theme change mid-decision (which would leave the icon
+		// stale) is not worth optimising for.
+		var darkTheme = window.prefs.getBoolean('darkTheme');
+		var iconSuffix = darkTheme ? '-dark.svg' : '-light.svg';
+
+		var cardWidgets = cards.map(function (c) {
+			return {
+				id: c.id + '-card',
+				type: 'container',
+				vertical: true,
+				children: [
+					{
+						id: c.id + '-card-icon',
+						type: 'image',
+						image: c.icon + iconSuffix,
+						text: ''
+					},
+					{
+						id: c.id + '-card-heading',
+						type: 'fixedtext',
+						text: c.heading
+					},
+					{
+						id: c.id + '-card-description',
+						type: 'fixedtext',
+						text: c.description
+					}
+				]
+			};
+		});
+
+		var json = {
+			id: dialogId,
+			dialogid: id,
+			type: 'modalpopup',
+			title: '',
+			hasClose: false,
+			hasOverlay: true,
+			cancellable: false,
+			jsontype: 'dialog',
+			'init_focus_id': 'response',
+			children: [{
+				id: 'collab-choice-dialog',
+				type: 'container',
+				vertical: true,
+				children: [
+					{
+						id: 'collab-choice-title-row',
+						type: 'container',
+						vertical: false,
+						children: titleChildren
+					},
+					{
+						id: 'collab-choice-subtitle',
+						type: 'fixedtext',
+						text: subtitle
+					},
+					{
+						id: 'collab-choice-cards',
+						type: 'container',
+						vertical: false,
+						children: cardWidgets
+					}
+				]
+			}]
+		};
+
+		this.uiManager.showModal(json, []);
+		// The cards are wired only while this build is the dialog registered under its ID (a close
+		// before it rendered, or a later build after such a close, ends the wait):
+		const registered = this.jsdialog && this.jsdialog.dialogs[dialogId];
+
+		// The jsdialog builder renders the dialog asynchronously, so the card containers (and
+		// the avatar <img>, if any) only exist some short time after showModal returns; poll
+		// briefly for them and wire up the click and image-error handlers once present.
+		var tries = 0;
+		var wire = function () {
+			if (that.jsdialog && that.jsdialog.dialogs[dialogId] !== registered) {
+				return;
+			}
+			var anyMissing = false;
+			cards.forEach(function (c) {
+				var card = document.getElementById(c.id + '-card');
+				if (!card) {
+					anyMissing = true;
+					return;
+				}
+				if (card.dataset.codaCollabCardWired) return;
+				card.dataset.codaCollabCardWired = '1';
+				card.setAttribute('role', 'button');
+				card.setAttribute('tabindex', '0');
+				card.addEventListener('click', function () {
+					that.uiManager.closeModal(dialogId);
+					c.onClick();
+				});
+				card.addEventListener('keydown', function (e) {
+					if (e.key === 'Enter' || e.key === ' ') {
+						e.preventDefault();
+						that.uiManager.closeModal(dialogId);
+						c.onClick();
+					}
+				});
+			});
+			if (titleAvatar) {
+				var img = document.getElementById('collab-choice-avatar');
+				if (!img) {
+					anyMissing = true;
+				} else if (!img.dataset.codaCollabAvatarWired) {
+					img.dataset.codaCollabAvatarWired = '1';
+					img.onerror = function () { img.style.display = 'none'; };
+					if (img.complete && img.naturalWidth === 0)
+						img.style.display = 'none';
+				}
+			}
+			if (anyMissing && ++tries < 50) {
+				setTimeout(wire, 50);
+			}
+		};
+		setTimeout(wire, 0);
+	},
+
+	// Offer the choice between editing locally (changes sync on save) or starting a
+	// collaborative session (all users edit together in real-time).
+	_showCollabEditChoiceDialog: function (title, subtitle, onEditLocally, titleAvatar) {
+		var that = this;
+		this._showTwoCardDialog(
+			'wasm-edit-choice-modal',
+			title,
+			subtitle,
+			[
+				{
+					id: 'edit-locally',
+					icon: 'images/coda-collab-local-editing',
+					heading: _('Edit locally'),
+					description: _('Changes sync when you save'),
+					onClick: onEditLocally
+				},
+				{
+					id: 'start-collaborative',
+					icon: 'images/coda-collab-collaborative-editing',
+					heading: _('Collaborative editing'),
+					description: _('Edit together in real-time'),
+					onClick: function () { that._saveAndSwitchToServerMode(); }
+				}
+			],
+			titleAvatar
+		);
+	},
+
+	// Show a "keep viewing vs. join collab editing" choice using
+	// the two-card layout.  Used both when another user has just
+	// started editing and when a collaborative session is already
+	// active - only the title/subtitle (and optional avatar image
+	// shown next to the title) differ.
+	_showCollabJoinDialog: function (title, subtitle, avatar) {
+		var that = this;
+		this._showTwoCardDialog(
+			'collab-join-modal',
+			title,
+			subtitle,
+			[
+				{
+					id: 'collab-keep-viewing',
+					icon: 'images/coda-collab-local-viewing',
+					heading: _('Keep viewing local copy'),
+					description: _('Continue with your version'),
+					onClick: function () {
+						// Stay in current WASM read-only mode.
+					}
+				},
+				{
+					id: 'collab-join',
+					icon: 'images/coda-collab-collaborative-editing',
+					heading: _('Join collaborative editing'),
+					description: _('Edit together in real-time'),
+					onClick: function () {
+						if (window.collab.editingActive) {
+							// Someone is editing locally - ask them to
+							// save and switch, then wait.
+							that._waitForCollabSave();
+							window.collab.sendMessage({type: 'switch_to_collab'});
+						} else {
+							// No active editor - just switch directly.
+							window.switchToServerMode();
+						}
+					}
+				}
+			],
+			avatar
+		);
+	},
+
+	// Start waiting for the local editor to save and switch.
+	// Shows a busy indicator and sets a timeout so we switch
+	// even if the editor does not respond (e.g., they have a
+	// dialog open or have already left).
+	_waitForCollabSave: function () {
+		this._waitingForCollabSwitch = true;
+		this.fire('showbusy', {
+			label: _('Waiting for changes to be saved...')
+		});
+		var that = this;
+		this._collabSaveTimeout = setTimeout(function () {
+			that._finishCollabSwitch();
+		}, 10000);
+	},
+
+	// Called when the wait is over (editor saved, timed out, or
+	// all other users left).  Cleans up and switches.
+	_finishCollabSwitch: function () {
+		if (!this._waitingForCollabSwitch)
+			return;
+		this._waitingForCollabSwitch = false;
+		if (this._collabSaveTimeout) {
+			clearTimeout(this._collabSaveTimeout);
+			this._collabSaveTimeout = null;
+		}
+		this.fire('hidebusy');
+		window.switchToServerMode();
+	},
+
+	// The local editor has saved and is switching to server mode.
+	_onEditorSavedAndSwitching: function () {
+		this._finishCollabSwitch();
+	},
+
+	// A collab user left while we were waiting for their save.
+	// If no other collab users remain, switch now.
+	_onCollabUserLeft: function () {
+		if (this._waitingForCollabSwitch
+			&& window.collab.users && window.collab.users.length === 0) {
+			this._finishCollabSwitch();
+		}
+	},
+
+	// Save any local-edit changes and then switch to server mode.
+	// If the document has been modified, .uno:Save triggers the
+	// per-platform upload path (collabSaveToServer for COWASM, the
+	// commandresult-driven collab.uploadFile in main.js for CODA),
+	// and the _switchToServerAfterSave flag causes switchToServerMode
+	// to be called after the upload completes.  If there are no
+	// modifications, .uno:Save is a no-op and we switch immediately.
+	_saveAndSwitchToServerMode: function () {
+		if (this._permission === 'edit' && this._everModified) {
+			window._switchToServerAfterSave = true;
+			this.save(true /* dontTerminateEdit */,
+				false /* dontSaveIfUnmodified */);
+		} else {
+			window.collab.sendMessage({type: 'saved_and_switching'});
+			window.switchToServerMode();
+		}
+	},
+
+	// Save what the user changed, for a native host that is waiting on the
+	// result.  A document with nothing to save is answered at once with
+	// answerNothingToSave, so the host hears back either way.  Answers
+	// whether a save was started.  A dead session can never answer a save,
+	// and the page already showed its error for it.
+	_saveForNativeHost: function (answerNothingToSave) {
+		if (this._permission !== 'edit' || !this._everModified ||
+			this._fatal || !app.socket.connected()) {
+			answerNothingToSave();
+			return false;
+		}
+		this.save(true /* dontTerminateEdit */,
+			false /* dontSaveIfUnmodified */);
+		return true;
+	},
+
+	// The purpose of the save the page runs for the native host, or null:
+	// 'quiet' (the host asked on its own) or 'close'.
+	_pendingNativeSave: null,
+
+	// The open save-failed prompt, or null: what it shows, and whether a
+	// close waits on the user's choice.
+	_saveFailedPrompt: null,
+
+	// The last step of a close, after the save.
+	_finishClose: null,
+
+	// Save any local-edit changes and then close the window.  Mirrors
+	// _saveAndSwitchToServerMode but the post-save action is window
+	// close, signalled to the native host via a CLOSE_WINDOW message
+	// once the save (and, for remote docs, the subsequent integrator
+	// upload) completes.
+	// A close joins the save that the page already runs, or the open prompt
+	// of the save that failed.
+	_saveAndClose: function (finishClose) {
+		const closeWindow = function () { window.postMobileMessage('CLOSE_WINDOW'); };
+		this._finishClose = finishClose || closeWindow;
+
+		var prompt = this._saveFailedPrompt;
+		if (prompt) {
+			if (!prompt.closing)
+				this._showSaveFailedPrompt(prompt.errorDetail, prompt.fileName, true);
+			return;
+		}
+
+		if (this._pendingNativeSave) {
+			this._pendingNativeSave = 'close';
+			return;
+		}
+
+		if (this._saveForNativeHost(this._finishClose))
+			this._pendingNativeSave = 'close';
+	},
+
+	// A save the native host asked for on its own, not the user.  It joins
+	// the save the page already runs, whose result answers the host too.
+	_saveQuietlyForNativeHost: function () {
+		if (this._pendingNativeSave)
+			return;
+		var answer = function () { window.postMobileMessage('SAVECOMPLETED'); };
+		if (this._saveForNativeHost(answer))
+			this._pendingNativeSave = 'quiet';
+	},
+
+	// A save wsd started on its own is nobody's: the document stays
+	// modified, so the next save or close answers for it.  wsd refuses
+	// a save while its own runs, without a word, so a save the page
+	// asked for in that time is asked again once wsd's save is done.
+	// Answers whether the result was wsd's own.
+	_takeAutosaveResult: function (autosave) {
+		if (!autosave)
+			return false;
+		var pending = this._pendingNativeSave;
+		if (pending) {
+			this._pendingNativeSave = null;
+			if (pending === 'close')
+				this._saveAndClose(this._finishClose);
+			else
+				this._saveQuietlyForNativeHost();
+		}
+		return true;
+	},
+
+	_nativeSaveSucceeded: function (autosave) {
+		if (this._takeAutosaveResult(autosave))
+			return;
+		var pending = this._pendingNativeSave;
+		this._pendingNativeSave = null;
+		window.postMobileMessage('SAVECOMPLETED');
+		if (pending === 'close')
+			this._finishClose();
+	},
+
+	_nativeSaveFailed: function (autosave, errorDetail, storageConflict) {
+		if (this._takeAutosaveResult(autosave))
+			return;
+		var pending = this._pendingNativeSave;
+		this._pendingNativeSave = null;
+		// A quiet save fails without a word. The host hears when a prompt
+		// follows, so it can bring a hidden tab to the front for it.
+		var prompts = pending !== 'quiet';
+		window.postMobileMessage(prompts ? 'SAVEFAILED prompt' : 'SAVEFAILED');
+		if (prompts && storageConflict && pending !== 'close') {
+			this._showCollabConflictPrompt(errorDetail, storageConflict.wasSwitching);
+		} else if (prompts) {
+			this._showSaveFailedPrompt(errorDetail, undefined, pending === 'close');
+		}
+	},
+
+	// A remote document whose upload was refused because it changed in storage in the meantime
+	// offers the choices of the document conflict dialog (with Discard joining the others on the
+	// server):
+	_showCollabConflictPrompt: function (errorDetail, wasSwitching) {
+		const buttons = [
+			{ id: 'collab-conflict-cancel', text: _('Cancel') },
+			{ id: 'collab-conflict-discard', text: _('Discard') },
+			{ id: 'collab-conflict-overwrite', text: _('Overwrite') },
+			{ id: 'collab-conflict-saveas', text: _('Save to new file') },
+		];
+		const callbacks = [
+			{ id: 'collab-conflict-cancel', func_: null },
+			{
+				id: 'collab-conflict-discard',
+				func_: () => {
+					window.collab.sendMessage({type: 'saved_and_switching'});
+					window.switchToServerMode();
+				},
+			},
+			{
+				id: 'collab-conflict-overwrite',
+				func_: () => {
+					window._codaForceNextUpload = true;
+					window._switchToServerAfterSave = wasSwitching;
+					this.save(true /* dontTerminateEdit */, false /* dontSaveIfUnmodified */);
+				},
+			},
+			{
+				id: 'collab-conflict-saveas',
+				func_: () => { window.postMobileMessage('uno .uno:SaveAs'); },
+			},
+		];
+		this.uiManager.showModalWithCustomButtons(
+			'collab-conflict', _('Document has been changed'),
+			_('Document has been changed in storage. What would you like to do with your unsaved changes?'),
+			false, buttons, callbacks, errorDetail);
+	},
+
+	// The desktop apps write the user's own file, which can be read-only
+	// or held open by another program. fileName names the file a Save As
+	// failed to write. With closing, the user's choice ends a close.
+	_showSaveFailedPrompt: function (errorDetail, fileName, closing) {
+		var dialogId = this.uiManager.generateModalId('savefailed');
+		if (this._saveFailedPrompt)
+			this.uiManager.closeModal(dialogId, true);
+		closing = !!closing;
+		this._saveFailedPrompt = {
+			errorDetail: errorDetail,
+			fileName: fileName,
+			closing: closing,
+		};
+
+		var that = this;
+		var decided = function (closeMessage) {
+			that._saveFailedPrompt = null;
+			if (closing)
+				window.postMobileMessage(closeMessage);
+		};
+		var cancel = function () { decided('CLOSE_CANCELLED'); };
+		var closeWithoutSaving = function () {
+			that._saveFailedPrompt = null;
+			that._finishClose();
+		};
+		var saveAs = function () {
+			decided('CLOSE_CANCELLED');
+			window.postMobileMessage('uno .uno:SaveAs');
+		};
+
+		var buttons = [{ id: 'savefailed-cancel', text: _('Cancel') }];
+		var callbacks = [
+			{ id: 'savefailed-cancel', func_: cancel },
+			{ id: '__POPOVER__', func: cancel },
+			// The X of the title bar.
+			{ id: '__DIALOG__', func: cancel },
+		];
+		if (closing) {
+			buttons.push({ id: 'savefailed-close', text: _('Close without saving') });
+			callbacks.push({ id: 'savefailed-close', func_: closeWithoutSaving });
+		}
+		buttons.push({ id: 'savefailed-saveas', text: _('Save As'), 'has_default': true });
+		callbacks.push({ id: 'savefailed-saveas', func_: saveAs });
+
+		if (!fileName)
+			fileName = this['wopi'].BaseFileName
+				|| decodeURIComponent(this.options.doc.split(/[?#]/)[0].split('/').pop());
+		var message = _('"%FILENAME" could not be written. The file may be read-only or in use by another program. You can save your changes to a different file.')
+			.replace('%FILENAME', fileName);
+
+		this.uiManager.showModalWithCustomButtons('savefailed',
+			_('Cannot Save Document'), message, false, buttons, callbacks, errorDetail,
+			'savefailed-saveas');
+	},
+
+	// Another user wants to start collaborative editing.  Ask
+	// whether to save local changes and switch to server mode.  If
+	// a dialog is already open (e.g., the edit choice dialog), do
+	// nothing - the user will make their own choice via the dialog
+	// buttons.
+	_onSwitchToCollabRequest: function (userName) {
+		if (this.uiManager.isAnyDialogOpen())
+			return;
+		if (this.isEditMode()) {
+			this._showCollabEditChoiceDialog(
+				_('{0} wants to edit together').replace('{0}', userName),
+				_('Choose how you\'d like to continue:'),
+				() => {});
+		} else {
+			this._saveAndSwitchToServerMode();
+		}
+	},
+
+	// A newly-joining user opens a document where a
+	// collaborative editing session is already active.
+	_onCollabEditingActive: function () {
+		this._showCollabJoinDialog(
+			_('How would you like to edit?'),
+			_('Other users are editing this document. Choose how you\'d like to continue:'));
+	},
+
+	// Someone opened the document we are editing locally.
+	_onCollabUserJoined: function (userName, avatar) {
+		if (!this.isEditMode())
+			return;
+		this._showCollabEditChoiceDialog(
+			avatar
+				? { name: userName, rest: _('opened this document') }
+				: _('{0} opened this document').replace('{0}', userName),
+			_('Choose how you\'d like to continue:'),
+			function () {},
+			avatar);
+	},
+
+	// Another user has just started editing while we were
+	// viewing.  Offer to keep viewing locally or join the
+	// collaborative session.
+	_onOtherUserEditingStarted: function (userName, avatar) {
+		var title = avatar
+			? { name: userName, rest: _('started editing') }
+			: _('{0} started editing').replace('{0}', userName);
+		// Joining from edit mode saves the local changes first.
+		if (this.isEditMode())
+		{
+			this._showCollabEditChoiceDialog(
+				title, _('Choose how you\'d like to continue:'), function () {}, avatar);
+			return;
+		}
+		this._showCollabJoinDialog(
+			title,
+			_('Someone else is now editing this document. Choose how you\'d like to continue:'),
+			avatar);
+	},
+
+	// Notify the collab broker that editing is starting so that
+	// users who join later are informed.
+	_sendEditingStarted: function () {
+		if (window.ThisIsTheEmscriptenApp || window.mode.isCODesktop()) {
+			window.collab.sendMessage({type: 'editing_started'});
+		}
+	},
+
+	// from read-only to edit mode
+	_switchToEditMode: function () {
+		this._sendEditingStarted();
+
+		// With other collab users present, offer the choice between
+		// local and collaborative editing.
+		if ((window.ThisIsTheEmscriptenApp || window.mode.isCODesktop())
+			&& window.collab.users && window.collab.users.length > 0) {
+			this._showCollabEditChoiceDialog(
+				_('How would you like to edit?'),
+				_('Other users are viewing this document. Choose how you\'d like to continue:'),
+				this._proceedEditMode.bind(this));
+			return;
+		}
+
+		// This will be handled by the native mobile app instead
+		if (this._shouldStartReadOnly() && !window.ThisIsAnApp) {
+			var fileName = this['wopi'].BaseFileName;
+			var extension = this._getFileExtension(fileName);
+
+			// For defined formats (from server config), just proceed to edit mode without dialog
+			if (app.isViewModeExtension(extension)) {
+				this._proceedEditMode();
+				return;
+			}
+
+			var extensionInfo = this.readonlyStartingFormats[extension];
+
+			var yesButtonText = !this['wopi'].UserCanNotWriteRelative ? _('Save as ODF format'): null;
+			var noButtonText = extensionInfo.canEdit ? _('Continue editing') : _('Continue read only');
+
+			if (!yesButtonText) {
+				yesButtonText = noButtonText;
+				noButtonText = null;
+			}
+
+			var yesFunction = !noButtonText ? function() { this._proceedEditMode(); }.bind(this) : function() { this._offerSaveAs(); }.bind(this);
+			var noFunction = function() { this._proceedEditMode(); }.bind(this);
+
+			this.uiManager.showYesNoButton(
+				'switch-to-edit-mode-modal', // id.
+				'', // Title.
+				_('This document may contain formatting or content that cannot be saved in the current file format.'), // Message.
+				yesButtonText,
+				noButtonText,
+				yesFunction,
+				noFunction,
+				false // Cancellable.
+			);
+		} else {
+			this._proceedEditMode();
+		}
+	},
+
+	_requestFileCopy: function() {
+		if (app.isReadOnly()) {
+			window.postMobileMessage('REQUESTFILECOPY');
+		} else {
+			this._switchToEditMode();
+		}
+	},
+
+	// Update the client-side comment and redline edit flags for the view
+	// and edit toggle. A genuinely read-only session is skipped: its flags
+	// were set at session start from the real document state (for example
+	// comments allowed on an otherwise read-only PDF).
+	_setViewReadOnlyFlags: function (readOnly) {
+		if (app.isReadOnly())
+			return;
+		app.file.editComment = !readOnly;
+		app.file.allowManageRedlines = !readOnly;
+	},
+
+	// Tell core whether this view is read-only. Same gate as above.
+	_sendViewReadOnly: function (readOnly) {
+		if (app.isReadOnly())
+			return;
+		// Only a live view takes the message. The reconnect sets the state
+		// of a reloaded view.
+		if (app.socket && app.socket.connected())
+			app.socket.sendMessage('setviewreadonly value=' + readOnly);
+	},
+
+	_enterEditMode: function (perm) {
+		this._permission = perm;
+
+		if ((window.mode.isSmallScreenDevice() || window.mode.isTablet()) && this._textInput && this.getDocType() === 'text') {
+			this._textInput.setSwitchedToEditMode();
+		}
+
+		if (app.map['stateChangeHandler'].getItemValue('EditDoc') === 'false')
+			app.map.sendUnoCommand('.uno:EditDoc?Editable:bool=true');
+
+		// Make the view editable in core before the listeners run, so the
+		// commands they send are accepted.
+		this._sendViewReadOnly(false);
+		this._setViewReadOnlyFlags(false);
+
+		app.events.fire('updatepermission', {perm : perm});
+
+		if (this._docLayer._docType === 'text' && (window.mode.isSmallScreenDevice() || window.mode.isTablet())) {
+			app.activeDocument.activeLayout.applyZoom(10);
+		}
+
+		if (window.ThisIsTheiOSApp && window.mode.isTablet() && this._docLayer._docType === 'spreadsheet')
+			this.showCalcInputBar();
+
+		if (window.ThisIsTheAndroidApp)
+			window.postMobileMessage('EDITMODE on');
+	},
+
+	_enterReadOnlyMode: function (perm) {
+		// The dispatcher refuses an action while a dialog is open,
+		// close the dialogs first so the cell edit below is accepted.
+		this.fire('closealldialogs');
+
+		// Finish an open cell edit while the view is still editable
+		this.acceptPendingCellEdit();
+
+		this._permission = perm;
+
+		// disable all user interaction, will need to add keyboard too
+		if (this._docLayer) {
+			this._docLayer._onUpdateCursor();
+			this._docLayer._clearSelections();
+		}
+
+		this._setViewReadOnlyFlags(true);
+
+		app.events.fire('updatepermission', {perm : perm});
+		this.fire('closemobilewizard');
+
+		// Mark the view read-only in core only after the listeners above
+		// have sent their cleanup commands. The kit accepts sidebar show
+		// and hide only for an editable view, so the sidebar hide sent on
+		// updatepermission must arrive while the view is still editable,
+		// or core keeps its sidebar open and it cannot be reopened later.
+		this._sendViewReadOnly(true);
+
+		if (window.ThisIsTheAndroidApp)
+			window.postMobileMessage('EDITMODE off');
+	},
+
+	// Is user currently in read only mode (i.e: initial mobile read only view mode, user may have write access)
+	isReadOnlyMode: function() {
+		return this._permission === 'readonly';
+	},
+
+	// Is user currently in editing mode
+	isEditMode: function() {
+		return this._permission === 'edit';
+	}
+});

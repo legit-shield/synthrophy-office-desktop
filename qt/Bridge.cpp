@@ -1,0 +1,1741 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <config.h>
+
+#include "bridge.hpp"
+
+#include <COKit/COKit.hxx>
+
+#include <qt/DBusService.hpp>
+#include <qt/RemoteOpen.hpp>
+#include <qt/DocumentOperations.hpp>
+#include <wsd/DocumentBroker.hpp>
+#include <net/FakeSocket.hpp>
+#include <common/FailurePage.hpp>
+#include <common/FileUtil.hpp>
+#include <common/Log.hpp>
+#include <common/MobileApp.hpp>
+#include <common/Protocol.hpp>
+#include <common/Uri.hpp>
+#include <qt/QtClipboard.hpp>
+#include <qt/qt.hpp>
+#include <common/Util.hpp>
+#include <qt/StandaloneWindow.hpp>
+#include <qt/TabManager.hpp>
+#include <qt/TabbedWindow.hpp>
+#include <qt/WebView.hpp>
+#include <qt/WindowUtils.hpp>
+#include <common/JsonUtil.hpp>
+#include <common/SettingsStorage.hpp>
+#include <common/StringVector.hpp>
+#include <Poco/Path.h>
+#include <Poco/URI.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+
+#include <QApplication>
+#include <QByteArray>
+#include <QClipboard>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMainWindow>
+#include <QMessageBox>
+#include <QMetaObject>
+#include <QObject>
+#include <QPointer>
+#include <QString>
+#include <QStringList>
+#include <QTemporaryFile>
+#include <QTimer>
+#include <QSettings>
+#include <QUrl>
+#include <QWidget>
+
+static const int SHOW_JS_MAXLEN = 300;
+
+namespace
+{
+    void closeStarterScreen(QPointer<WebView> starter)
+    {
+        if (starter && starter->isStarterScreen())
+        {
+            LOG_TRC("Closing starter screen after document action");
+            QTimer::singleShot(0, [starter]() {
+                if (starter)
+                    starter->requestClose();
+            });
+        }
+    }
+
+    std::string percentDecoded(const std::string& value)
+    {
+        return QUrl::fromPercentEncoding(QByteArray::fromStdString(value)).toStdString();
+    }
+
+    QJsonObject userTemplateToJson(const UserTemplates::Entry& entry)
+    {
+        QJsonObject result;
+        result["id"] = QString::fromStdString(entry.id);
+        result["name"] = QString::fromStdString(entry.name);
+        result["type"] = QString::fromStdString(entry.type);
+        result["path"] = QString::fromStdString(entry.path);
+        if (!entry.previewPath.empty())
+            result["preview"] =
+                QUrl::fromLocalFile(QString::fromStdString(entry.previewPath)).toString();
+        return result;
+    }
+
+    std::mutex BridgeRegistryMutex;
+    std::map<unsigned, Bridge*> BridgeRegistry;
+
+    // The files a document links to, the chapters of a master document for example, are named by
+    // their real location. Inside a sandbox the app reads a folder outside of its own through the
+    // document portal only, under another path, once the user chose that folder. The folders
+    // chosen are kept: the real folder and the path the app reads it under.
+    constexpr const char* LinkedFoldersKey = "LinkedFolders";
+
+    /// The path the app reads the file with the real path hostPath under, from a folder the user
+    /// chose before. Empty when there is none.
+    QString readablePathFor(const QString& hostPath)
+    {
+        QSettings settings;
+        settings.beginGroup(LinkedFoldersKey);
+        for (const QString& key : settings.childKeys())
+        {
+            const QString hostFolder = QUrl::fromPercentEncoding(key.toUtf8());
+            const QString readableFolder = settings.value(key).toString();
+            if (hostPath.startsWith(hostFolder + '/') && QFileInfo(readableFolder).isDir())
+            {
+                const QString candidate = readableFolder + hostPath.mid(hostFolder.size());
+                if (QFileInfo(candidate).isFile())
+                    return candidate;
+            }
+        }
+        return QString();
+    }
+
+    /// Keeps the folder the user chose: its real path and the path the app reads it under.
+    void rememberLinkedFolder(const QString& readableFolder)
+    {
+        std::string hostUri = coda::hostDisplayUriForPath(readableFolder);
+        const QString hostFolder =
+            hostUri.empty() ? readableFolder : QUrl(QString::fromStdString(hostUri)).toLocalFile();
+        QSettings settings;
+        settings.beginGroup(LinkedFoldersKey);
+        settings.setValue(QString::fromUtf8(QUrl::toPercentEncoding(hostFolder)), readableFolder);
+    }
+
+    /// The deepest folder that holds all of the given files.
+    QString commonFolder(const QStringList& files)
+    {
+        if (files.isEmpty())
+            return QString();
+        QStringList common = QFileInfo(files.first()).absolutePath().split('/');
+        for (const QString& file : files)
+        {
+            const QStringList parts = QFileInfo(file).absolutePath().split('/');
+            int count = 0;
+            while (count < common.size() && count < parts.size() && common[count] == parts[count])
+                ++count;
+            common = common.mid(0, count);
+        }
+        return common.join('/');
+    }
+} // namespace
+
+void coda::registerBridge(unsigned appDocId, Bridge* bridge)
+{
+    if (appDocId == 0)
+        return;
+    std::lock_guard<std::mutex> lock(BridgeRegistryMutex);
+    BridgeRegistry[appDocId] = bridge;
+}
+
+void coda::unregisterBridge(Bridge* bridge)
+{
+    std::lock_guard<std::mutex> lock(BridgeRegistryMutex);
+    for (auto it = BridgeRegistry.begin(); it != BridgeRegistry.end();)
+    {
+        if (it->second == bridge)
+            it = BridgeRegistry.erase(it);
+        else
+            ++it;
+    }
+}
+
+bool coda::invokeOnBridge(unsigned appDocId, std::function<void(Bridge&)> fn)
+{
+    // The lock is held across the queued post: a bridge being destroyed on
+    // the GUI thread first waits here in unregisterBridge, and a call
+    // queued before the destruction is discarded with the QObject.
+    std::lock_guard<std::mutex> lock(BridgeRegistryMutex);
+    const auto it = BridgeRegistry.find(appDocId);
+    if (it == BridgeRegistry.end())
+        return false;
+    Bridge* bridge = it->second;
+    QMetaObject::invokeMethod(
+        bridge, [bridge, fn = std::move(fn)] { fn(*bridge); }, Qt::QueuedConnection);
+    return true;
+}
+
+Bridge::Bridge(QObject* parent, WebView* owner, coda::DocumentData& document,
+               QWebEngineView* webView, bool secondaryView)
+    : QObject(parent)
+    , _document(document)
+    , _owner(owner)
+    , _webView(webView)
+    , _closeNotificationPipeForForwardingThread{ -1, -1 }
+    , _secondaryView(secondaryView)
+{
+    if (_secondaryView)
+        _keepDocumentLoaded = true;
+    else
+        coda::registerBridge(_document._appDocId, this);
+}
+
+Bridge::~Bridge() {
+    coda::unregisterBridge(this);
+    // A document with no view of its own is kept loaded on purpose, so closing its
+    // last session is not what ends it. Ask for it directly.
+    if (!_keepDocumentLoaded)
+        closeDetachedDocument(_document._appDocId);
+
+    const bool removeRemoteCopy = !_keepDocumentLoaded && !_remoteCopyPath.isEmpty();
+    if (removeRemoteCopy)
+        if (!QFile::remove(_remoteCopyPath))
+            LOG_WRN("The temporary copy of a remote document could not be removed");
+
+    if (_document._fakeClientFd != -1) {
+        fakeSocketClose(_document._fakeClientFd);
+    }
+    if (_app2js.joinable()) {
+        fakeSocketClose(_closeNotificationPipeForForwardingThread[0]);
+        _app2js.join();
+    }
+}
+
+void Bridge::sendCollabBye()
+{
+    // Ask the page-JS to send {"type":"bye"} on its collab WebSocket
+    // so the server-side CollabBroker knows the disconnect is orderly
+    // and can reclaim itself immediately instead of waiting out its
+    // idle grace period.  No-op if the page never opened a collab WS
+    // (e.g. a local-only document).
+    if (!_document._remoteInfo)
+        return;
+    evalJS(
+        "if (window.collab?.ws?.readyState === 1)"
+        "  window.collab.ws.send('{\"type\":\"bye\"}');");
+}
+
+void Bridge::createAndStartMessagePumpThread()
+{
+    // Create pipe for close notifications
+    fakeSocketPipe2(_closeNotificationPipeForForwardingThread);
+
+    // Thread pumping Online → JS
+    assert(!_app2js.joinable());
+    _app2js = std::thread(
+        [this]
+        {
+            ProcUtil::setThreadName("app2js");
+            LOG_INF("message pump thread started for appDocId "
+                    << _document._appDocId << " on client fd " << _document._fakeClientFd);
+            bool unexpectedClose = false;
+            bool docUnloading = false;
+            while (true)
+            {
+                struct pollfd pfd[2];
+                pfd[0].fd = _document._fakeClientFd;
+                pfd[0].events = POLLIN;
+                pfd[1].fd = _closeNotificationPipeForForwardingThread[1];
+                pfd[1].events = POLLIN;
+                if (fakeSocketPoll(pfd, 2, -1) > 0)
+                {
+                    if (pfd[1].revents & POLLIN)
+                    {
+                        break; // document closed
+                    }
+                    if (pfd[0].revents & POLLIN)
+                    {
+                        int n = fakeSocketAvailableDataLength(_document._fakeClientFd);
+                        if (n == 0)
+                        {
+                            LOG_TRC("Socket closed #" << _document._fakeClientFd);
+                            unexpectedClose = true;
+                            break;
+                        }
+                        std::vector<char> buf(n);
+                        fakeSocketRead(_document._fakeClientFd, buf.data(), n);
+
+                        // The server rejects the load when the previous use of
+                        // the same document is still being cleaned up, then it
+                        // drops the connection. Reload and try again rather than
+                        // forwarding the error and letting the window close.
+                        const std::string_view message(buf.data(), buf.size());
+                        if (message.find("error: cmd=load kind=docunloading") !=
+                            std::string_view::npos)
+                        {
+                            LOG_TRC("Load rejected while the document is still "
+                                    "unloading; will reconnect and retry");
+                            docUnloading = true;
+                            break;
+                        }
+
+                        send2JS(buf);
+                    }
+                    if (pfd[0].revents & POLLERR)
+                    {
+                        LOG_TRC("Socket error #" << _document._fakeClientFd);
+                        unexpectedClose = true;
+                        break;
+                    }
+                }
+            }
+            LOG_INF("closing message pump thread for appDocId "
+                    << _document._appDocId << " on client fd " << _document._fakeClientFd
+                    << ", the document is unloading: " << docUnloading
+                    << ", the close was unexpected: " << unexpectedClose);
+            fakeSocketClose(_closeNotificationPipeForForwardingThread[1]);
+            _closeNotificationPipeForForwardingThread[1] = -1;
+            fakeSocketClose(_document._fakeClientFd);
+            _document._fakeClientFd = -1;
+            if (docUnloading)
+            {
+                QMetaObject::invokeMethod(
+                    this, [this] { retryLoadAfterUnloading(); }, Qt::QueuedConnection);
+            }
+            else if (unexpectedClose)
+            {
+                LOG_WRN("Unexpected closing of message pump thread; closing window now");
+                // Post through the owner so Qt drops the call if the WebView is
+                // already gone by the time the event loop runs it.
+                if (WebView* owner = _owner.data())
+                    QMetaObject::invokeMethod(owner, [owner]() { owner->requestClose(); },
+                                              Qt::QueuedConnection);
+            }
+        });
+}
+
+void Bridge::retryLoadAfterUnloading()
+{
+    // Up to this many reloads while the previous use of the document keeps
+    // unloading. The server frees a closed document in about two seconds, so
+    // this back-off comfortably outlasts that.
+    constexpr int maxRetries = 10;
+
+    // The pump thread that asked for this retry has finished, so let it join
+    // before a fresh one starts.
+    if (_app2js.joinable())
+        _app2js.join();
+
+    // That pump created a close-notification pipe; its read end is still open.
+    if (_closeNotificationPipeForForwardingThread[0] != -1)
+    {
+        fakeSocketClose(_closeNotificationPipeForForwardingThread[0]);
+        _closeNotificationPipeForForwardingThread[0] = -1;
+    }
+
+    if (_docUnloadingRetries++ >= maxRetries)
+    {
+        LOG_WRN("Document [" << _document._fileURL.toString() << "] was still unloading after "
+                             << maxRetries << " attempts; closing window");
+        // The document never loaded, so there is nothing to save; don't let
+        // the close try a save round-trip through the failed page.
+        _readyToClose = true;
+        if (WebView* owner = _owner.data())
+            QMetaObject::invokeMethod(
+                owner, [owner]() { owner->requestClose(); }, Qt::QueuedConnection);
+        return;
+    }
+
+    // A fresh client socket for the next attempt; the previous one was closed
+    // when the pump thread saw the server drop the connection.
+    _document._fakeClientFd = fakeSocketSocket();
+    LOG_INF("reconnecting appDocId " << _document._appDocId << " on new client fd "
+                                     << _document._fakeClientFd);
+
+    // Quadratic back-off, the same shape the browser client uses when it
+    // retries on a docunloading error.
+    const int delayMs = 500 * _docUnloadingRetries * _docUnloadingRetries;
+    LOG_TRC("Document still unloading; reloading to retry (attempt " << _docUnloadingRetries
+                                                                     << ") in " << delayMs << "ms");
+
+    // Reloading the page re-runs the startup script, which reconnects the fake
+    // socket through the HULLO handler and sends the load request again.
+    QPointer<QWebEngineView> webView(_webView);
+    QTimer::singleShot(delayMs, this,
+                       [webView]
+                       {
+                           if (webView)
+                               webView->reload();
+                       });
+}
+
+void Bridge::detachFromView()
+{
+    if (_detached)
+        return;
+    _detached = true;
+
+    LOG_INF("detaching appDocId " << _document._appDocId << ", client fd "
+                                  << _document._fakeClientFd);
+
+    // Mark the document before the socket goes, so the broker never sees an empty
+    // session list that it would read as the document having ended. A secondary view leaves
+    // the first view's session, which keeps the document.
+    if (!_secondaryView)
+        if (auto broker = findBrokerByMobileAppDocId(_document._appDocId))
+            broker->setDetached(true);
+
+    if (!_app2js.joinable())
+        return;
+
+    // Closing the signal end wakes the pump thread, which closes the watched end
+    // and the client socket and clears the socket from the document.
+    if (_closeNotificationPipeForForwardingThread[0] != -1)
+    {
+        fakeSocketClose(_closeNotificationPipeForForwardingThread[0]);
+        _closeNotificationPipeForForwardingThread[0] = -1;
+    }
+    _app2js.join();
+}
+
+void Bridge::evalJS(const std::string& script)
+{
+    // Ensure execution on GUI thread – queued if needed
+    QMetaObject::invokeMethod(
+        _webView,
+        [_webView = _webView, frame = _frame, script]() mutable
+        {
+            const QString source = QString::fromStdString(script);
+            if (frame)
+                frame->runJavaScript(source);
+            else
+                _webView->page()->runJavaScript(source);
+        },
+        Qt::QueuedConnection);
+}
+
+void Bridge::showProgressSnackbar()
+{
+    evalJS("if (window.app && window.app.map && window.app.map.uiManager) "
+           "window.app.map.uiManager.showProgressBar(window._(''), null, null, -1, false, true);");
+}
+
+void Bridge::closeSnackbar()
+{
+    evalJS("if (window.app && window.app.map && window.app.map.uiManager) "
+           "window.app.map.uiManager.closeSnackbar();");
+}
+
+void Bridge::onPrintExportReady(const QString& pdfPath)
+{
+    closeSnackbar();
+    showPrintDialog(pdfPath.toStdString(), _webView);
+}
+
+void Bridge::onSaveExportReady(const QString& filePath)
+{
+    closeSnackbar();
+
+    const QFileInfo srcInfo(filePath);
+    const QString suggestedName = srcInfo.fileName();
+
+    QFileDialog* dialog = showSaveFileDialog(_webView, QObject::tr("Export As"), suggestedName,
+                                             filePath.toStdString(),
+                                             [self = QPointer<Bridge>(this)](bool ok)
+                                             {
+                                                 if (!ok && self)
+                                                     self->onExportFailed();
+                                             });
+
+    // The dialog deletes itself on close, whichever way it is dismissed;
+    // removing the exported file and its private temp directory on
+    // destruction covers saving, cancelling, and the dialog going down with
+    // its parent window.
+    QObject::connect(dialog, &QObject::destroyed,
+                     [filePath] { removeExportTempDirectory(filePath.toStdString()); });
+}
+
+void Bridge::onExportFailed()
+{
+    closeSnackbar();
+    if (_webView)
+        QMessageBox::warning(_webView, QObject::tr("Export Error"),
+                             QObject::tr("Failed to export the document."));
+}
+
+void Bridge::send2JS(const std::vector<char>& buffer)
+{
+    if (buffer.empty())
+        return;
+
+    const std::string_view bufferView(buffer.data(), buffer.size());
+
+    LOG_TRC_NOFILE(
+        "Send to JS: " << COOLProtocol::getAbbreviatedMessage(bufferView.data(), bufferView.size()));
+
+    // Determine if message is of a binary type
+    bool binaryMessage = std::any_of(
+        std::begin(COOLProtocol::binaryMessageTypes),
+        std::end(COOLProtocol::binaryMessageTypes),
+        [&](const char* type) {
+            return bufferView.starts_with(type);
+        }
+    );
+
+    QByteArray base64 = QByteArray(bufferView.data(), bufferView.size()).toBase64();
+
+    std::string pretext = binaryMessage
+                              ? "window.TheFakeWebSocket.onmessage({'data': window.atob('"
+                              : "window.TheFakeWebSocket.onmessage({'data': window.b64d('";
+    const std::string posttext = "')});";
+
+    std::string js = pretext + base64.toStdString() + posttext;
+
+    std::string subjs = js.substr(0, std::min<std::string::size_type>(SHOW_JS_MAXLEN, js.length()));
+    if (js.length() > SHOW_JS_MAXLEN)
+        subjs += "...";
+    LOG_TRC_NOFILE("Evaluating JavaScript: " << subjs);
+
+    evalJS(js);
+}
+
+void Bridge::debug(const QString& msg) { LOG_TRC_NOFILE("From JS: debug: " << msg.toStdString()); }
+
+void Bridge::error(const QString& msg) { LOG_TRC_NOFILE("From JS: error: " << msg.toStdString()); }
+
+QString Bridge::getAllPrefs()
+{
+    return QString::fromStdString(Application::getPrefs().serialize());
+}
+
+void Bridge::setPref(const QString& key, const QString& value)
+{
+    Application::getPrefs().set(key.toStdString(), value.toStdString());
+}
+
+QString Bridge::getRemoteInfo()
+{
+    if (!_document._remoteInfo)
+        return {};
+    const auto& ri = *_document._remoteInfo;
+    QJsonObject obj;
+    obj["wopiSrc"] = ri.wopiSrc;
+    obj["accessToken"] = ri.accessToken;
+    obj["coolServer"] = ri.coolServer;
+    obj["coolPath"] = ri.coolPath;
+    return QString::fromUtf8(
+        QJsonDocument(obj).toJson(QJsonDocument::Compact));
+}
+
+QString Bridge::writeRemoteDocFile(const QString& filename,
+                                   const QString& base64Bytes)
+{
+    // Extension drives core's filter detection; keep whatever the
+    // integrator gave us via /co/collab/fetch's filename field.
+    const std::string extension = FileUtil::extractFileExtension(filename.toStdString());
+    if (!FileUtil::isPlainExtension(extension))
+    {
+        LOG_WRN("writeRemoteDocFile: extension \"" << extension
+                                                    << "\" is not only letters and digits");
+        return {};
+    }
+
+    const QString ext = QString::fromStdString(extension);
+    QTemporaryFile tmp(QDir::tempPath() + "/coda-XXXXXX." + ext);
+    if (!tmp.open())
+    {
+        LOG_ERR("writeRemoteDocFile: cannot open temp file");
+        return {};
+    }
+    const QByteArray bytes =
+        QByteArray::fromBase64(base64Bytes.toLatin1());
+    if (tmp.write(bytes) != bytes.size())
+    {
+        LOG_ERR("writeRemoteDocFile: short write to "
+                << tmp.fileName().toStdString());
+        return {};
+    }
+    const QString path = tmp.fileName();
+    tmp.close();
+    tmp.setAutoRemove(false);
+    _remoteCopyPath = path;
+
+    _document._fileURL = Poco::URI(Poco::Path(path.toStdString()));
+    LOG_TRC("writeRemoteDocFile: wrote " << bytes.size()
+            << " bytes to " << path.toStdString());
+    return path;
+}
+
+QString Bridge::readLocalDocBytes()
+{
+    const std::string localPath = _document._fileURL.getPath();
+    QFile file(QString::fromStdString(localPath));
+    if (!file.open(QIODevice::ReadOnly))
+    {
+        LOG_ERR("readLocalDocBytes: cannot read " << localPath);
+        return {};
+    }
+    const QByteArray bytes = file.readAll();
+    return QString::fromLatin1(bytes.toBase64());
+}
+
+void Bridge::saveCompleted()
+{
+    finishSave(true);
+}
+
+void Bridge::promptSaveLocation(std::function<void(const std::string&, const std::string&)> callback)
+{
+    // Prompt user to pick a save location and format
+    COKitDocument* loKitDoc = DocumentData::loadedKitDocument(_document._appDocId);
+    if (!loKitDoc)
+    {
+        LOG_ERR("promptSaveLocation: no loKitDocument");
+        return;
+    }
+
+    const COKitDocumentType docType = loKitDoc->getDocumentType();
+    auto formats = getSaveAsFormats(docType);
+
+    if (formats.empty())
+    {
+        LOG_ERR("promptSaveLocation: no formats available for document type");
+        return;
+    }
+
+    // Get document info for suggested filename
+    const QUrl docUrl(QString::fromStdString(_document._fileURL.toString()));
+    const QString docPath = docUrl.isLocalFile() ? docUrl.toLocalFile() : docUrl.toString();
+    const QFileInfo docInfo(docPath);
+    const QString baseName = docInfo.completeBaseName().isEmpty()
+                               ? QStringLiteral("document")
+                               : docInfo.completeBaseName();
+
+    const QString docSuffix = _requiresSaveAs ? QString() : docInfo.suffix();
+    size_t formatIndex = 0;
+    if (!docSuffix.isEmpty())
+    {
+        const auto match = std::find_if(
+            formats.begin(), formats.end(), [&docSuffix](const SaveAsFormat& fmt)
+            { return docSuffix.compare(fmt.extension, Qt::CaseInsensitive) == 0; });
+        formatIndex = match - formats.begin();
+        if (match == formats.end())
+        {
+            const QString extension = docSuffix.toLower();
+            formats.push_back(
+                { QStringLiteral("saveas-") + extension, extension, extension.toUpper() });
+        }
+    }
+    const QString defaultExtension = formats[formatIndex].extension;
+
+    // Build file filter string with all available formats
+    QStringList nameFilters;
+    for (const auto& fmt : formats)
+        nameFilters << fmt.displayName + QStringLiteral(" (*.") + fmt.extension +
+                           QStringLiteral(")");
+
+    // Under flatpak the file picker is the xdg-desktop-portal FileChooser,
+    // which exports the chosen file to the document portal under the exact
+    // name the user confirms and ignores setDefaultSuffix().
+    const QString suggestedName =
+        baseName + QStringLiteral(".") + (docSuffix.isEmpty() ? defaultExtension : docSuffix);
+
+    QString startFolder = QDir::homePath();
+    if (docUrl.isLocalFile() && !_requiresSaveAs)
+    {
+        const QString hostUri = QString::fromStdString(coda::hostDisplayUriForPath(docPath));
+        const QString docFolder = hostUri.isEmpty()
+                                      ? docInfo.absolutePath()
+                                      : QFileInfo(QUrl(hostUri).toLocalFile()).absolutePath();
+        const QString tempFolder = QDir::tempPath();
+        if (docFolder != tempFolder && !docFolder.startsWith(tempFolder + '/'))
+            startFolder = docFolder;
+    }
+
+    QFileDialog* dialog = new QFileDialog(
+        _webView,
+        QObject::tr("Save Document"),
+        QDir(startFolder).filePath(suggestedName),
+        nameFilters.join(QStringLiteral(";;")));
+
+    dialog->setAcceptMode(QFileDialog::AcceptSave);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->selectNameFilter(nameFilters[formatIndex]);
+
+    // Set default suffix to enforce extension in GUI
+    dialog->setDefaultSuffix(defaultExtension);
+
+    // Update default suffix and the proposed filename when the user changes
+    // the selected filter, so the name registered by the portal keeps the
+    // extension matching the chosen format.
+    QObject::connect(dialog, QOverload<const QString&>::of(&QFileDialog::filterSelected),
+                     [dialog, baseName, formats](const QString& selectedFilter)
+                     {
+                         for (const auto& fmt : formats)
+                         {
+                             if (selectedFilter.startsWith(fmt.displayName))
+                             {
+                                 dialog->setDefaultSuffix(fmt.extension);
+                                 dialog->selectFile(baseName + QStringLiteral(".") + fmt.extension);
+                                 break;
+                             }
+                         }
+                     });
+
+    QObject::connect(dialog, &QFileDialog::fileSelected,
+                     [callback, formats, defaultExtension](const QString& destPath)
+                     {
+                         // The format is determined by file name not the
+                         // file format dropdown menu. We can't change the
+                         // file name automatically based on file format
+                         // dropdown.
+                         const QString suffix = QFileInfo(destPath).suffix();
+                         QString format;
+                         for (const auto& fmt : formats)
+                         {
+                             if (suffix.compare(fmt.extension, Qt::CaseInsensitive) == 0)
+                             {
+                                 format = fmt.extension;
+                                 break;
+                             }
+                         }
+
+                         if (format.isEmpty())
+                             format = defaultExtension;
+
+                         // Ensure file ends with the selected format's extension - save-as fails otherwise!
+                         QString finalPath = destPath;
+                         const QString runtimeDir = qEnvironmentVariable("XDG_RUNTIME_DIR");
+                         const bool isPortalPath =
+                             !runtimeDir.isEmpty() && destPath.startsWith(runtimeDir);
+
+                         const QString currentSuffix = QFileInfo(finalPath).suffix();
+                         if (!isPortalPath && currentSuffix.compare(format, Qt::CaseInsensitive) != 0)
+                         {
+                             for (const auto& fmt : formats)
+                             {
+                                 if (currentSuffix.compare(fmt.extension, Qt::CaseInsensitive) == 0)
+                                 {
+                                     finalPath.chop(currentSuffix.length() + 1);
+                                     break;
+                                 }
+                             }
+                             finalPath += "." + format;
+                         }
+
+                         callback(finalPath.toStdString(), format.toStdString());
+                     });
+
+    dialog->open();
+}
+
+void Bridge::finishSave(bool saved)
+{
+    _saveInFlight = false;
+    LOG_TRC_NOFILE("Bridge::finishSave: _saveInFlight=false, saved=" << saved);
+    if (_onSaveComplete)
+    {
+        // Move out before invoking so a handler that schedules a new
+        // close (which re-checks isSaveInFlight) sees a clean slate.
+        auto cb = std::move(_onSaveComplete);
+        _onSaveComplete = nullptr;
+        cb(saved);
+    }
+}
+
+void Bridge::onSaveComplete(std::function<void(bool)> callback)
+{
+    if (!_saveInFlight)
+    {
+        if (callback)
+            callback(true);
+        return;
+    }
+    _onSaveComplete = std::move(callback);
+}
+
+bool Bridge::requestSave(std::function<void(bool)> onComplete)
+{
+    if (_saveInFlight || _onSaveComplete)
+        return false;
+
+    _onSaveComplete = std::move(onComplete);
+    // The page raises SAVESTARTED over the web channel, which can land after this call
+    // returns, so the flag is raised here as well. A close clicked in the meantime then
+    // waits for this save instead of asking about unsaved changes.
+    _saveInFlight = true;
+    LOG_TRC_NOFILE("Bridge::requestSave: _saveInFlight=true");
+    // The page answers with SAVECOMPLETED or SAVEFAILED when the save finishes, or with
+    // SAVECOMPLETED at once when there is nothing to save, and the fallback answers for a
+    // page that has no map, so the callback always runs.
+    evalJS("if (window.app && window.app.map) window.app.map._saveQuietlyForNativeHost();"
+           "else window.postMobileMessage('SAVECOMPLETED');");
+    return true;
+}
+
+void Bridge::closeWaitsForSave(std::function<void(bool)> then)
+{
+    // A second wait would push a second override cursor that nothing ever pops.
+    if (_closeWaitsForSave)
+        return;
+    _closeWaitsForSave = true;
+    // Busy cursor for immediate feedback: the in-page busy modal paints with a delay and may
+    // never appear on a fast finish.
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    evalJS("if (window.app && window.app.map)"
+           "  window.app.map.fire('showbusy', {label: window._('Saving...')});");
+    saveAndClose();
+    onSaveComplete([self = QPointer<Bridge>(this), then = std::move(then)](bool saved) mutable {
+        QApplication::restoreOverrideCursor();
+        if (!self)
+            return;
+        self->_closeWaitsForSave = false;
+        // The busy modal must not hang behind the page's prompt for a failed save.
+        self->evalJS("if (window.app && window.app.map) window.app.map.fire('hidebusy');");
+        if (saved)
+            self->markReadyToClose();
+        // Deferred: a close in then destroys this bridge, which the save result runs in.
+        QTimer::singleShot(0, self.data(), [then = std::move(then), saved]() { then(saved); });
+    });
+}
+
+void Bridge::saveAndClose()
+{
+    static constexpr char script[] =
+        "if (window.app && window.app.map "
+        "    && typeof window.app.map._saveAndClose === 'function')"
+        "  window.app.map._saveAndClose();"
+        "else window.postMobileMessage('CLOSE_WINDOW');";
+    if (_frame) {
+        // An editor frame that no longer shows CODA's page cannot answer (the script throws there,
+        // so its result is not true), and then its account window closes at once:
+        _frame->runJavaScript(
+            QString::fromLatin1(script) + QStringLiteral("true"),
+            [self = QPointer<Bridge>(this)](QVariant const & answered) {
+                if (self && !answered.toBool()) {
+                    self->_readyToClose = true;
+                    self->closeAccountWindow();
+                }
+            });
+    } else {
+        evalJS(script);
+    }
+}
+
+void Bridge::closeAccountWindow() {
+    QWidget * window = _webView->window();
+    QMetaObject::invokeMethod(window, [window]() { window->close(); }, Qt::QueuedConnection);
+}
+
+void Bridge::saveDocumentAs()
+{
+    promptSaveLocation(
+        [self = QPointer<Bridge>(this), fakeClientFd = _document._fakeClientFd,
+         currentUri = _document._fileURL](const std::string& destPath, const std::string& format)
+        {
+            const QFileInfo destInfo(QString::fromStdString(destPath));
+
+            const Poco::URI destUri(Poco::Path(destInfo.absoluteFilePath().toStdString()));
+
+            if (destUri.getPath() == currentUri.getPath())
+            {
+                if (self)
+                    self->_isNewDocument = false;
+                // Send save command if the saveas destination is the same as the current document.
+                const std::string saveCmd = "save dontTerminateEdit=0 dontSaveIfUnmodified=0";
+                fakeSocketWriteQueue(fakeClientFd, saveCmd.data(), saveCmd.size());
+            }
+            else
+            {
+                // Send saveas command to COOLWSD with the selected format
+                std::string saveasCmd =
+                    "saveas url=" + destUri.toString() + " format=" + format + " options=";
+                fakeSocketWriteQueue(fakeClientFd, saveasCmd.c_str(), saveasCmd.size());
+            }
+        });
+}
+
+QVariant Bridge::cool(const QString& messageStr)
+{
+    const std::string message = messageStr.toStdString();
+    LOG_TRC_NOFILE("From JS: cool: " << message);
+
+    const StringVector tokens = StringVector::tokenize(message);
+    if (tokens.empty())
+        return {};
+
+    if (tokens.equals(0, "HULLO"))
+    {
+        if (_localSessionEnded) {
+            LOG_WRN(
+                "HULLO for appDocId " << _document._appDocId << " after its local session ended");
+            return {};
+        }
+
+        // A HULLO while the connection is still up comes from a reload of the page, which then
+        // rejoins the document as after a renderer crash:
+        if (_app2js.joinable()) {
+            detachFromView();
+        }
+        if (_detached)
+        {
+            // The connection was released when the renderer died, and the appDocId
+            // survived. A fresh socket carrying the same appDocId rejoins the document
+            // already loaded under it.
+            _document._fakeClientFd = fakeSocketSocket();
+            _detached = false;
+            LOG_INF("reattaching appDocId " << _document._appDocId << " on new client fd "
+                                            << _document._fakeClientFd);
+        }
+
+        // Skip for starter screen (no document connection needed)
+        if (_document._fakeClientFd == -1) {
+            LOG_TRC_NOFILE("Starter screen - skipping COOLWSD connection");
+            return {};
+        }
+
+        // JS side fully initialised – open our fake WebSocket to COOLWSD
+        assert(coolwsd_server_socket_fd != -1);
+        LOG_INF("HULLO for appDocId " << _document._appDocId << ", connecting client fd "
+                                      << _document._fakeClientFd << " to server fd "
+                                      << coolwsd_server_socket_fd);
+        int rc = fakeSocketConnect(_document._fakeClientFd, coolwsd_server_socket_fd);
+        if (rc == -1)
+        {
+            LOG_ERR("HULLO: failed to connect fakesocket");
+            return {};
+        }
+
+        createAndStartMessagePumpThread();
+
+        // 1st request: the initial GET /?file_path=...  (mimic WebSocket upgrade)
+        std::string initMsg(_document._fileURL.toString() +
+                            (" " + std::to_string(_document._appDocId)));
+        // A document opened through the document portal is read under a path of the portal. Its
+        // real location is the third token, so the relative links of the document, the chapters
+        // of a master document for example, are relative to that.
+        if (_document._fileURL.getScheme() == "file")
+        {
+            const std::string hostUri = coda::hostDisplayUriForPath(
+                QString::fromStdString(_document._fileURL.getPath()));
+            if (!hostUri.empty() && hostUri != _document._fileURL.toString())
+                initMsg += ' ' + hostUri;
+        }
+        LOG_INF("sending handshake on client fd " << _document._fakeClientFd << ": " << initMsg);
+        fakeSocketWriteQueue(_document._fakeClientFd, initMsg.c_str(), initMsg.size());
+    }
+    else if (tokens.equals(0, "loaddocument"))
+    {
+        // loaddocument url=file:///path/to/file.odt
+        std::string newFileUrl;
+        if (!COOLProtocol::getTokenString(tokens, "url", newFileUrl))
+        {
+            LOG_ERR("loaddocument: no url= specified");
+            return {};
+        }
+
+        LOG_TRC_NOFILE("loaddocument: switching to URL: " << newFileUrl);
+
+        // The document is now bound to a real file the user chose, so a plain
+        // save is no longer redirected to Save As.
+        _requiresSaveAs = false;
+
+        // A different document gets its own retry budget for the case where it
+        // too is still unloading from an earlier use.
+        _docUnloadingRetries = 0;
+
+        // Close the existing fakesocket
+        if (_document._fakeClientFd != -1) {
+            fakeSocketClose(_document._fakeClientFd);
+            _document._fakeClientFd = -1;
+        }
+        // Close the existing forwarding thread
+        if (_app2js.joinable()) {
+            fakeSocketClose(_closeNotificationPipeForForwardingThread[0]);
+            _app2js.join();
+        }
+
+        // Create a new fakesocket
+        _document._fakeClientFd = fakeSocketSocket();
+        // Generate a new appDocId
+        _document._appDocId = coda::generateNewAppDocId();
+        coda::unregisterBridge(this);
+        coda::registerBridge(_document._appDocId, this);
+        const std::string previousUri = _document._fileURL.toString();
+        // Update the file URL
+        _document._fileURL = Poco::URI(newFileUrl);
+
+        LOG_TRC_NOFILE("loaddocument: created new appDocId=" << _document._appDocId);
+
+        // Connect to COOLWSD
+        int rc = fakeSocketConnect(_document._fakeClientFd, coolwsd_server_socket_fd);
+        if (rc == -1) {
+            LOG_ERR("loaddocument: failed to connect fakesocket");
+            return {};
+        }
+
+        createAndStartMessagePumpThread();
+
+        // Send the initial message with the new file URL and appDocId
+        std::string initialMessage(_document._fileURL.toString() +
+                                   (" " + std::to_string(_document._appDocId)));
+        fakeSocketWriteQueue(_document._fakeClientFd, initialMessage.c_str(), initialMessage.size());
+
+        // Update window/tab title with new filename
+        Poco::Path uriPath(_document._fileURL.getPath());
+        QString fileName = QString::fromStdString(uriPath.getFileName());
+        if (_owner)
+            _owner->updateTitle(fileName);
+
+        // Drop the app-picked name of a new document from the recent list.
+        if (_isNewDocument)
+        {
+            Application::getRecentFiles().remove(previousUri);
+            _isNewDocument = false;
+        }
+
+        // Add the new document location to recent files.
+        // For flatpak use the host location
+        const std::string hostDisplayUri = coda::hostDisplayUriForPath(
+            QString::fromStdString(_document._fileURL.getPath()));
+        Application::getRecentFiles().add(_document._fileURL.toString(), hostDisplayUri);
+
+        LOG_TRC_NOFILE("loaddocument: sent initial message with new appDocId");
+        return {};
+    }
+    else if (tokens.equals(0, "WELCOME"))
+    {
+        // "WELCOME auto" is the first start or an update, "WELCOME" is Help > Latest Updates.
+#if ENABLE_DEBUG
+        // A debug build opens the slideshow only from the menu.
+        const bool welcomeEnabled = !(tokens.size() > 1 && tokens.equals(1, "auto"));
+#else
+        const bool welcomeEnabled = true;
+#endif
+        const std::string welcomePath = getBrowserDistDir() + "/welcome/welcome-slideshow.odp";
+        struct stat st;
+        if (!welcomeEnabled)
+        {
+            LOG_TRC_NOFILE("A debug build does not start the welcome slideshow by itself");
+        }
+        else if (FileUtil::getStatOfFile(welcomePath, st) == 0)
+        {
+            Poco::URI fileURL{Poco::Path(welcomePath)};
+            QPointer<QMainWindow> parent = _owner ? _owner->mainWindow() : nullptr;
+            QTimer::singleShot(0, [fileURL, parent]() {
+                WebView* wv = new WebView(Application::getProfile(), /*isWelcome*/ true);
+                StandaloneWindow::wrap(wv, parent);
+                wv->load(fileURL);
+            });
+            LOG_TRC_NOFILE("Opening welcome slideshow: " << welcomePath);
+        }
+        else
+        {
+            LOG_TRC_NOFILE("Welcome slideshow not found at: " << welcomePath);
+        }
+    }
+    else if (tokens.equals(0, "LICENSE"))
+    {
+        std::string licensePath = LO_PATH "/LICENSE.html";
+        // Inside a snap, LO_PATH is a bind-mount that exists only in the
+        // snap's mount namespace. xdg-desktop-portal hands the URL to the
+        // host browser, which can't resolve that path — translate to the
+        // host-visible $SNAP-rooted location.
+        if (const char* snapRoot = std::getenv("SNAP"))
+        {
+            licensePath = std::string(snapRoot) + licensePath;
+        }
+        struct stat st;
+        if (FileUtil::getStatOfFile(licensePath, st) == 0)
+        {
+            const QUrl url = QUrl::fromLocalFile(QString::fromStdString(licensePath));
+            QDesktopServices::openUrl(url);
+            LOG_TRC_NOFILE("Opening LICENSE.html: " << licensePath);
+        }
+        else
+        {
+            LOG_TRC_NOFILE("LICENSE.html not found at: " << licensePath);
+        }
+    }
+    else if (tokens.equals(0, "COMMANDSTATECHANGED"))
+    {
+        Poco::JSON::Object::Ptr object;
+        if (!JsonUtil::parseJSON(tokens.substrFromToken(1), object))
+            return {};
+
+        const std::string commandName = object->get("commandName").toString();
+        if (commandName != ".uno:ModifiedStatus")
+            return {};
+
+        const bool wasModified = _modified;
+        _modified = (object->get("state").toString() == "true");
+        LOG_TRC_NOFILE("Document modified status changed: " << (_modified ? "modified" : "unmodified"));
+        if (wasModified != _modified)
+        {
+            if (WebView* owner = _owner.data())
+            {
+                owner->onDocumentModifiedStatusChanged(_modified);
+                if (wasModified && !_modified)
+                    owner->onDocumentUnmodified();
+            }
+        }
+    }
+    else if (tokens.equals(0, "UPLOADSETTINGS"))
+    {
+        uploadAndApplySettings(tokens.substrFromToken(1));
+        return {};
+    }
+    else if (tokens.equals(0, "FETCHSETTINGSFILE"))
+    {
+        auto result = Desktop::fetchSettingsFile(tokens.substrFromToken(1));
+        if (result.content.empty())
+            return {};
+
+        // A QJsonObject holds no standard-library container, so its layout is the same in this
+        // code and in the system Qt that turns the reply into JSON for the page.
+        QJsonObject resultObject;
+        resultObject["fileName"] = QString::fromStdString(result.fileName);
+        resultObject["mimeType"] = QString::fromStdString(result.mimeType);
+        resultObject["content"] = QString::fromStdString(result.content);
+
+        return resultObject;
+    }
+    else if (tokens.equals(0, "FETCHSETTINGSCONFIG"))
+    {
+        return QString::fromStdString(Desktop::fetchSettingsConfig());
+    }
+    else if (tokens.equals(0, "SYNCSETTINGS"))
+    {
+        // The page of a remote document gets no secrets (it is in the remote server's origin):
+        Desktop::syncSettings([this](const std::vector<char>& data) {
+            send2JS(data);
+        }, !_document._remoteInfo);
+        return {};
+    }
+    else if (tokens.equals(0, "SETDARKMODE"))
+    {
+        const bool dark = tokens.equals(1, "true");
+        Desktop::setDarkMode(dark);
+        // The tab strips follow the saved dark mode choice.
+        const QString theme = dark ? QStringLiteral("dark") : QStringLiteral("light");
+        for (TabbedWindow* tw : TabbedWindow::allWindows())
+            tw->manager()->applyTheme(theme);
+        return {};
+    }
+    else if (tokens.equals(0, "OPENSECONDARYVIEW"))
+    {
+        if (WebView* owner = _owner.data())
+            owner->openSecondaryView();
+        return {};
+    }
+    else if (tokens.equals(0, "SETUIZOOM"))
+    {
+        int percent = 0;
+        try
+        {
+            percent = std::stoi(tokens[1]);
+        }
+        catch (const std::exception&)
+        {
+            LOG_ERR("SETUIZOOM: invalid zoom percentage '" << tokens[1] << "'");
+            return {};
+        }
+        Desktop::setUIZoomPercent(percent);
+        // The zoom is a per-application preference, so every open window
+        // follows the new value at once.
+        WebView::applyUIZoomToAll();
+        return {};
+    }
+    else if (tokens.equals(0, "GETUIZOOM"))
+    {
+        return Desktop::getUIZoomPercent();
+    }
+    else if (tokens.equals(0, "TABTHUMBNAIL"))
+    {
+        if (WebView* owner = _owner.data())
+            owner->updateThumbnail(tokens.substrFromToken(1));
+        return {};
+    }
+    else if (tokens.equals(0, "FETCHAIMODELS"))
+    {
+        return QString::fromStdString(Desktop::fetchAIModels(tokens.substrFromToken(1)));
+    }
+    else if (tokens.equals(0, "SAVESTARTED"))
+    {
+        // JS-side hand-off raised from the save() entry-point in
+        // browser/src/control/Toolbar.js as the 'save' WS message
+        // goes out.  The JS-side SAVECOMPLETED below closes out via
+        // finishSave().
+        _saveInFlight = true;
+        LOG_TRC_NOFILE("Bridge::cool SAVESTARTED: _saveInFlight=true");
+    }
+    else if (tokens.equals(0, "BYE") || tokens.equals(0, "EXIT_TEST"))
+    {
+        const bool quitApp = tokens.equals(0, "EXIT_TEST");
+        LOG_INF((quitApp ? "EXIT_TEST" : "BYE")
+                << " -- closing document with appDocId " << _document._appDocId
+                << (quitApp ? " and quitting" : ""));
+        // Render the shared clipboard's lazy transferable into engine-held
+        // bytes before destroying the document, so a paste after the
+        // document closes still works. The document stays open after a
+        // secondary view of it closes.
+        if (!_secondaryView)
+            flushClipboardOnDocClose(_document._appDocId);
+
+        if (_document._remoteInfo) {
+            _localSessionEnded = true;
+        }
+        fakeSocketClose(_closeNotificationPipeForForwardingThread[0]);
+        // The page-JS is already terminating, so the close below must not
+        // drive another save-if-dirty round-trip through it.
+        _readyToClose = true;
+        QPointer<WebView> owner = _owner;
+        QTimer::singleShot(0, [owner, quitApp]() {
+            if (owner)
+                owner->requestClose();
+            if (quitApp)
+                QApplication::quit();
+        });
+    }
+    else if (tokens.equals(0, "REMOTEBOOTSTRAPFAILED"))
+    {
+        const QString server = _document._remoteInfo ? _document._remoteInfo->coolServer : QString();
+        QString serverName = QObject::tr("the Collabora Online server");
+        if (!server.isEmpty())
+            serverName = server;
+
+        const std::string error = tokens.substrFromToken(1);
+        const std::string title = QObject::tr("Cannot open remote document").toStdString();
+        const std::vector<std::string> paragraphs {
+            "Could not open the document from " + serverName.toStdString() + ".",
+            "Details: " + error
+        };
+
+        // In an editor frame the integrator's page stays, and only the frame shows the failure.
+        if (_frame)
+        {
+            LOG_ERR("remote bootstrap failed in the editor frame: " << error);
+            evalJS(FailurePage::script(title, paragraphs));
+            return {};
+        }
+
+        const QString html = QString::fromStdString(FailurePage::html(title, paragraphs));
+        QTimer::singleShot(0, [this, html]() {
+            if (_webView) {
+                _webView->setHtml(html);
+            }
+            markReadyToClose();
+        });
+    }
+    else if (tokens.equals(0, "TEXTCLIPBOARD"))
+    {
+        QString text = QString::fromStdString(tokens.substrFromToken(1));
+        // The dataChanged watcher (QtClipboard.cpp) records the ownership
+        // loss, so the next in-document paste reads this plain text through
+        // the clipboard provider instead of replaying the stale engine copy.
+        QApplication::clipboard()->setText(text);
+    }
+    else if (tokens.equals(0, "GETRECENTDOCS"))
+    {
+        QString result = QString::fromStdString(Application::getRecentFiles().serialise());
+        LOG_TRC_NOFILE("GETRECENTDOCS: returning recent documents");
+        return result;
+    }
+    else if (tokens.equals(0, "GETUSERTEMPLATES"))
+    {
+        QJsonArray result;
+        for (const UserTemplates::Entry& entry : Application::getUserTemplates().list())
+            result.append(userTemplateToJson(entry));
+        return result;
+    }
+    else if (tokens.equals(0, "PICKUSERTEMPLATE"))
+    {
+        QStringList patterns;
+        for (const std::string& extension : UserTemplates::acceptedExtensions())
+            patterns << QStringLiteral("*.") + QString::fromStdString(extension);
+
+        QFileDialog dialog(_webView, QObject::tr("Add Template"), QString(),
+                           QObject::tr("Templates and documents") + " (" + patterns.join(' ') +
+                               ")");
+        dialog.setFileMode(QFileDialog::ExistingFile);
+        if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty())
+            return {};
+
+        return CODAWebEngineView::templateFileToJson(dialog.selectedFiles().first());
+    }
+    else if (tokens.equals(0, "SETTEMPLATEDROPTARGET"))
+    {
+        // e.g. "SETTEMPLATEDROPTARGET on" while the page shows a drop zone for template files
+        if (auto* coda = dynamic_cast<CODAWebEngineView*>(_webView))
+            coda->setTemplateDropTarget(tokens.equals(1, "on"));
+    }
+    else if (tokens.equals(0, "ADDUSERTEMPLATE"))
+    {
+        // e.g. "ADDUSERTEMPLATE name=Invoice source=%2Fhome%2F...%2FInvoice.ott"
+        std::string name, source;
+        COOLProtocol::getTokenString(tokens, "name", name);
+        COOLProtocol::getTokenString(tokens, "source", source);
+        const std::optional<UserTemplates::Entry> entry =
+            Application::getUserTemplates().addFile(percentDecoded(source), percentDecoded(name));
+        if (!entry)
+            return {};
+        return userTemplateToJson(*entry);
+    }
+    else if (tokens.equals(0, "RENAMEUSERTEMPLATE"))
+    {
+        std::string id, name;
+        COOLProtocol::getTokenString(tokens, "id", id);
+        COOLProtocol::getTokenString(tokens, "name", name);
+        const std::optional<UserTemplates::Entry> entry =
+            Application::getUserTemplates().rename(id, percentDecoded(name));
+        if (!entry)
+            return {};
+        return userTemplateToJson(*entry);
+    }
+    else if (tokens.equals(0, "REMOVEUSERTEMPLATE"))
+    {
+        std::string id;
+        COOLProtocol::getTokenString(tokens, "id", id);
+        if (!Application::getUserTemplates().remove(id))
+            return {};
+        return true;
+    }
+    else if (tokens.equals(0, "openremote"))
+    {
+        // The server URL comes with the message, from the backstage's
+        // cloud-provider tile, so no URL prompt is needed.
+        if (tokens.size() < 2)
+        {
+            LOG_WRN("openremote: missing server URL");
+            return {};
+        }
+        QString serverUrl = QString::fromStdString(
+            std::string(tokens[1]));
+        std::string accountId;
+        COOLProtocol::getTokenString(tokens, "account", accountId);
+        // A request that names no account signs in on the profile every window shares.
+        QWebEngineProfile* pickerProfile =
+            accountId.empty() ? Application::getProfile()
+                              : Application::getAccountProfile(QString::fromStdString(accountId));
+        LOG_DBG("openremote: account '" << accountId << "' opens on the "
+                << (pickerProfile == Application::getProfile() ? "shared" : "account's")
+                << " profile");
+        auto* webView = _webView;
+        QTimer::singleShot(0, [serverUrl, webView, pickerProfile]() {
+            coda::openRemoteFile(serverUrl, webView, Application::getProfile(), pickerProfile);
+        });
+    }
+    else if (tokens.equals(0, "removecloudaccount"))
+    {
+        std::string accountId;
+        COOLProtocol::getTokenString(tokens, "account", accountId);
+        const QString account = QString::fromStdString(accountId);
+
+        // Documents opened from this account use its profile to stay signed in.
+        if (Application::countAccountProfileViews(account) > 0)
+        {
+            LOG_WRN("removecloudaccount: refused, the account still has open documents");
+            return QStringLiteral("refused");
+        }
+
+        Application::deleteAccountProfile(account);
+    }
+    else if (message == "uno .uno:Open")
+    {
+        QFileDialog* dialog =
+            new QFileDialog(_webView, QObject::tr("Open File"), QString(),
+                            QObject::tr("All Files (*);;"
+                                        "Text Documents (*.odt *.ott *.doc *.docx *.rtf *.txt);;"
+                                        "Spreadsheets (*.ods *.ots *.xls *.xlsx *.csv);;"
+                                        "Presentations (*.odp *.otp *.ppt *.pptx);;"
+                                        "PDF Documents (*.pdf)"));
+
+        dialog->setFileMode(QFileDialog::ExistingFiles);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+
+        QObject::connect(dialog, &QFileDialog::filesSelected,
+                         [this](const QStringList& filePaths)
+                         {
+                             // Under flatpak the picker returns sandboxed document-portal paths,
+                             // resolve the real host location for the recent-files list.
+                             QStringList displayUris;
+                             displayUris.reserve(filePaths.size());
+                             for (const QString& filePath : filePaths)
+                                 displayUris << QString::fromStdString(
+                                     coda::hostDisplayUriForPath(filePath));
+
+                             coda::openFiles(filePaths, displayUris);
+                             closeStarterScreen(_owner);
+
+                             // The picked document opens in its own window; return the
+                             // originating window to its document view.
+                             evalJS("window.app?.map?.backstageView?.returnToDocumentView();");
+                         });
+
+        dialog->open();
+    }
+    else if (message == "uno .uno:NewDoc" || message == "uno .uno:NewDocText" ||
+             message == "uno .uno:NewDocSpreadsheet" ||
+             message == "uno .uno:NewDocPresentation" || message == "uno .uno:NewDocDraw")
+    {
+        const char* docType = "writer";
+        if (message == "uno .uno:NewDocSpreadsheet") docType = "calc";
+        else if (message == "uno .uno:NewDocPresentation") docType = "impress";
+        else if (message == "uno .uno:NewDocDraw") docType = "draw";
+
+        if (coda::openNewDocument(docType, {}, {}))
+            closeStarterScreen(_owner);
+    }
+    else if (message == "uno .uno:SaveAs")
+    {
+        assert(_document._fakeClientFd != -1);
+
+        saveDocumentAs();
+    }
+    else if (message == "uno .uno:CloseWin")
+    {
+        // Defer: requestClose() may delete this WebView and Bridge, and we are
+        // still running inside the bridge here.
+        QPointer<WebView> owner = _owner;
+        QTimer::singleShot(0, [owner]() {
+            if (owner)
+                owner->requestClose();
+        });
+    }
+    else if (message == "uno .uno:NextDocumentTab" ||
+             message == "uno .uno:PreviousDocumentTab" ||
+             message == "uno .uno:RecentlyUsedDocumentTab")
+    {
+        const bool recentlyUsed = (message == "uno .uno:RecentlyUsedDocumentTab");
+        const int delta = (message == "uno .uno:PreviousDocumentTab") ? -1 : 1;
+        // Defer, as CloseWin does: the tab switch runs from the event loop.
+        QPointer<WebView> owner = _owner;
+        QTimer::singleShot(0, [owner, recentlyUsed, delta]() {
+            if (!owner)
+                return;
+            if (auto* tw = qobject_cast<TabbedWindow*>(owner->mainWindow()))
+            {
+                if (recentlyUsed)
+                    tw->manager()->activateRecentlyUsedTab();
+                else
+                    tw->manager()->activateAdjacentTab(delta);
+            }
+        });
+    }
+    else if (message == "uno .uno:Quit")
+    {
+        // The application exits when the last window has gone. The close runs from the event
+        // loop, so that the page-JS call this arrives on has returned before the web view it
+        // came from is destroyed.
+        QTimer::singleShot(0, []() { closeEveryWindow(); });
+    }
+    else if (tokens.equals(0, "EXCHANGEMONITORS"))
+    {
+        if (auto* coda = dynamic_cast<CODAWebEngineView*>(_webView))
+            coda->exchangeMonitors();
+    }
+    else if (tokens.equals(0, "exportfile"))
+    {
+        // Used by both .uno:SaveGraphic (Save Image) and .uno:ExportToPDF
+        // (PDF with options) — take the suggested filename from the source URL
+        // so the dialog title and default name match what was actually written.
+        std::string fileUrl;
+        if (!COOLProtocol::getTokenString(tokens, "url", fileUrl))
+        {
+            LOG_ERR("exportfile: no url= specified");
+            return {};
+        }
+
+        const QUrl srcUrl(QString::fromStdString(fileUrl));
+        const QString srcPath = srcUrl.toLocalFile();
+        if (srcPath.isEmpty() || !QFileInfo::exists(srcPath))
+        {
+            LOG_ERR("exportfile: source file not found: " << fileUrl);
+            return {};
+        }
+
+        const QFileInfo srcInfo(srcPath);
+        QString suggestedName = srcInfo.fileName();
+        if (suggestedName.isEmpty())
+        {
+            const QString ext = srcInfo.suffix();
+            suggestedName = QStringLiteral("export.") + (ext.isEmpty() ? QStringLiteral("bin") : ext);
+        }
+
+        showSaveFileDialog(_webView, QObject::tr("Save File"), suggestedName,
+                           srcPath.toStdString(),
+                           [srcPath](bool ok)
+                           {
+                               // The source stays behind on failure for another attempt.
+                               if (ok)
+                                   QFile::remove(srcPath);
+                           });
+    }
+    else if (tokens.equals(0, "extensionsavefile"))
+    {
+        // A JS extension (see browser Control.Extension.ts) generated a file -
+        // e.g. LibreLogo's PICTURE "x.svg" export - and asked to save it. The
+        // bytes travel base64 in the message; write them to a temp file and
+        // reuse the same save dialog as exportfile.
+        std::string name, data;
+        COOLProtocol::getTokenString(tokens, "name", name);
+        if (!COOLProtocol::getTokenString(tokens, "data", data))
+        {
+            LOG_ERR("extensionsavefile: no data= specified");
+            return {};
+        }
+        QString suggestedName = QUrl::fromPercentEncoding(QByteArray::fromStdString(name));
+        suggestedName = QFileInfo(suggestedName).fileName();
+        if (suggestedName.isEmpty())
+            suggestedName = QStringLiteral("file");
+        const QByteArray bytes = QByteArray::fromBase64(QByteArray::fromStdString(data));
+
+        QString tmpPath = QDir(QDir::tempPath()).filePath(suggestedName);
+        QFile tmp(tmpPath);
+        if (!tmp.open(QIODevice::WriteOnly) || tmp.write(bytes) != bytes.size())
+        {
+            LOG_ERR("extensionsavefile: could not write temp file: " << tmpPath.toStdString());
+            return {};
+        }
+        tmp.close();
+
+        showSaveFileDialog(_webView, QObject::tr("Save File"), suggestedName,
+                           tmpPath.toStdString(),
+                           [tmpPath](bool /*ok*/)
+                           {
+                               // The dialog copies to the chosen path; drop the temp either way.
+                               QFile::remove(tmpPath);
+                           });
+    }
+    else if (tokens.equals(0, "GRANTLINKEDFILES"))
+    {
+        // The document links to files the app may not read: in a sandbox, files outside the
+        // folders the app reads. Each is read from a folder the user chose, under the path the
+        // app reads it under; their links are then updated, which choosing the folder agrees to.
+        const QJsonDocument json = QJsonDocument::fromJson(
+            QByteArray::fromStdString(message.substr(std::string("GRANTLINKEDFILES ").size())));
+        QStringList hostPaths;
+        QStringList ids;
+        for (const QJsonValue& link : json.object()["links"].toArray())
+        {
+            const QUrl url(link.toObject()["url"].toString());
+            if (url.isLocalFile())
+            {
+                hostPaths << url.toLocalFile();
+                ids << link.toObject()["id"].toString();
+            }
+        }
+        if (hostPaths.isEmpty())
+            return {};
+
+        const std::function<void()> giveFiles = [this, hostPaths, ids]()
+        {
+            for (int i = 0; i < hostPaths.size(); ++i)
+            {
+                const QString readable = readablePathFor(hostPaths[i]);
+                if (readable.isEmpty() || readable == hostPaths[i])
+                    continue;
+                const std::string source =
+                    "linkedfile source id=" + Uri::encode(ids[i].toStdString()) + " file=" +
+                    Uri::encode(QUrl::fromLocalFile(readable).toString().toStdString());
+                fakeSocketWriteQueue(_document._fakeClientFd, source.c_str(), source.size());
+            }
+            const std::string allow = "allowlinkupdate";
+            fakeSocketWriteQueue(_document._fakeClientFd, allow.c_str(), allow.size());
+        };
+
+        // A folder chosen before may hold them all.
+        bool allKnown = true;
+        for (const QString& hostPath : hostPaths)
+            allKnown = allKnown && (QFileInfo(hostPath).isReadable() || !readablePathFor(hostPath).isEmpty());
+        if (allKnown)
+        {
+            giveFiles();
+            return {};
+        }
+
+        const QString folder = QFileDialog::getExistingDirectory(
+            _webView, QObject::tr("Choose the folder that holds the files this document links to"),
+            commonFolder(hostPaths));
+        if (folder.isEmpty())
+            return {};
+        rememberLinkedFolder(folder);
+        giveFiles();
+    }
+    else if (tokens.equals(0, "HYPERLINK"))
+    {
+        QString qurl = QString::fromStdString(tokens.substrFromToken(1));
+        QDesktopServices::openUrl(QUrl::fromUserInput(qurl));
+    }
+    else if (tokens.equals(0, "opendoc"))
+    {
+        // e.g. "opendoc file=%2Fhome%2F...something.odt"
+        std::string fileArg;
+        if (!COOLProtocol::getTokenString(tokens, "file", fileArg))
+        {
+            LOG_ERR("opendoc: no file= specified");
+            return {};
+        }
+        QString decodedUri = QUrl::fromPercentEncoding(QByteArray::fromStdString(fileArg));
+
+        QUrl url(decodedUri);
+        QString localPath = url.isLocalFile() ? url.toLocalFile() : decodedUri;
+        // A file outside the sandbox is read from the folder the user chose for it.
+        if (!QFileInfo(localPath).exists())
+        {
+            const QString readable = readablePathFor(localPath);
+            if (!readable.isEmpty())
+                localPath = readable;
+        }
+
+        QFileInfo fileInfo(localPath);
+        if (!fileInfo.exists() || !fileInfo.isFile())
+        {
+            LOG_ERR("opendoc: file does not exist: " << localPath.toStdString());
+            return {};
+        }
+
+        QString absolutePath = fileInfo.absoluteFilePath();
+        const QStringList displayUri{ QString::fromStdString(
+            coda::hostDisplayUriForPath(absolutePath)) };
+        coda::openFiles(QStringList() << absolutePath, displayUri);
+        closeStarterScreen(_owner);
+
+        LOG_INF("opendoc: opened file: " << absolutePath.toStdString());
+        return {};
+    }
+    else if (tokens.equals(0, "newdoc"))
+    {
+        // e.g."newdoc type=writer template=%2Fhome%2F...something.ott basename=Cool%20Text%20CV"
+        std::string typeToken, templateToken, basenameToken;
+        if (!COOLProtocol::getTokenString(tokens, "type", typeToken))
+        {
+            LOG_ERR("No type parameter in message '" << message << "'");
+            return {};
+        }
+
+        // template is optional
+        COOLProtocol::getTokenString(tokens, "template", templateToken);
+
+        // basename is optional, when provided overrides the default file
+        // names like "Text Document (1).odt" to "basename (1).odt"
+        COOLProtocol::getTokenString(tokens, "basename", basenameToken);
+
+        std::string templatePath;
+        if (!templateToken.empty())
+        {
+            templatePath =
+                QUrl::fromPercentEncoding(QByteArray::fromStdString(templateToken)).toStdString();
+        }
+
+        std::string decodedBasename;
+        Poco::URI::decode(basenameToken, decodedBasename);
+
+        if (coda::openNewDocument(typeToken, templatePath, decodedBasename))
+            closeStarterScreen(_owner);
+    }
+    else if (tokens.equals(0, "switchToServerMode"))
+    {
+        // Tear down the local-LOKit side of a remote document so the
+        // page can swap its underlying WebSocket from the FakeWebSocket
+        // (routed through this bridge to the in-process kit) to a real
+        // one pointing at the cool server.  The page-JS does the
+        // socket swap itself and also sends {"type":"bye"} on its
+        // collab WS before triggering this; here we only handle the
+        // FakeSocket teardown.  Do NOT navigate the webview - the
+        // whole point of this seamless switch (vs. the original
+        // _webView->load(coolUrl) path) is to keep the page loaded.
+        if (!_document._remoteInfo)
+            return {};
+
+        _localSessionEnded = true;
+
+        // Stop the local FakeSocket message pump.  The in-process kit
+        // will exit on its own once its socket is gone.
+        if (_closeNotificationPipeForForwardingThread[0] >= 0)
+        {
+            fakeSocketClose(_closeNotificationPipeForForwardingThread[0]);
+            _closeNotificationPipeForForwardingThread[0] = -1;
+        }
+
+        // After the swap the page's JS has muted postMobileMessage, so a subsequent closeEvent has
+        // no way to drive the JS-side _saveAndClose round-trip and would otherwise hang waiting for
+        // a CLOSE_WINDOW that can never arrive; the COOL server session handles save-on-disconnect
+        // like a plain-browser editor tab, so let teardown proceed straight away:
+        _readyToClose = true;
+    }
+    else if (tokens.equals(0, "SAVECOMPLETED"))
+    {
+        // Page-JS finished the save (and, for remote docs, the
+        // subsequent integrator upload via collab.uploadFile).
+        // Clear _saveInFlight and release any close that has been
+        // waiting on us.
+        saveCompleted();
+    }
+    else if (tokens.equals(0, "SAVEFAILED"))
+    {
+        finishSave(false);
+        // The page is about to prompt, in a tab that may be hidden.
+        if (tokens.equals(1, "prompt"))
+            if (WebView* owner = _owner.data())
+                owner->activateWindow();
+    }
+    else if (tokens.equals(0, "CLOSE_CANCELLED"))
+    {
+        if (WebView* owner = _owner.data())
+            owner->closeCancelled();
+    }
+    else if (tokens.equals(0, "CLOSE_WINDOW"))
+    {
+        // Page-JS is done with the save-if-dirty step initiated by
+        // saveAndClose() (either because the save finished, or
+        // because the doc was clean).  Trip _readyToClose so the
+        // re-entry into TabManager::closeTab (or the standalone
+        // window's closeEvent) proceeds with teardown instead of
+        // looping back here.
+        _readyToClose = true;
+        if (WebView* owner = _owner.data())
+            QMetaObject::invokeMethod(
+                owner, [owner]() { owner->requestClose(); }, Qt::QueuedConnection);
+        else if (_frame) {
+            closeAccountWindow();
+        }
+    }
+    else if (_requiresSaveAs && tokens.equals(0, "save"))
+    {
+        // The document was opened from a template and has no real file yet, so
+        // it loads from a temporary working copy. Turn the save into a Save As
+        // so the user picks a destination and format, and the working copy is
+        // never treated as the saved document.
+        saveDocumentAs();
+    }
+    else
+    {
+        // Forward arbitrary payload from JS -> Online
+        fakeSocketWriteQueue(_document._fakeClientFd, message.c_str(), message.size());
+    }
+    return {};
+}
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

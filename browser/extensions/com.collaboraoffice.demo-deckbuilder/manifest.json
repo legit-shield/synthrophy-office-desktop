@@ -1,0 +1,8 @@
+{
+    "manifestVersion": "0.2",
+    "name": "Deck builder",
+    "entry": "index.html",
+    "icon": "icon.svg",
+    "supports": ["presentation"],
+    "remote": ["remote.js"]
+}

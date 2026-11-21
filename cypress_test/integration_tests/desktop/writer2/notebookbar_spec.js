@@ -1,0 +1,651 @@
+/* global expect describe it cy beforeEach require Cypress */
+
+var helper = require('../../common/helper');
+var desktopHelper = require('../../common/desktop_helper');
+var writerHelper = require('../../common/writer_helper');
+const onboardingHelper = require('../../common/onboarding_helper');
+
+describe(['tagdesktop'], 'Notebookbar tests.', function() {
+
+	beforeEach(function() {
+		helper.setupAndLoadDocument('writer/notebookbar.odt');
+		desktopHelper.switchUIToNotebookbar();
+		cy.viewport(1920,1080);
+
+		if (Cypress.env('INTEGRATION') === 'nextcloud') {
+			desktopHelper.showSidebar();
+		}
+
+		writerHelper.selectAllTextOfDoc();
+		cy.getFrameWindow().then((win) => {
+			this.win = win;
+		});
+	});
+
+	// the ids of the groups of the Home tab that are folded
+	function foldedHomeGroups() {
+		return cy.cGet('#Home-container .ui-overflow-group').then(function($groups) {
+			return Array.from($groups)
+				.filter((group) => !group.classList.contains('ui-overflow-group-container-with-label'))
+				.map((group) => group.id);
+		});
+	}
+
+	it('Check collapsed state after mode switch', function() {
+		cy.viewport(900, 600);
+		helper.processToIdle(this.win); // stabilize
+
+		foldedHomeGroups().then(function(before) {
+			expect(before, 'groups folded at 900px').to.not.be.empty;
+			desktopHelper.switchUIToCompact();
+			desktopHelper.switchUIToNotebookbar();
+			helper.processToIdle(this.win);
+			foldedHomeGroups().should('deep.equal', before);
+		}.bind(this));
+	});
+
+	it('A group that folded stays folded while the window gets narrower', function() {
+		let folded = [];
+		[1600, 1400, 1200, 1100, 1000, 900, 800, 700].forEach(function(width) {
+			cy.viewport(width, 600);
+			helper.processToIdle(this.win);
+			foldedHomeGroups().then(function(now) {
+				for (const id of folded)
+					expect(now, id + ' is still folded at ' + width + 'px').to.include(id);
+				folded = now;
+			});
+		}.bind(this));
+
+		// the style gallery gives way before the groups to its left
+		cy.cGet('.ui-overflow-group#home-stylesview-group')
+			.should('not.have.class', 'ui-overflow-group-container-with-label');
+	});
+
+	it('Overflow groups should not folded after switching from tabbed to compact mode', function() {
+		// Ensure wide viewport where all groups fit without folding
+		cy.viewport(1920, 1080);
+
+		desktopHelper.switchUIToCompact();
+		cy.cGet('#toolbar-up').should('be.visible');
+
+		cy.getFrameWindow().then((win) => {
+			helper.processToIdle(win);
+		});
+
+		// All foldable groups should be expanded in compact mode
+		cy.cGet('#toolbar-up .ui-overflow-group:not(.nofold):not(.ui-overflow-group-container-with-label)')
+			.should('have.length', 0);
+	});
+
+	it('OverflowGroup collapse state preserved after mode switch', function() {
+		cy.viewport(900, 600);
+		helper.processToIdle(this.win);
+
+		// At this width some groups should be collapsed and some expanded
+		cy.cGet('.notebookbar .ui-overflow-group:not(.nofold):not(.ui-overflow-group-container-with-label)')
+			.should('have.length.greaterThan', 0);
+		cy.cGet('.notebookbar .ui-overflow-group.ui-overflow-group-container-with-label')
+			.should('have.length.greaterThan', 0);
+
+		// Save the number of expanded groups before switching
+		cy.cGet('.notebookbar .ui-overflow-group.ui-overflow-group-container-with-label')
+			.then($expanded => cy.wrap($expanded.length).as('expandedCount'));
+
+		// Switch to compact UI via View tab
+		desktopHelper.switchUIToCompact();
+		// Switch back to notebookbar via View menu
+		desktopHelper.switchUIToNotebookbar();
+
+		// Wait for layout stabilization after mode switch
+		cy.getFrameWindow().then((win) => {
+			helper.processToIdle(win);
+		});
+
+		// Verify the number of expanded groups is preserved (bug: all were collapsed)
+		cy.get('@expandedCount').then(expandedCount => {
+			cy.cGet('.notebookbar .ui-overflow-group.ui-overflow-group-container-with-label')
+				.should('have.length', expandedCount);
+		});
+	});
+
+	it('Apply bold font from dropdown in Format tab', function() {
+		helper.setDummyClipboardForCopy();
+		cy.cGet('.notebookbar #Format-tab-label').click();
+		desktopHelper.getNbIconArrow('FormatMenu', 'Format').click();
+		desktopHelper.getDropdown('format-FormatMenu').should('exist');
+		desktopHelper.getDropdown('format-FormatMenu').contains('.ui-combobox-entry', 'Bold').click();
+		desktopHelper.getDropdown('format-FormatMenu').should('not.exist');
+		writerHelper.selectAllTextOfDoc();
+		helper.copy();
+		cy.cGet('#copy-paste-container p b').should('exist');
+	});
+
+	it('Check label showing heuristic', function() {
+		// no label
+		cy.cGet('.notebookbar .unoBold').should('be.visible');
+		cy.cGet('.notebookbar .unoBold span').should('not.exist');
+
+		// with label
+		cy.cGet('.notebookbar #Review-tab-label').click();
+		cy.cGet('.notebookbar .unoSpellOnline').should('be.visible');
+		cy.cGet('.notebookbar .unoSpellOnline label').contains('Auto Spell Check');
+	});
+
+	it('A folded group opens from anywhere on its button', function() {
+		cy.viewport(700, 600);
+		helper.processToIdle(this.win);
+
+		cy.then(() => {
+			this.fontHeight = this.win.app.map.stateChangeHandler.getItemValue('.uno:FontHeight');
+		});
+
+		// the main part of the button, not its arrow
+		cy.cGet('#Home-container .unotoolbutton[id^="overflow-button-home-font"] > button.unobutton').click();
+		cy.cGet('[id^="overflow-button-home-font"].modalpopup').should('be.visible');
+		cy.cGet('[id^="overflow-button-home-font"].modalpopup .unoBold').should('be.visible');
+
+		// the click opens the group and applies nothing
+		cy.then(() => helper.processToIdle(this.win));
+		cy.then(() => {
+			expect(this.win.app.map.stateChangeHandler.getItemValue('.uno:FontHeight')).to.equal(this.fontHeight);
+		});
+	});
+
+	it('A folded group shows no state of the commands inside it', function() {
+		cy.viewport(700, 600);
+		helper.processToIdle(this.win);
+
+		// Bullets are the first command of the Paragraph group.
+		helper.typeIntoDocument('text');
+		cy.then(() => this.win.app.map.sendUnoCommand('.uno:DefaultBullet'));
+		helper.waitForMapState('.uno:DefaultBullet', 'true');
+
+		const button = '#Home-container .unotoolbutton[id^="overflow-button-home-paragraph"]';
+		cy.cGet(button).should('be.visible').should('not.have.class', 'selected');
+		cy.cGet(button + ' > button.unobutton').should('not.have.attr', 'aria-pressed');
+		cy.cGet(button + ' > button.unobutton').should('have.attr', 'aria-haspopup', 'true');
+		// The arrow is part of the one button, so it takes no focus of its own.
+		cy.cGet(button + ' .arrowbackground').should('have.attr', 'aria-hidden', 'true');
+	});
+});
+
+describe(['tagdesktop'], 'Notebookbar checkbox widgets', function() {
+	var newFilePath;
+
+	beforeEach(function() {
+		newFilePath = helper.setupAndLoadDocument('writer/notebookbar.odt');
+		desktopHelper.switchUIToNotebookbar();
+		cy.cGet('#View-tab-label').click();
+		cy.getFrameWindow().then((win) => {
+			this.win = win;
+			helper.processToIdle(win);
+		});
+	});
+
+	it('Ruler Toggle', function() {
+		cy.cGet('#showruler').should('be.visible');
+		cy.cGet('#showruler-input').should('be.visible').should('not.be.checked');
+		cy.cGet('.cool-ruler').should('not.be.visible');
+
+		cy.cGet('#showruler-input').check();
+		cy.cGet('#showruler-input').should('be.checked');
+		cy.cGet('.cool-ruler').should('be.visible');
+		helper.processToIdle(this.win);
+
+		cy.cGet('#lo-fline-marker').should('exist');
+
+		cy.cGet('#lo-fline-marker').should(function($marker) {
+			const left = parseFloat($marker[0].style.left);
+			expect(left).to.be.finite;
+		});
+
+		// Drag the first-line indentation marker right by 100px. Body has a
+		// fixed origin, so the move offsets stay correct as the marker moves
+		// during the drag, and holding y at the marker centre keeps the
+		// pointer over the marker the whole time.
+		var marker;
+		var startX;
+		var startY;
+		var startLeft;
+		cy.cGet('#lo-fline-marker').then(function(items) {
+			expect(items).to.have.lengthOf(1);
+			marker = items[0];
+			const boundingRectangle = marker.getBoundingClientRect();
+			startLeft = boundingRectangle.left;
+			startX = boundingRectangle.left + boundingRectangle.width / 2;
+			startY = boundingRectangle.top + boundingRectangle.height / 2;
+
+			cy.cGet('body').realMouseDown({ x: startX, y: startY });
+		});
+		helper.processToIdle(this.win);
+
+		// A single realMouseMove can be dropped under CI load before the
+		// browser handler runs, so re-send the move each poll until the
+		// marker leaves its start position. The target is a fixed viewport
+		// point, so re-firing it is safe.
+		cy.then(function() {
+			helper.retryUntil(
+				function() { cy.cGet('body').realMouseMove(startX + 100, startY); },
+				function() { return marker.getBoundingClientRect().left !== startLeft; });
+		});
+		helper.processToIdle(this.win);
+
+		cy.then(function() {
+			cy.cGet('body').realMouseUp({ x: startX + 100, y: startY });
+		});
+		helper.processToIdle(this.win);
+
+		// Re-read the marker position on each retry: the drag end round-trips
+		// .uno:LeftRightParaMargin before the DOM settles, so the post-drag
+		// position can't be frozen into a constant.
+		cy.then(function() {
+			cy.cGet('#lo-fline-marker').should(function($items) {
+				expect($items).to.have.lengthOf(1);
+				expect($items[0].getBoundingClientRect().left).to.not.equal(startLeft);
+			});
+		});
+
+		// Check that there are no tab stops.
+		cy.cGet('.cool-ruler-tabstop-left').should('not.exist');
+		// Add a tab stop with a double click.
+		cy.cGet('.cool-ruler-horizontal-tabstopcontainer').dblclick();
+		// Check that a new tab stop is added.
+		cy.cGet('.cool-ruler-tabstop-left').should('exist');
+
+		cy.cGet('#showruler-input').uncheck();
+		cy.cGet('#showruler-input').should('not.be.checked');
+		cy.cGet('.cool-ruler').should('not.be.visible');
+	});
+
+	it('Ruler visible after reload', function() {
+		cy.cGet('#showruler').should('be.visible');
+
+		// Enable if not checked
+		cy.cGet('#showruler-input').then(($input) => {
+			if (!$input.is(':checked')) {
+				cy.wrap($input).check();
+			}
+		});
+
+		cy.cGet('#showruler-input').should('be.checked');
+		cy.cGet('.cool-ruler').should('be.visible');
+
+		// Reload
+		helper.reloadDocument(newFilePath);
+
+		// Verify ruler is still visible
+		cy.cGet('.cool-ruler').should('be.visible');
+	});
+
+	it('StatusBar Toggle', function() {
+		cy.cGet('#showstatusbar').should('be.visible');
+		cy.cGet('#showstatusbar-input').should('be.visible').should('be.checked');
+		cy.cGet('#toolbar-down').should('be.visible');
+
+		cy.cGet('#showstatusbar-input').uncheck();
+		cy.cGet('#showstatusbar-input').should('not.be.checked');
+		cy.cGet('#toolbar-down').should('not.be.visible');
+
+		cy.cGet('#showstatusbar-input').check();
+		cy.cGet('#showstatusbar-input').should('be.checked');
+		cy.cGet('#toolbar-down').should('be.visible');
+	});
+});
+
+describe(['tagdesktop'], 'Notebookbar review operations.', function() {
+	it.skip('Go to the next change', function() {
+		// Given a document where the first redline is inside a table:
+		helper.setupAndLoadDocument('writer/notebookbar-redline.odt');
+		desktopHelper.switchUIToNotebookbar();
+		cy.viewport(1920,1080);
+
+		// When going to the next redline:
+		cy.cGet('#Review-tab-label').click();
+		cy.cGet('#Review-tab-label').should('have.class', 'selected');
+		cy.cGet('#overflow-button-review-tracking .arrowbackground').click();
+		cy.cGet('#review-next-tracked-change-button').click();
+		cy.cGet('#Table-tab-label').should('not.have.class', 'hidden');
+
+		// Then make sure that by the time the Table tab is visible, the Review tab is still
+		// selected:
+		// Without the accompanying fix in place, this test would have failed with:
+		// AssertionError: Timed out retrying after 10000ms: expected '<button#Review-tab-label.ui-tab.notebookbar>' to have class 'selected'
+		cy.cGet('#Review-tab-label').should('have.class', 'selected');
+	});
+});
+
+describe(['tagdesktop'], 'Notebookbar contextual tabs.', function() {
+
+	it('Image inside a table offers both the Picture and the Table tab', function() {
+		helper.setupAndLoadDocument('writer/table_operation.odt');
+		desktopHelper.switchUIToNotebookbar();
+		cy.viewport(1920,1080);
+
+		// The document opens with the cursor in the first table cell. Insert
+		// an image there: it is anchored in the cell and stays selected.
+		desktopHelper.insertImage();
+
+		// The image's tab takes over, and the tab of the surrounding table is
+		// offered alongside it.
+		cy.cGet('#Picture-tab-label').should('be.visible');
+		cy.cGet('#Picture-tab-label').should('have.class', 'selected');
+		cy.cGet('#Table-tab-label').should('be.visible');
+
+		// The table tab is reachable while the image is still selected.
+		// (That its commands then operate on the cell holding the image is
+		// covered by the SwUibaseUiviewTest unit test.)
+		cy.cGet('#Table-tab-label').click();
+		cy.cGet('#Table-tab-label').should('have.class', 'selected');
+	});
+
+	it('Image not in a table does not offer the Table tab', function() {
+		// A document without any table.
+		helper.setupAndLoadDocument('writer/image_operation.odt');
+		desktopHelper.switchUIToNotebookbar();
+		cy.viewport(1920,1080);
+
+		desktopHelper.insertImage();
+
+		// Only the image's tab is offered, no table tab.
+		cy.cGet('#Picture-tab-label').should('be.visible');
+		cy.cGet('#Picture-tab-label').should('have.class', 'selected');
+		cy.cGet('#Table-tab-label').should('not.be.visible');
+	});
+});
+
+describe(['tagdesktop'], 'HideChangeTrackingControls mode tests.', function() {
+	it('Check that track change controls are not shown', function() {
+		helper.setupAndLoadDocument('writer/hide_change_tracking_controls.odt', /* isMultiUser */ false, /* copyCertificates copies .wopi.json */ true);
+		desktopHelper.switchUIToNotebookbar();
+		cy.viewport(1920,1080);
+
+		cy.cGet('.notebookbar #Review-tab-label').click();
+		cy.cGet('.notebookbar #Review-container').should('exist');
+		cy.cGet('.notebookbar #review-tracking').should('not.exist');
+		cy.cGet('.notebookbar .unoTrackChanges').should('not.exist');
+		cy.cGet('.notebookbar .unoShowTrackedChanges').should('not.exist');
+		cy.cGet('.notebookbar .unoNextTrackedChange').should('not.exist');
+		cy.cGet('.notebookbar .unoPreviousTrackedChange').should('not.exist');
+		cy.cGet('.notebookbar .unoAcceptTrackedChangeToNext').should('not.exist');
+		cy.cGet('.notebookbar .unoRejectTrackedChangeToNext').should('not.exist');
+		cy.cGet('.notebookbar .unoReinstateTrackedChange').should('not.exist');
+		cy.cGet('.notebookbar .unoAcceptTrackedChanges').should('not.exist');
+	});
+});
+
+describe(['tagdesktop'], 'Notebookbar of a document opened in compact view.', function() {
+	var USER = 'compact-view';
+
+	beforeEach(function() {
+		cy.viewport(1920,1080);
+		cy.task('writeUserSetting', { userId: USER, settings: { compactMode: 'true' } });
+		var newFilePath = helper.setupDocument('writer/notebookbar.odt');
+		helper.loadDocument(newFilePath, /*skipDocumentChecks*/ true, undefined, undefined, 'userid=' + USER);
+		cy.cGet('#map').should('have.class', 'initialized');
+		cy.cGet('body').should('have.attr', 'data-userInterfaceMode', 'classic');
+		cy.cGet('#busypopup-overlay').should('not.exist');
+		Cypress.env('USER_INTERFACE', 'notebookbar');
+		cy.getFrameWindow().then((win) => {
+			this.win = win;
+		});
+	});
+
+	it('The selected tab expands the notebookbar again after the switch to tabbed view', function() {
+		helper.processToIdle(this.win);
+		cy.cGet('#menu-view').click();
+		cy.cGet('#menu-toggleuimode').click();
+		cy.cGet('.notebookbar-scroll-wrapper').should('have.class', 'initialized');
+		helper.processToIdle(this.win);
+
+		desktopHelper.selectNotebookbarTab('View');
+		desktopHelper.getNbItem('collapsenotebookbar', 'View').should('not.have.attr', 'disabled');
+		desktopHelper.getNbIcon('collapsenotebookbar', 'View').click();
+		cy.cGet('#document-container').should('have.class', 'tabs-collapsed');
+		cy.cGet('#View-container').should('not.be.visible');
+
+		cy.cGet('#View-tab-label').click();
+		cy.cGet('#document-container').should('not.have.class', 'tabs-collapsed');
+		cy.cGet('#View-container').should('be.visible');
+	});
+});
+
+describe(['tagdesktop'], 'Onboarding tour on a first visit.', function() {
+
+	beforeEach(function() {
+		// This user has not been shown the tour yet.
+		localStorage.setItem(onboardingHelper.tourSeenKey('text'), 'false');
+
+		helper.setupAndLoadDocument('writer/notebookbar.odt');
+		cy.viewport(1920,1080);
+		cy.getFrameWindow().then((win) => {
+			this.win = win;
+		});
+	});
+
+	it('Someone opening a document for the first time is welcomed by the tour', function() {
+		onboardingHelper.assertStep(this.win, 'intro');
+
+		// The welcome card stands on its own, with nothing singled out behind it.
+		cy.cGet('.onboarding-highlight').should('not.exist');
+
+		// The welcome is remembered as soon as it appears, so a tour that is closed
+		// in any way at all is not offered again.
+		cy.then(() => {
+			expect(this.win.prefs.getBoolean(onboardingHelper.tourSeenKey('text'))).to.be.true;
+			expect(this.win.localStorage.getItem(onboardingHelper.tourSeenKey('text'))).to.equal('true');
+		});
+
+		// The next card puts the ring on the part of the screen it talks about,
+		// and on nothing else.
+		cy.cGet('#onboarding-next-button').click();
+		cy.cGet('.onboarding-highlight').should('have.length', 1);
+	});
+});
+
+describe(['tagdesktop'], 'Onboarding tour on a later visit.', function() {
+
+	beforeEach(function() {
+		// This user has been shown the tour already, so nothing opens on its own
+		// and each test below decides when the tour starts.
+		localStorage.setItem(onboardingHelper.tourSeenKey('text'), 'true');
+
+		helper.setupAndLoadDocument('writer/notebookbar.odt');
+		cy.viewport(1920,1080);
+		cy.getFrameWindow().then((win) => {
+			this.win = win;
+			helper.processToIdle(win);
+		});
+	});
+
+	it('Someone who has seen the tour is not welcomed again', function() {
+		// A tour that opens on its own does so in a layout task, once the document
+		// is drawn and the sidebar has shown. The document checks have seen both,
+		// so once layout is idle the tour has had its chance to open.
+		cy.then(() => {
+			helper.processToIdle(this.win);
+		});
+
+		cy.cGet('#modal-dialog-onboarding-tour').should('not.exist');
+		cy.then(() => {
+			expect(this.win.app.onboardingTour.isRunning()).to.be.false;
+		});
+	});
+
+	it('Walking through the tour singles out the place each card describes', function() {
+		desktopHelper.switchUIToNotebookbar();
+		cy.then(() => {
+			helper.processToIdle(this.win);
+		});
+
+		onboardingHelper.startTour(this.win);
+		onboardingHelper.assertStep(this.win, 'intro');
+		cy.then(() => {
+			expect(this.win.app.onboardingTour.isRunning()).to.be.true;
+		});
+
+		// The first card has nowhere to go back to.
+		cy.cGet('#onboarding-back-button').should('be.disabled');
+		cy.cGet('#onboarding-progress .ui-progressdots-current').should('have.length', 1);
+
+		let welcomeProgress;
+		cy.cGet('#onboarding-progress').then(($progress) => {
+			welcomeProgress = $progress.text().trim();
+		});
+
+		// Going forward moves on to another card, and how far along the tour is
+		// says so.
+		let secondStepId;
+		cy.cGet('#onboarding-next-button').click();
+		onboardingHelper.waitForCard(this.win);
+		cy.cGet('#onboarding-progress').should(($progress) => {
+			expect($progress.text().trim()).to.not.equal(welcomeProgress);
+		});
+		cy.then(() => {
+			secondStepId = this.win.app.onboardingTour.currentStepId();
+			expect(secondStepId).to.not.equal('intro');
+		});
+
+		// The keyboard focus stays in the card on its Next button, so the next key
+		// the user presses moves the tour on and does not reach the document.
+		cy.cGet('#onboarding-next-button').should(($button) => {
+			expect(this.win.document.activeElement).to.equal($button[0]);
+		});
+		// It is still there once everything has settled, not only for a moment.
+		cy.then(() => {
+			helper.processToIdle(this.win);
+		});
+		cy.cGet('#onboarding-next-button').then(($button) => {
+			expect(this.win.document.activeElement).to.equal($button[0]);
+		});
+
+		// Going back returns to the card the tour opened on.
+		cy.cGet('#onboarding-back-button').click();
+		onboardingHelper.assertStep(this.win, 'intro');
+		cy.cGet('#onboarding-progress').should(($progress) => {
+			expect($progress.text().trim()).to.equal(welcomeProgress);
+		});
+
+		// While the card has the focus, the right arrow key goes forward to the
+		// same card the Next button reached.
+		cy.cGet('#onboarding-next-button').focus();
+		cy.realPress('ArrowRight');
+		cy.then(() => {
+			onboardingHelper.assertStep(this.win, secondStepId);
+		});
+
+		// The left arrow key goes back to the card the tour opened on.
+		cy.cGet('#onboarding-next-button').focus();
+		cy.realPress('ArrowLeft');
+		onboardingHelper.assertStep(this.win, 'intro');
+
+		// The card about the document name highlights the name of the document.
+		onboardingHelper.stepForwardTo(this.win, 'document-name', 3);
+		onboardingHelper.assertHighlighted('#document-titlebar .document-title');
+
+		// Escape leaves the tour and hands the document back.
+		cy.cGet('#onboarding-next-button').focus();
+		cy.realPress('Escape');
+		onboardingHelper.assertTourEnded(this.win);
+	});
+
+	it('The tour can be left part way through, and the document is usable again', function() {
+		// Closing the tour from its second card leaves nothing of it behind.
+		onboardingHelper.startTour(this.win);
+		cy.cGet('#onboarding-next-button').click();
+		onboardingHelper.waitForCard(this.win);
+		cy.cGet(onboardingHelper.cardSelector + ' .ui-dialog-titlebar-close').click();
+		onboardingHelper.assertTourEnded(this.win);
+
+		// Skipping the tour from the same place does the same.
+		onboardingHelper.startTour(this.win);
+		cy.cGet('#onboarding-next-button').click();
+		onboardingHelper.waitForCard(this.win);
+		cy.cGet('#onboarding-skip-button').click();
+		onboardingHelper.assertTourEnded(this.win);
+	});
+
+	it('The focus stays in the tour while one card replaces another', function() {
+		onboardingHelper.startTour(this.win);
+		onboardingHelper.assertStep(this.win, 'intro');
+		cy.cGet('#onboarding-next-button').focus();
+
+		// A screen reader follows the focus, which moves into the new card before the old one
+		// goes, so the reader is told of the new card and has no other place in between.
+		const outside = [];
+		let replaced = 0;
+		let observer;
+		cy.then(() => {
+			const doc = this.win.document;
+			observer = new this.win.MutationObserver((mutations) => {
+				const gone = mutations.some((mutation) => Array.from(mutation.removedNodes)
+					.some((node) => node.id === 'modal-dialog-onboarding-tour'));
+				if (!gone)
+					return;
+				++replaced;
+				const card = doc.getElementById('modal-dialog-onboarding-tour-next');
+				if (!card || !card.contains(doc.activeElement))
+					outside.push(this.win.app.onboardingTour.currentStepId());
+			});
+			observer.observe(doc.body, { childList: true, subtree: true });
+		});
+
+		cy.realPress('Enter');
+		cy.wrap(null).should(() => {
+			expect(replaced, 'cards replaced').to.be.greaterThan(0);
+		});
+		// the button of the new card
+		cy.then(() => {
+			helper.processToIdle(this.win);
+		});
+		cy.cGet('#onboarding-next-button').should(($button) => {
+			expect(this.win.document.activeElement).to.equal($button[0]);
+		});
+
+		cy.then(() => {
+			observer.disconnect();
+			expect(outside, 'cards removed with the focus outside the new card').to.be.empty;
+		});
+
+		// Only a card that points at nothing dims the page.
+		cy.cGet('#modal-dialog-onboarding-tour-next-overlay').should('not.have.class', 'dimmed');
+		cy.cGet('#onboarding-back-button').click();
+		onboardingHelper.assertStep(this.win, 'intro');
+		cy.cGet('#modal-dialog-onboarding-tour-overlay').should('have.class', 'dimmed');
+	});
+
+	it('Leaving the tour gives the focus to the document, wherever it started from', function() {
+		desktopHelper.switchUIToNotebookbar();
+		cy.then(() => {
+			helper.processToIdle(this.win);
+		});
+		// once: a click on the selected tab collapses the notebookbar
+		cy.cGet('#Help-tab-label').click();
+
+		const ways = [
+			() => cy.cGet('#onboarding-skip-button').click(),
+			() => {
+				cy.cGet('#onboarding-next-button').focus();
+				cy.realPress('Escape');
+			},
+			() => cy.cGet(onboardingHelper.cardSelector + ' .ui-dialog-titlebar-close').click(),
+		];
+		for (const leave of ways) {
+			// Started from the keyboard, the tour opens with the focus on its button.
+			cy.cGet('#onboardingtour-button').focus();
+			cy.realPress('Enter');
+			onboardingHelper.assertStep(this.win, 'intro');
+			cy.cGet('#onboarding-next-button').click();
+			onboardingHelper.waitForCard(this.win);
+
+			leave();
+			onboardingHelper.assertTourEnded(this.win);
+			cy.then(() => {
+				helper.processToIdle(this.win);
+			});
+			cy.wrap(null).should(() => {
+				expect(this.win.app.map._textInput.hasFocus(), 'the document has the focus')
+					.to.equal(true);
+			});
+		}
+	});
+});

@@ -1,0 +1,12 @@
+ext {
+    coAppName         = '@APP_NAME@'
+    coSrcRoot         = '@LOBUILDDIR@'
+    coInstdir         = '@LOBUILDDIR@/instdir'
+    coExampleDocument = '@LOBUILDDIR@/android/default-document/example.odt'
+    coVersionMajor    = '@COOLWSD_VERSION_MAJOR@'
+    coVersionMinor    = '@COOLWSD_VERSION_MINOR@'
+    coVersionHash     = '@COOLWSD_VERSION_HASH@'
+    coApplicationId   = '@APP_PACKAGE_NAME@'
+    coGooglePlay      = '@APP_GOOGLE_PLAY@'
+    coAbiSplit        = [@ANDROID_ABI_SPLIT@]
+}

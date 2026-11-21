@@ -1,0 +1,235 @@
+/* CSS specific for desktop browsers. */
+
+#coolwsd-version span:before {
+	content: ' (';
+	white-space: pre;
+}
+#coolwsd-version span:after {
+	content: ')';
+}
+
+/* btns hover status
+   Rules not intended for touch devices */
+.ui-toggle button:hover,
+.button-secondary:hover,
+button:not(.ui-corner-all):not(.button):not(.button-primary):not(.unobutton):not(.form-field-button):not(.notebookbar.ui-tab):not(.ui-expander-btn):not(.arrowbackground):not(.ui-combobox-button):not(.inserttable-grid .col):not(.spinfieldbutton-up):not(.spinfieldbutton-down):not(.ui-treeview-header-button):not(.ui-chip-main):not(.ui-chip-action):not(.slide-import-source-main):not([aria-disabled='true']):not(.snackbar *):hover {
+	cursor: pointer;
+	color: var(--color-text-darker) !important;
+	background-color: var(--color-background-lighter) !important;
+	border: 1px solid var(--color-border-darker);
+}
+
+/* Compact mode: a title row above the menu row */
+
+[data-userinterfacemode='classic'] {
+	--compact-title-font-size: calc(var(--default-font-size) * 18 / 14);
+}
+
+[data-userinterfacemode='classic'] :is(.main-nav, #toolbar-wrapper),
+[data-userinterfacemode='classic'] :is(.main-nav, #toolbar-wrapper) :is(a, button, input, select, label, .unolabel) {
+	font-family: var(--cool-font);
+	font-size: var(--default-font-size);
+	font-weight: normal;
+}
+
+[data-userinterfacemode='classic'] .main-nav {
+	--header-actions-offset: 3px;
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) repeat(5, auto);
+	grid-template-rows: 24px 24px;
+	align-items: center;
+	column-gap: var(--spacing-s);
+	height: auto;
+	padding-block: var(--spacing-s) 1px;
+}
+
+@media (max-width: 900px) {
+	[data-userinterfacemode='classic'] .main-nav {
+		--header-actions-offset: 0px;
+	}
+}
+
+[data-userinterfacemode='classic'] .main-nav::after {
+	display: none;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #document-header {
+	grid-row: 1 / span 2;
+	grid-column: 1;
+	align-self: stretch;
+	display: flex;
+	align-items: center;
+	width: auto;
+	height: auto;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #document-header > a.document-logo {
+	width: 44px;
+	height: 44px;
+	padding: 0;
+	margin-inline-start: var(--spacing-s);
+	background-size: 44px !important;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #document-titlebar {
+	grid-row: 1;
+	grid-column: 2;
+	display: flex;
+	min-width: 0;
+	max-height: none;
+}
+
+[data-userinterfacemode='classic'] .main-nav .document-title {
+	justify-content: flex-start;
+	align-items: baseline;
+	flex-wrap: nowrap;
+	min-width: 0;
+}
+
+[data-userinterfacemode='classic'] .main-nav #document-name-input,
+[data-userinterfacemode='classic'] .main-nav #document-name-input.editable {
+	font-size: var(--compact-title-font-size) !important;
+	flex: 0 1 auto;
+	width: auto !important;
+	box-sizing: border-box;
+	height: 24px !important;
+	margin-top: 0;
+	text-align: start;
+}
+
+[data-userinterfacemode='classic'] #document-name-input {
+	flex: 0 1 auto;
+	field-sizing: content;
+	width: auto;
+	min-width: 4ch;
+	max-width: 100%;
+	text-align: start;
+}
+
+[data-userinterfacemode='classic'] #document-last-saved:not([hidden]) {
+	display: inline;
+	flex: 0 0 auto;
+	color: var(--color-text-light);
+	border-radius: var(--border-radius);
+	padding-inline: var(--spacing-xs);
+}
+
+[data-userinterfacemode='classic'] #document-last-saved[role='button'] {
+	cursor: pointer;
+}
+
+[data-userinterfacemode='classic'] #document-last-saved[role='button']:hover {
+	color: var(--color-text-darker);
+	background-color: var(--color-background-darker);
+}
+
+[data-userinterfacemode='classic'] #menu-last-mod {
+	display: none !important;
+}
+
+[data-userinterfacemode='classic'] .main-nav > :is(#userListHeader, #viewMode, #shareAsContainer, #closebuttonwrapper) {
+	position: relative;
+	top: var(--header-actions-offset);
+}
+
+[data-userinterfacemode='classic'] .main-nav > #userListHeader {
+	grid-row: 1;
+	grid-column: 3;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #viewMode {
+	grid-row: 1;
+	grid-column: 4;
+	margin: 0;
+}
+
+[data-userinterfacemode='classic'] .main-nav > :is(#viewMode, #shareAsContainer) .unolabel {
+	font-size: var(--compact-title-font-size);
+}
+
+[data-userinterfacemode='classic'] .main-nav > #shareAsContainer {
+	grid-row: 1;
+	grid-column: 5;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #shareAsContainer #shareas {
+	height: var(--btn-size-s);
+	border-color: var(--color-btn-border);
+}
+
+[data-userinterfacemode='classic'] .main-nav > #shareAsContainer #shareas img {
+	display: none;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #shareAsContainer #shareas .unobutton {
+	height: 100%;
+	padding-block: 0;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #closebuttonwrapperseparator {
+	grid-row: 1;
+	grid-column: 6;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #closebuttonwrapper {
+	grid-row: 1;
+	grid-column: 7;
+	width: 24px;
+	height: 24px;
+	margin: 0;
+	margin-inline-end: 2px;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #main-menu {
+	grid-row: 2;
+	grid-column: 2 / -1;
+	margin-inline-start: calc(var(--spacing-xs) - var(--spacing-m));
+	float: none;
+}
+
+[data-userinterfacemode='classic'] .main-nav > #main-menu > li > a {
+	padding-block: 0;
+	line-height: 22px;
+}
+
+[data-userinterfacemode='classic'] #toolbar-up #documentmenu-button {
+	background: var(--doc-icon-url) center / 16px 16px no-repeat;
+}
+
+[data-userinterfacemode='classic'] #documentmenu-content {
+	min-width: 240px;
+}
+
+[data-userinterfacemode='classic'] #documentmenu-dropdown {
+	max-height: calc(100vh - 38px);
+	overflow-y: auto;
+}
+
+[data-userinterfacemode='classic'] #documentmenu-dropdown :is(.ui-dialog-content, #documentmenu-entries) {
+	max-height: none;
+	overflow-y: visible;
+}
+
+[data-userinterfacemode='classic'] #documentmenu-header {
+	display: block;
+	box-sizing: border-box;
+	width: 0;
+	min-width: 100%;
+	overflow: hidden;
+	padding: var(--spacing-s) var(--spacing-m);
+	border-bottom: 1px solid var(--color-border);
+	font-weight: 600;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+[data-userinterfacemode='classic'] #documentmenu-header.ui-grid-cell {
+	grid-template-columns: minmax(0, max-content) max-content;
+	justify-content: start;
+	column-gap: 0;
+}
+
+[data-userinterfacemode='classic'] #documentmenu-header-start {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}

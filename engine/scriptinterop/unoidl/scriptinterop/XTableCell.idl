@@ -1,0 +1,37 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** A cell of a table. Its children are the paragraphs and tables in it.
+
+    @gas TableCell
+ */
+interface XTableCell: XContainerElement {
+    /** Returns the paragraphs and tables of the cell, in document order. */
+    sequence<XElement> getChildren();
+
+    /** This always returns 1 for now, even for a horizontally merged cell.
+
+        @gas TableCell.getColSpan
+     */
+    long getColSpan();
+
+    /** Returns the number of rows the cell spans, at least 1.
+
+        @gas TableCell.getRowSpan
+     */
+    long getRowSpan();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

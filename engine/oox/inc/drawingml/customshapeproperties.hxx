@@ -1,0 +1,226 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following license notice:
+ *
+ *   Licensed to the Apache Software Foundation (ASF) under one or more
+ *   contributor license agreements. See the NOTICE file distributed
+ *   with this work for additional information regarding copyright
+ *   ownership. The ASF licenses this file to you under the Apache
+ *   License, Version 2.0 (the "License"); you may not use this file
+ *   except in compliance with the License. You may obtain a copy of
+ *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+ */
+
+#ifndef INCLUDED_OOX_DRAWINGML_CUSTOMSHAPEPROPERTIES_HXX
+#define INCLUDED_OOX_DRAWINGML_CUSTOMSHAPEPROPERTIES_HXX
+
+#include <memory>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+#include <com/sun/star/awt/Rectangle.hpp>
+#include <com/sun/star/awt/Size.hpp>
+#include <com/sun/star/beans/PropertyValue.hpp>
+#include <cpo/uno/Sequence.hxx>
+#include <com/sun/star/drawing/EnhancedCustomShapeParameterPair.hpp>
+#include <com/sun/star/drawing/EnhancedCustomShapeSegment.hpp>
+#include <com/sun/star/drawing/XShape.hpp>
+#include <oox/helper/helper.hxx>
+#include <oox/helper/propertymap.hxx>
+#include <oox/token/tokens.hxx>
+
+namespace oox::drawingml {
+
+class CustomShapeProperties;
+
+typedef std::shared_ptr< CustomShapeProperties > CustomShapePropertiesPtr;
+
+struct CustomShapeGuide
+{
+    OUString   maName;
+    OUString   maFormula;
+};
+
+class CustomShapeGuideContainer
+{
+public:
+    sal_Int32 GetCustomShapeGuideValue( const OUString& rFormulaName ) const;
+    sal_Int32 SetCustomShapeGuideValue( const CustomShapeGuide& rGuide );
+
+    void push_back( const CustomShapeGuide& rGuide );
+    size_t size() const { return maGuideList.size(); };
+    bool empty() const { return maGuideList.empty(); };
+    std::vector< CustomShapeGuide >::const_iterator begin() const { return maGuideList.begin(); };
+    std::vector< CustomShapeGuide >::const_iterator end() const { return maGuideList.end(); };
+    const CustomShapeGuide& operator[](size_t nIndex) const { return maGuideList[ nIndex ]; };
+
+private:
+    std::vector< CustomShapeGuide > maGuideList;
+    mutable std::unordered_map< OUString, sal_Int32 > maGuideListLookupMap;
+    mutable bool mbLookupMapStale = false;
+    mutable sal_Int32 mnPreviousActSize = 0;
+
+    void ActualizeLookupMap() const;
+};
+
+struct AdjustHandle
+{
+    bool                                    polar;
+    css::drawing::EnhancedCustomShapeParameterPair
+                                            pos;
+
+    // depending to the type (polar or not):
+    std::optional< OUString >               gdRef1; // gdRefX   or gdRefR
+    std::optional< css::drawing::EnhancedCustomShapeParameter >
+                                            min1;   // minX     or minR
+    std::optional< css::drawing::EnhancedCustomShapeParameter >
+                                            max1;   // maxX     or maxR
+    std::optional< OUString >               gdRef2; // gdRefY   or gdRefAng
+    std::optional< css::drawing::EnhancedCustomShapeParameter >
+                                            min2;   // minX     or minAng
+    std::optional< css::drawing::EnhancedCustomShapeParameter >
+                                            max2;   // maxY     or maxAng
+
+    AdjustHandle( bool bPolar ) : polar( bPolar ) {};
+};
+
+struct ConnectionSite
+{
+    css::drawing::EnhancedCustomShapeParameterPair
+                                pos;
+    css::drawing::EnhancedCustomShapeParameter
+                                ang;
+};
+
+struct GeomRect
+{
+    css::drawing::EnhancedCustomShapeParameter   l;
+    css::drawing::EnhancedCustomShapeParameter   t;
+    css::drawing::EnhancedCustomShapeParameter   r;
+    css::drawing::EnhancedCustomShapeParameter   b;
+};
+
+struct Path2D
+{
+    sal_Int64   w;
+    sal_Int64   h;
+    sal_Int32   fill;
+    bool        stroke;
+    bool        extrusionOk;
+    std::vector< css::drawing::EnhancedCustomShapeParameterPair > parameter;
+
+    Path2D() : w( 0 ), h( 0 ), fill( XML_norm ), stroke( true ), extrusionOk( true ) {};
+};
+
+
+class CustomShapeProperties final
+{
+public:
+    CustomShapeProperties();
+
+    void pushToPropSet( const cpo::uno::Reference < css::beans::XPropertySet > & xPropSet,
+                        const css::awt::Size &aSize );
+
+    /// text area of the preset in a shape of rSize, in EMU from its top left, or of the hidden
+    /// preset where the shape draws none and states adjustments; none for no preset
+    std::optional<css::awt::Rectangle> getPresetTextArea(const css::awt::Size& rSize) const;
+
+    sal_Int32 getShapePresetType() const { return mnShapePresetType; }
+    OUString getShapePresetTypeName() const;
+    void setShapePresetType( sal_Int32 nShapePresetType ){ mnShapePresetType = nShapePresetType; };
+    void setHiddenPresetType(sal_Int32 nPresetType) { mnHiddenPresetType = nPresetType; }
+    sal_Int32 getHiddenPresetType() const { return mnHiddenPresetType; }
+    bool                                getShapeTypeOverride() const { return mbShapeTypeOverride; };
+    void                                setShapeTypeOverride( bool bShapeTypeOverride ) { mbShapeTypeOverride = bShapeTypeOverride; };
+
+    CustomShapeGuideContainer&          getAdjustmentGuideList(){ return maAdjustmentGuideList; };
+    CustomShapeGuideContainer&          getGuideList(){ return maGuideList; };
+    std::vector< AdjustHandle >&        getAdjustHandleList(){ return maAdjustHandleList; };
+    std::vector< ConnectionSite >&      getConnectionSiteList(){ return maConnectionSiteList; };
+    std::optional< GeomRect >&          getTextRect(){ return maTextRect; };
+    std::vector< Path2D >&              getPath2DList(){ return maPath2DList; };
+    std::vector< css::drawing::EnhancedCustomShapeSegment >& getSegments(){ return maSegments; };
+    void                                setMirroredX( bool bMirroredX ) { mbMirroredX = bMirroredX; };
+    void                                setMirroredY( bool bMirroredY ) { mbMirroredY = bMirroredY; };
+    void                                setTextPreRotateAngle( sal_Int32 nAngle ) { mnTextPreRotateAngle = nAngle; };
+    void                                setTextCameraZRotateAngle( sal_Int32 nAngle ) { mnTextCameraZRotateAngle = nAngle; };
+    void                                setTextAreaRotateAngle(sal_Int32 nAngle) { moTextAreaRotateAngle = nAngle; };
+
+    sal_Int32 getArcNum() { return mnArcNum++; }
+
+    // Whether the path is built from guide equations, which hold a value in 1/100 mm, rather
+    // than from plain numbers, which hold an ooxml coordinate. The angles of an arcTo do not count.
+    void setPathUsesEquations() { mbPathUsesEquations = true; };
+    PropertyMap& getExtrusionPropertyMap() { return maExtrusionPropertyMap; }
+
+    /**
+       Returns whether or not the current CustomShapeProperties
+       represent a default shape preset that is rectangular.
+    */
+    bool representsDefaultShape() const;
+
+private:
+
+    sal_Int32                       mnShapePresetType;
+    // the preset a shape with hidden geometry is stated with: it draws nothing, its text has
+    // the area of that preset; -1 for none
+    sal_Int32                       mnHiddenPresetType;
+    bool                            mbShapeTypeOverride;
+    CustomShapeGuideContainer       maAdjustmentGuideList;
+    CustomShapeGuideContainer       maGuideList;
+    std::vector< AdjustHandle >     maAdjustHandleList;
+    std::vector< ConnectionSite >   maConnectionSiteList;
+    std::optional< GeomRect >       maTextRect;
+    std::vector< Path2D >           maPath2DList;
+
+    std::vector< css::drawing::EnhancedCustomShapeSegment >
+                                    maSegments;
+    bool                            mbMirroredX;
+    bool                            mbMirroredY;
+    sal_Int32                       mnTextPreRotateAngle; // TextPreRotateAngle
+    sal_Int32                       mnTextCameraZRotateAngle;
+    std::optional< sal_Int32 >      moTextAreaRotateAngle; // TextRotateAngle
+
+    typedef std::unordered_map< sal_Int32, PropertyMap > PresetDataMap;
+
+    static PresetDataMap maPresetDataMap;
+    static void initializePresetDataMap();
+
+    /// puts the values of the adjustment guides into the AdjustmentValues of rGeometry; false
+    /// where rGeometry has none
+    bool mergeAdjustments( cpo::uno::Sequence< css::beans::PropertyValue >& rGeometry ) const;
+    /// the CustomShapeGeometry of the preset with the adjustments of this shape, empty for a
+    /// preset there is no data for
+    cpo::uno::Sequence< css::beans::PropertyValue > presetGeometry() const;
+
+public:
+    /// What an adjustment of a preset holds. Part: a part of one in parts of a hundred
+    /// thousand. Angle: an angle in 60000ths of a degree. TurnAngle: an angle in 60000ths of a
+    /// degree that the preset takes from 0 to 21599999 only, a start or an end angle.
+    enum class AdjustmentKind
+    {
+        Part,
+        Angle,
+        TurnAngle
+    };
+    /// what the adjustment nIndex, counted from 1, of the preset nPresetType holds
+    static AdjustmentKind getAdjustmentKind( sal_Int32 nPresetType, sal_Int32 nIndex );
+
+private:
+
+    sal_Int32 mnArcNum;
+    bool mbPathUsesEquations;
+    PropertyMap maExtrusionPropertyMap;
+};
+
+}
+
+#endif // INCLUDED_OOX_DRAWINGML_CUSTOMSHAPEPROPERTIES_HXX
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

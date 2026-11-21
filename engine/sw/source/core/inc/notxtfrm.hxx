@@ -1,0 +1,128 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following license notice:
+ *
+ *   Licensed to the Apache Software Foundation (ASF) under one or more
+ *   contributor license agreements. See the NOTICE file distributed
+ *   with this work for additional information regarding copyright
+ *   ownership. The ASF licenses this file to you under the Apache
+ *   License, Version 2.0 (the "License"); you may not use this file
+ *   except in compliance with the License. You may obtain a copy of
+ *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+ */
+#ifndef INCLUDED_SW_SOURCE_CORE_INC_NOTXTFRM_HXX
+#define INCLUDED_SW_SOURCE_CORE_INC_NOTXTFRM_HXX
+
+#include "cntfrm.hxx"
+#include <node.hxx>
+// MM02
+#include <svx/sdr/contact/viewcontact.hxx>
+
+class GraphicObject;
+class SwNoTextNode;
+class OutputDevice;
+
+class SwNoTextFrame final : public SwContentFrame
+{
+private:
+    friend void FrameFinit();
+    const Size& GetSize() const;
+
+    void Format ( vcl::RenderContext* pRenderContext, const SwBorderAttrs *pAttrs = nullptr ) override;
+    void PaintPicture( vcl::RenderContext*, const SwRect& ) const;
+
+    virtual void DestroyImpl() override;
+    virtual ~SwNoTextFrame() override;
+
+    // RotateFlyFrame3 add TransformableSwFrame
+    std::unique_ptr< TransformableSwFrame >     mpTransformableSwFrame;
+
+    // RotateFlyFrame3 - Support for inner frame of a SwGrfNode.
+    // Only for local data extraction. To uniquely access information
+    // for local transformation, use getFrameArea(Print)Transformation.
+    friend double getLocalFrameRotation_from_SwNoTextFrame(const SwNoTextFrame& rNoTextFrame);
+    double getLocalFrameRotation() const;
+
+    void ClearCache();
+
+    // MM02
+    std::unique_ptr<sdr::contact::ViewContact> mpViewContact;
+    sdr::contact::ViewContact& GetViewContact() const;
+    void OnGraphicArrived();
+
+    /// The primitive that the picture was decomposed to last, relative to the origin given then.
+    /// It holds what it prepared for drawing the picture.
+    mutable drawinglayer::primitive2d::Primitive2DReference mxPicturePrimitive;
+
+    virtual void MakeAll(vcl::RenderContext* pRenderContext) override;
+    virtual void SwClientNotify(const SwModify&, const SfxHint&) override;
+
+    void ImplPaintPictureGraphic( vcl::RenderContext* pOut,
+            SwGrfNode* pGrfNd, bool bPrn,
+            const SwRect& rAlignedGrfArea, SwViewShell* pShell, const SwNoTextNode& rNoTNd ) const;
+    void ImplPaintPictureBitmap( vcl::RenderContext* pOut,
+            SwOLENode* pOLENd, bool bIsChart, bool bPrn,
+            const SwRect& rAlignedGrfArea, SwViewShell* pShell ) const;
+    void ImplPaintPictureAnimate(vcl::RenderContext* pOut, const SwViewShell* pShell,
+            SwGrfNode* pGrfNd, const SwRect& rAlignedGrfArea) const;
+    /// Draws the box that says why the picture cannot be shown into rAlignedGrfArea, on pOut,
+    /// or on the device of pShell when pOut is null.
+    void ImplPaintPictureReplacement(const GraphicObject& rGrfObj, const SwGrfNode* pGrfNd,
+            const SwRect& rAlignedGrfArea, const SwViewShell* pShell,
+            OutputDevice* pOut = nullptr) const;
+
+public:
+    SwNoTextFrame( SwNoTextNode * const, SwFrame* );
+
+    const SwContentNode *GetNode() const
+        { return static_cast<SwContentNode const*>(GetDep()); }
+          SwContentNode *GetNode()
+        { return static_cast<SwContentNode      *>(GetDep()); }
+
+    virtual bool LeftMargin(SwPaM *) const override;
+    virtual bool RightMargin(SwPaM *, bool bAPI = false) const override;
+
+    virtual void PaintSwFrame( vcl::RenderContext& rRenderContext, SwRect const&, PaintFrameMode mode = PAINT_ALL ) const override;
+    virtual void CreatePrimitives( sw::vector::Collector& rCollector ) const override;
+    /// The picture, chart or embedded object the frame shows, relative to rOrigin. A linked
+    /// picture that is not loaded yet shows what the node holds now. A picture that cannot be shown
+    /// gives the box with the text that says why, and an embedded object with no replacement
+    /// picture the box with its name. With contour wrap the content is cut at the contour.
+    drawinglayer::primitive2d::Primitive2DContainer
+    CreateContentPrimitives( const Point& rOrigin ) const;
+    virtual bool GetCharRect( SwRect &, const SwPosition&,
+                              SwCursorMoveState* = nullptr, bool bAllowFarAway = true ) const override;
+    virtual bool GetModelPositionForViewPoint(SwPosition* pPos, Point& aPoint,
+                     SwCursorMoveState* = nullptr, bool bTestBackground = false) const override;
+
+    void GetGrfArea( SwRect &rRect, SwRect * ) const;
+
+    bool IsTransparent() const;
+
+    void StopAnimation( const OutputDevice* = nullptr ) const;
+    bool HasAnimation()  const;
+
+    // RotateFlyFrame3 - Support for Transformations
+    bool isTransformableSwFrame() const { return bool(mpTransformableSwFrame); }
+    TransformableSwFrame* getTransformableSwFrame() { return mpTransformableSwFrame.get(); }
+    const TransformableSwFrame* getTransformableSwFrame() const { return mpTransformableSwFrame.get(); }
+
+    // RotateFlyFrame3 - Support for Transformations
+    virtual basegfx::B2DHomMatrix getFrameAreaTransformation() const override;
+    virtual basegfx::B2DHomMatrix getFramePrintAreaTransformation() const override;
+
+    // RotateFlyFrame3 - Support for Transformations
+    virtual void transform_translate(const Point& rOffset) override;
+
+    void dumpAsXml(xmlTextWriterPtr writer = nullptr) const override;
+};
+
+#endif
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

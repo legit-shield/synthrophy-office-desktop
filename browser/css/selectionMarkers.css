@@ -1,0 +1,84 @@
+.text-selection-handle-start, .formulabar-selection-handle-start {
+	position: absolute;
+	width: 30px;
+	height: 44px;
+	background-image: url('images/handle_start.svg');
+}
+
+.text-selection-handle-end, .formulabar-selection-handle-end {
+	position: absolute;
+	width: 30px;
+	height: 44px;
+	background-image: url('images/handle_end.svg');
+}
+
+.formulabar-selection-handle-start, .formulabar-selection-handle-end {
+	touch-action: none;
+}
+
+.cursor-handler {
+	margin-left: -14px;
+	width: 30px;
+	height: 44px;
+	background-image: url('images/cursor-handler.svg');
+}
+
+html[data-bg-theme='dark'] .cursor-handler {
+	background-image: url('images/dark/cursor-handler.svg');
+}
+
+/* The caret that marks where a dragged selection would land: a bar with a small
+   triangle at each end, so it stands apart from the blinking text caret. */
+.text-drop-caret {
+	--drop-caret-color: var(--color-primary);
+	background-color: var(--drop-caret-color);
+}
+
+.text-drop-caret::before,
+.text-drop-caret::after {
+	content: '';
+	position: absolute;
+	left: -3px;
+	border-left: 4px solid transparent;
+	border-right: 4px solid transparent;
+}
+
+.text-drop-caret::before {
+	top: -2px;
+	border-top: 5px solid var(--drop-caret-color);
+}
+
+.text-drop-caret::after {
+	bottom: -2px;
+	border-bottom: 5px solid var(--drop-caret-color);
+}
+
+.html-object-section {
+	display: block;
+	position: absolute;
+	cursor: pointer;
+	left: 0;
+	top: 0;
+	z-index: 11;
+	user-select: none;
+}
+
+/* the working form controls over the page in a view that draws from objects */
+.vector-form-controls {
+	z-index: 11;
+	user-select: none;
+}
+
+/* a drag that started on the page passes over them */
+.vector-form-controls.passing .vector-form-control {
+	pointer-events: none !important;
+}
+
+/* A list that drops down has the focus in the browser's list, which lies unseen over the drawn
+   field. The drawn field shows the focus, as a field that is typed into does, and so does a list
+   that shows its entries. */
+.vector-form-control:has(> select.vector-form-field:focus) > .ui-edit,
+.vector-form-control .vector-form-list:focus {
+	outline: auto Highlight;
+	outline-offset: -1px;
+}

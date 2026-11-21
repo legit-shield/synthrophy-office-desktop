@@ -1,0 +1,372 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+describe('SlideLinkToolbar', function () {
+	// The map events the toolbar listens for, by name, so a test can fire one.
+	let listeners: Map<string, (e: any) => void>;
+	// The actions the toolbar's buttons asked for.
+	let dispatched: string[];
+	let editable: boolean;
+	// The identifier of the slide on show.
+	let current: string;
+	// The pages that hold a link of their own, with what they are linked to.
+	let linked: Map<string, { source: string; name: string }>;
+	// The links whose source has moved on since they were read.
+	let outdated: Set<string>;
+	// The state of every source, as the storage announced it.
+	let sourceState: string;
+	// The slides that sit in the linked section.
+	let inSection: Set<string>;
+	// The slides whose section sits in the linked presentation.
+	let inPresentation: Set<string>;
+	let toolbar: SlideLinkToolbar;
+	let savedEvents: any;
+
+	// The linked pages, by the identifier each one holds.
+	const numbersPart = '{6A1C31B0-0001-4C5B-9E77-2F3D4A5B6C7D}';
+	const outlookPart = '{6A1C31B0-0002-4C5B-9E77-2F3D4A5B6C7D}';
+	// A page this document does not hold.
+	const unknownPart = '{6A1C31B0-0099-4C5B-9E77-2F3D4A5B6C7D}';
+	// A slide of the linked section that was edited here, so it lost its own
+	// link.
+	const editedPart = '{6A1C31B0-0003-4C5B-9E77-2F3D4A5B6C7D}';
+	const sectionId = '{6A1C31B0-0100-4C5B-9E77-2F3D4A5B6C7D}';
+	const presentationId = '{6A1C31B0-0200-4C5B-9E77-2F3D4A5B6C7D}';
+
+	function element(): HTMLElement | null {
+		return document.getElementById('slide-link-toolbar');
+	}
+
+	// The labels of the actions on show, in order.
+	function actions(): string[] {
+		const found = element();
+		if (!found) return [];
+		return Array.from(
+			found.querySelectorAll('button.slide-link-toolbar-action'),
+		).map((button) => button.textContent || '');
+	}
+
+	function action(name: string): HTMLButtonElement | null {
+		const found = element();
+		return found
+			? (found.querySelector(
+					'button.slide-link-toolbar-action.' + name,
+				) as HTMLButtonElement | null)
+			: null;
+	}
+
+	function slideShown(part: string): void {
+		current = part;
+		const listener = listeners.get('setpart');
+		nodeassert.ok(listener, 'nothing listens for setpart');
+		listener({ selectedPart: 0 });
+	}
+
+	// The links over a slide, innermost first, as SlideLinks lists them: the
+	// slide's own link when it holds one, then the section that holds it,
+	// then the presentation that holds the section.
+	function linksOf(part: string): any[] {
+		const chain: any[] = [];
+		const link = linked.get(part);
+		if (link)
+			chain.push({
+				unit: 'slide',
+				id: part,
+				parent: inSection.has(part) ? sectionId : '',
+				source: link.source,
+				name: link.name,
+				slides: [part],
+			});
+		if (inSection.has(part))
+			chain.push({
+				unit: 'section',
+				id: sectionId,
+				parent: inPresentation.has(part) ? presentationId : '',
+				source: 'Sales deck.odp',
+				name: 'Opening',
+				slides: [numbersPart, editedPart],
+			});
+		if (inPresentation.has(part))
+			chain.push({
+				unit: 'presentation',
+				id: presentationId,
+				parent: '',
+				source: 'Sales deck.odp',
+				name: 'Sales deck.odp',
+				slides: [numbersPart, editedPart, outlookPart],
+			});
+		return chain;
+	}
+
+	// The JSX runtime tells a node from a text child by its class, which the
+	// jsdom window has and the Node global does not.
+	before(function () {
+		if (typeof (globalThis as any).Node === 'undefined')
+			(globalThis as any).Node = (window as any).Node;
+	});
+
+	beforeEach(function () {
+		listeners = new Map();
+		dispatched = [];
+		editable = true;
+		current = numbersPart;
+		linked = new Map([
+			[numbersPart, { source: 'Sales deck.odp', name: 'Numbers' }],
+			[outlookPart, { source: 'Sales deck.odp', name: 'Outlook' }],
+		]);
+		outdated = new Set();
+		sourceState = 'connected';
+		inSection = new Set();
+		inPresentation = new Set();
+
+		const readable = () =>
+			sourceState !== '' &&
+			sourceState !== 'noaccess' &&
+			sourceState !== 'missing';
+		const map: any = {
+			on: function (name: string, callback: any, context: any) {
+				listeners.set(name, callback.bind(context));
+			},
+			isEditMode: () => editable,
+			isPresentationOrDrawing: () => true,
+			slideLinks: {
+				currentPart: () => current,
+				linksOf: linksOf,
+				getSourceSlideName: () => '',
+				isOutdated: (id: string) => outdated.has(id),
+				getSourceState: () => sourceState,
+				isUpdatable: () => readable(),
+			},
+		};
+
+		savedEvents = app.events;
+		app.dispatcher = {
+			dispatch: (name: string) => dispatched.push(name),
+		};
+		(app as any).events = {
+			on: () => {},
+			fire: () => {},
+		};
+
+		toolbar = new SlideLinkToolbar(map);
+	});
+
+	afterEach(function () {
+		const found = element();
+		if (found) found.remove();
+		app.events = savedEvents;
+	});
+
+	it('stays away from a slide that is linked to nothing', function () {
+		slideShown(unknownPart);
+		nodeassert.equal(element(), null);
+	});
+
+	it('names the link of the slide on show, with the actions folded away', function () {
+		slideShown(numbersPart);
+		const found = element();
+		nodeassert.ok(found);
+		nodeassert.ok(
+			(found.getAttribute('aria-label') || '').indexOf('Sales deck.odp') >= 0,
+		);
+		nodeassert.deepEqual(actions(), []);
+	});
+
+	it('offers an update alone while folded when the source has moved on', function () {
+		outdated.add(numbersPart);
+		slideShown(numbersPart);
+		nodeassert.deepEqual(actions(), ['Update']);
+		nodeassert.equal(action('update').disabled, false);
+	});
+
+	it('unfolds every action, and folds them away again', function () {
+		slideShown(numbersPart);
+		toolbar.setExpanded(true);
+		nodeassert.deepEqual(actions(), ['Unlink', 'Update']);
+
+		toolbar.setExpanded(false);
+		nodeassert.deepEqual(actions(), []);
+	});
+
+	it('unfolds from its own chevron', function () {
+		slideShown(numbersPart);
+		const expander = element().querySelector(
+			'button.slide-link-toolbar-expander',
+		) as HTMLButtonElement;
+		nodeassert.equal(expander.getAttribute('aria-expanded'), 'false');
+
+		expander.click();
+		nodeassert.equal(toolbar.isExpanded(), true);
+		nodeassert.deepEqual(actions(), ['Unlink', 'Update']);
+	});
+
+	it('offers no action to a view that cannot edit', function () {
+		editable = false;
+		outdated.add(numbersPart);
+		slideShown(numbersPart);
+		nodeassert.deepEqual(actions(), []);
+
+		toolbar.setExpanded(true);
+		nodeassert.deepEqual(actions(), []);
+	});
+
+	it('acts on the slide on show', function () {
+		slideShown(numbersPart);
+		toolbar.setExpanded(true);
+
+		action('unlink').click();
+		action('update').click();
+		nodeassert.deepEqual(dispatched, ['unlinkslide', 'updatelinkedslide']);
+	});
+
+	it('says when the source cannot be read, and offers no update from it', function () {
+		sourceState = 'noaccess';
+		slideShown(numbersPart);
+		toolbar.setExpanded(true);
+
+		const state = element().querySelector('.slide-link-toolbar-state');
+		nodeassert.ok(state);
+		nodeassert.equal(state.textContent, 'No access');
+		nodeassert.equal(action('update').disabled, true);
+		// The link can still be taken off.
+		nodeassert.deepEqual(actions(), ['Unlink', 'Update']);
+		nodeassert.equal(action('unlink').disabled, false);
+	});
+
+	it('keeps the focus when it is drawn again', function () {
+		slideShown(numbersPart);
+		const expander = element().querySelector(
+			'button.slide-link-toolbar-expander',
+		) as HTMLButtonElement;
+		expander.focus();
+		expander.click();
+
+		// The chevron was pressed from the keyboard, and the one drawn in its
+		// place holds the focus so the actions can be reached with Tab.
+		const redrawn = element().querySelector(
+			'button.slide-link-toolbar-expander',
+		);
+		nodeassert.notEqual(redrawn, expander);
+		nodeassert.equal(document.activeElement, redrawn);
+
+		// A toolbar that did not hold the focus does not take it.
+		(document.activeElement as HTMLElement).blur();
+		slideShown(outlookPart);
+		nodeassert.notEqual(
+			document.activeElement,
+			element().querySelector('button.slide-link-toolbar-expander'),
+		);
+	});
+
+	it('follows the slide on show', function () {
+		slideShown(numbersPart);
+		nodeassert.ok(element());
+
+		slideShown(unknownPart);
+		nodeassert.equal(element(), null);
+
+		slideShown(outlookPart);
+		nodeassert.ok(
+			(element().getAttribute('aria-label') || '').indexOf('Outlook') >= 0,
+		);
+	});
+
+	it('offers an update of the section that holds the slide on show', function () {
+		inSection.add(numbersPart);
+		slideShown(numbersPart);
+		nodeassert.deepEqual(actions(), []);
+
+		toolbar.setExpanded(true);
+		nodeassert.deepEqual(actions(), ['Unlink', 'Update', 'Update section']);
+		action('update-section').click();
+		nodeassert.deepEqual(dispatched, ['updatelinkedsection']);
+	});
+
+	it('offers a section update alone while folded when the source section has moved on', function () {
+		inSection.add(numbersPart);
+		outdated.add(sectionId);
+		slideShown(numbersPart);
+		nodeassert.deepEqual(actions(), ['Update section']);
+	});
+
+	it('stays on a slide edited here while its section is still linked', function () {
+		inSection.add(editedPart);
+		slideShown(editedPart);
+		nodeassert.ok(
+			(element().getAttribute('aria-label') || '').indexOf('Sales deck.odp') >=
+				0,
+		);
+
+		// The slide has no link of its own, so only the section can be updated.
+		toolbar.setExpanded(true);
+		nodeassert.deepEqual(actions(), ['Update section']);
+	});
+
+	it('offers no section update from a source that cannot be read', function () {
+		inSection.add(numbersPart);
+		sourceState = 'missing';
+		slideShown(numbersPart);
+		toolbar.setExpanded(true);
+		nodeassert.equal(action('update-section').disabled, true);
+	});
+
+	it('offers an update of the presentation that holds the slide on show', function () {
+		inSection.add(numbersPart);
+		inPresentation.add(numbersPart);
+		slideShown(numbersPart);
+		nodeassert.deepEqual(actions(), []);
+
+		toolbar.setExpanded(true);
+		nodeassert.deepEqual(actions(), [
+			'Unlink',
+			'Update',
+			'Update section',
+			'Update presentation',
+		]);
+		action('update-presentation').click();
+		nodeassert.deepEqual(dispatched, ['updatelinkedpresentation']);
+	});
+
+	it('offers a presentation update alone while folded when the source has moved on', function () {
+		inSection.add(numbersPart);
+		inPresentation.add(numbersPart);
+		outdated.add(presentationId);
+		slideShown(numbersPart);
+		nodeassert.deepEqual(actions(), ['Update presentation']);
+		nodeassert.equal(action('update-presentation').disabled, false);
+	});
+
+	it('stays on a slide of a linked presentation whose section lost its link', function () {
+		// The section was taken apart here, so the slide sits under the
+		// presentation alone, and the toolbar says so.
+		inPresentation.add(editedPart);
+		slideShown(editedPart);
+		nodeassert.ok(
+			(element().getAttribute('aria-label') || '').indexOf('presentation') >= 0,
+		);
+		nodeassert.ok(
+			(element().getAttribute('aria-label') || '').indexOf('Sales deck.odp') >=
+				0,
+		);
+
+		toolbar.setExpanded(true);
+		nodeassert.deepEqual(actions(), ['Update presentation']);
+	});
+
+	it('offers no presentation update from a source that cannot be read', function () {
+		inSection.add(numbersPart);
+		inPresentation.add(numbersPart);
+		sourceState = 'missing';
+		slideShown(numbersPart);
+		toolbar.setExpanded(true);
+		nodeassert.equal(action('update-presentation').disabled, true);
+	});
+});

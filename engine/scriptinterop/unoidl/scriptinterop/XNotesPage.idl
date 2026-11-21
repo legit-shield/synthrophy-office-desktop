@@ -1,0 +1,56 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+interface XShape;
+
+/** The notes page of a slide, which holds its speaker notes.
+
+    @gas NotesPage
+ */
+interface XNotesPage : XPageBase
+{
+    /** @throws RuntimeException
+            when the notes page has no notes shape.
+
+        @gas NotesPage.getSpeakerNotesShape
+     */
+    XShape getSpeakerNotesShape();
+
+    /** Replaces every match of findText in the shapes on this page, ignoring case.
+
+        @returns
+            The number of occurrences replaced.
+        @throws RuntimeException
+            when findText is empty.
+
+        @gas NotesPage.replaceAllText
+     */
+    [overload replaceAllText] long replaceAllText([in] string findText, [in] string replaceText);
+
+    /** Replaces every match of findText in the shapes on this page.
+
+        @returns
+            The number of occurrences replaced.
+        @throws RuntimeException
+            when findText is empty.
+
+        @gas NotesPage.replaceAllText
+     */
+    [overload replaceAllText] long replaceAllTextMatchCase(
+        [in] string findText, [in] string replaceText, [in] boolean matchCase);
+
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

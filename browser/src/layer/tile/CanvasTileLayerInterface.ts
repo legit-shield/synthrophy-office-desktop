@@ -1,0 +1,26 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+namespace cool {
+	/// Interface of the Leaflet's CanvasTileLayer (defined in CanvasTileLayer.js)
+	export interface CanvasTileLayerInterface {
+		_selectedPart: number;
+		_docType: string;
+		/// The id the document gave this client's view, or undefined until it
+		/// has been reported.
+		_viewId?: number;
+		/// Draws the selected text from its rectangles, each as [x, y, width, height] in
+		/// twips, or removes the selection when there are none.
+		showTextSelection(rawRectangles: number[][]): void;
+		/// Shows the text cursor at the rectangle that app.file.textCursor holds.
+		_onUpdateCursor(): void;
+	}
+}

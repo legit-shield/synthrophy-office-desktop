@@ -1,0 +1,74 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+interface XSlideTable;
+interface XSlideTableColumn;
+interface XSlideTableRow;
+interface XTextRange;
+
+/** A cell of a table on a slide.
+
+    Indexes are 0-based.
+
+    @gas TableCell
+ */
+interface XSlideTableCell : XBase
+{
+    /** @unimplemented @gas TableCell.getColumnIndex */
+    long getColumnIndex();
+
+    /** Returns 0 for a cell merged into another cell.
+
+        @unimplemented
+        @gas TableCell.getColumnSpan
+     */
+    long getColumnSpan();
+
+    /** @unimplemented @gas TableCell.getContentAlignment */
+    ContentAlignment getContentAlignment();
+
+    /** @unimplemented @gas TableCell.getFill */
+    XFill getFill();
+
+    /** @unimplemented @gas TableCell.getMergeState */
+    CellMergeState getMergeState();
+
+    /** @unimplemented @gas TableCell.getParentColumn */
+    XSlideTableColumn getParentColumn();
+
+    /** @unimplemented @gas TableCell.getParentRow */
+    XSlideTableRow getParentRow();
+
+    /** @unimplemented @gas TableCell.getParentTable */
+    XSlideTable getParentTable();
+
+    /** @unimplemented @gas TableCell.getRowIndex */
+    long getRowIndex();
+
+    /** Returns 0 for a cell merged into another cell.
+
+        @unimplemented
+        @gas TableCell.getRowSpan
+     */
+    long getRowSpan();
+
+    /** @unimplemented @gas TableCell.getText */
+    XTextRange getText();
+
+    /** @unimplemented @gas TableCell.setContentAlignment */
+    XSlideTableCell setContentAlignment([in] ContentAlignment contentAlignment);
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

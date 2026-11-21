@@ -1,0 +1,4383 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+describe('ImpressVectorManager', function () {
+	// A dropped part re-fetches in full, which sends a request. Give the
+	// socket a no-op so those requests do not need a live connection.
+	before(function () {
+		const socket: any = (app as any).socket || ((app as any).socket = {});
+		socket.sendMessage = function () {};
+	});
+
+	// Drawing builds Path2D objects, which node does not have. A stand-in
+	// records the path so the drawing calls can be checked.
+	let originalPath2D: any;
+	before(function () {
+		originalPath2D = (globalThis as any).Path2D;
+		(globalThis as any).Path2D = Path2DRecorder;
+	});
+	after(function () {
+		(globalThis as any).Path2D = originalPath2D;
+	});
+
+	// The page list on screen, as the status message names it: one entry per
+	// page of the list the mode names, each with the id of its page.
+	function pageList(mode: number, count: number): any[] {
+		const prefix =
+			mode === cool.VectorMode.MasterPages
+				? 'M'
+				: mode === cool.VectorMode.NotesPages
+					? 'N'
+					: 'S';
+		const list: any[] = [];
+		for (let i = 0; i < count; i++)
+			list.push({ part: prefix + String(i), mode: mode });
+		return list;
+	}
+
+	// A page is asked for by the id the page list on screen names it by, so
+	// every test starts with ten slides on screen.
+	let originalImpressForTest: any;
+	beforeEach(function () {
+		originalImpressForTest = (app as any).impress;
+		(app as any).impress = { partList: pageList(cool.VectorMode.Slides, 10) };
+	});
+	afterEach(function () {
+		(app as any).impress = originalImpressForTest;
+	});
+
+	function countCalls(recorder: CanvasRecorder, method: string): number {
+		return recorder.calls.filter((call) => call.method === method).length;
+	}
+
+	// A primitive tree response carries a stable id per object. The
+	// manager keys the cached objects by that id and keeps the paint order
+	// beside them, so a later update can reach one object by its id.
+	it('keeps each object id from a primitive tree response', function () {
+		const manager = new ImpressVectorManager();
+
+		// Two objects with empty primitive lists.
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			objects: [
+				{ id: 11, primitives: [] },
+				{ id: 22, primitives: [] },
+			],
+		});
+
+		const data = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.ok(data, 'part 0 is cached after its response');
+		nodeassert.deepStrictEqual(data.order, [11, 22]);
+		nodeassert.strictEqual(data.objects.get(11)?.id, 11);
+		nodeassert.strictEqual(data.objects.get(22)?.id, 22);
+	});
+
+	// The engine stamps each part with a content version. The manager
+	// keeps it on the cached tree so a later update can tell whether the
+	// client is still in step with the engine.
+	it('keeps the part version from a primitive tree response', function () {
+		const manager = new ImpressVectorManager();
+
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 7,
+			objects: [],
+		});
+
+		const data = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.ok(data, 'part 0 is cached after its response');
+		nodeassert.strictEqual(data.version, 7);
+	});
+
+	// A delta replaces the objects it carries and leaves the rest alone.
+	// An order that comes with it sets the paint order, here reversing the
+	// two objects.
+	it('applies a delta, reusing cached content for unchanged objects', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [
+				{ id: 11, primitives: [] },
+				{ id: 22, primitives: [] },
+			],
+		});
+
+		// Object 22 changed and now carries one primitive. The order is
+		// reversed. Object 11 is unchanged.
+		const delta: any = {
+			partId: 'S0',
+			version: 2,
+			order: [22, 11],
+			objects: [{ id: 22, primitives: [{ type: 'polygonHairline' }] }],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 2);
+		nodeassert.deepStrictEqual(data.order, [22, 11]);
+		nodeassert.strictEqual(data.objects.get(22).primitives.length, 1);
+		nodeassert.strictEqual(data.objects.get(11).primitives.length, 0);
+	});
+
+	// The order travels only when the object set or its order moved, so a
+	// delta without one leaves the order alone and touches nothing but the
+	// object it names.
+	it('applies a delta that carries no order', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [
+				{ id: 11, primitives: [] },
+				{ id: 22, primitives: [] },
+			],
+		});
+
+		const delta: any = {
+			partId: 'S0',
+			version: 2,
+			objects: [{ id: 22, primitives: [{ type: 'polygonHairline' }] }],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.deepStrictEqual(data.order, [11, 22]);
+		nodeassert.strictEqual(data.objects.get(22).primitives.length, 1);
+		nodeassert.strictEqual(data.objects.get(11).primitives.length, 0);
+	});
+
+	// An object the order no longer names is gone, so it is dropped from
+	// the cache rather than left behind holding its primitives.
+	it('drops an object the delta order no longer names', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [
+				{ id: 11, primitives: [] },
+				{ id: 22, primitives: [] },
+			],
+		});
+
+		const delta: any = {
+			partId: 'S0',
+			version: 2,
+			order: [11],
+			objects: [],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.objects.size, 1);
+		nodeassert.ok(!data.objects.has(22), 'the removed object is gone');
+		nodeassert.deepStrictEqual(data.order, [11]);
+	});
+
+	// When the order names an object the client never cached, the delta
+	// cannot be rebuilt, so the part is dropped and re-fetched in full.
+	it('drops the part when a delta order names unknown content', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		const delta: any = {
+			partId: 'S0',
+			version: 2,
+			order: [99],
+			objects: [],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		// The cache was dropped, so the next request starts a fresh full
+		// fetch and has nothing to return yet.
+		nodeassert.strictEqual(
+			manager.requestPart(0, cool.VectorMode.Slides),
+			undefined,
+		);
+	});
+
+	// A delta computed against an older version can arrive after a newer
+	// full response. It describes an older state, so it must not roll the
+	// cache backwards.
+	it('ignores a delta that is not newer than the cache', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 5,
+			objects: [
+				{ id: 11, primitives: [] },
+				{ id: 22, primitives: [] },
+			],
+		});
+
+		// A stale delta from version 3 no longer lists object 22.
+		const delta: any = {
+			partId: 'S0',
+			version: 3,
+			order: [11],
+			objects: [],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 5);
+		nodeassert.strictEqual(data.objects.size, 2);
+	});
+
+	// A client that comes back to a new model keeps drawing what it holds until each page
+	// arrives again.
+	it('keeps drawing the other cached parts when a full response has a new epoch', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			epoch: 100,
+			version: 5,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S1',
+			epoch: 200,
+			version: 1,
+			objects: [{ id: 22, primitives: [] }],
+		});
+
+		const held: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(held.version, 5);
+		const data: any = manager.requestPart(1, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 1);
+	});
+
+	// A delta from a new epoch counts from another start, so it is not applied on top of the
+	// content cached for its own part.
+	it('drops a cached part instead of applying a delta from a new epoch', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			epoch: 100,
+			version: 5,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		manager.handleVectorPrimitivesDelta({
+			partId: 'S0',
+			epoch: 200,
+			from: 5,
+			version: 6,
+			objects: [{ id: 22, primitives: [] }],
+		});
+
+		nodeassert.strictEqual(
+			manager.requestPart(0, cool.VectorMode.Slides),
+			undefined,
+		);
+	});
+
+	// A delta that starts below the version held carries more objects than are needed. Each of
+	// them replaces a whole object, so the delta is applied as it is.
+	it('applies a delta that starts below the version held', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 5,
+			objects: [
+				{ id: 11, primitives: [] },
+				{ id: 22, primitives: [] },
+			],
+		});
+
+		const delta: any = {
+			partId: 'S0',
+			from: 2,
+			version: 6,
+			objects: [{ id: 22, primitives: [], width: 400 }],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 6);
+		nodeassert.strictEqual(data.objects.get(22).width, 400);
+	});
+
+	// A delta that starts above the version held leaves out the changes in between, and no
+	// later delta carries them, so the part is dropped and fetched whole.
+	it('drops the part when a delta starts above the version held', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 5,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		const delta: any = {
+			partId: 'S0',
+			from: 7,
+			version: 8,
+			objects: [],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		nodeassert.strictEqual(
+			manager.requestPart(0, cool.VectorMode.Slides),
+			undefined,
+		);
+	});
+
+	// Versions count in a space the engine names. A model that started counting again can
+	// answer with a lower version, and its page still replaces what is cached.
+	it('takes a full response from a new epoch whatever its version', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			epoch: 100,
+			version: 5,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			epoch: 200,
+			version: 1,
+			objects: [{ id: 22, primitives: [] }],
+		});
+
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 1);
+		nodeassert.ok(data.objects.has(22), 'the new page is cached');
+	});
+
+	// Runs the steps with the socket and the map recording what the manager
+	// sends to the server and tells the rest of the client.
+	function recording(steps: () => void): { sent: string[]; fired: string[] } {
+		const fired: string[] = [];
+		const originalMap = (app as any).map;
+		(app as any).map = {
+			fire: function (name: string) {
+				fired.push(name);
+			},
+		};
+		try {
+			return { sent: SocketRecorder.during(steps), fired: fired };
+		} finally {
+			(app as any).map = originalMap;
+		}
+	}
+
+	// A response for slide i, version 5 of epoch 100.
+	const cachedSlide = (i: number): cool.VectorPrimitivesResponse => ({
+		partId: 'S' + String(i),
+		epoch: 100,
+		version: 5,
+		objects: [{ id: 11, primitives: [] }],
+	});
+
+	// A client that was away was sent none of the changes made while it was, so
+	// its cache may be behind. A page drawn after that asks what changed since
+	// the version it holds, and is drawn from the cache until the answer comes.
+	it('asks what changed on a cached page when it is drawn after being away', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse(cachedSlide(0));
+		const answers: (number[] | undefined)[] = [];
+		manager.onVectorChanged((answered) => answers.push(answered));
+
+		const { sent, fired } = recording(() => {
+			manager.revalidateCachedParts();
+			nodeassert.ok(
+				manager.requestPart(0, cool.VectorMode.Slides),
+				'the part stopped being drawable while it was asked for again',
+			);
+			manager.requestPart(0, cool.VectorMode.Slides);
+		});
+
+		// Marking the cache as stale brings nothing from the engine, so the
+		// views draw again with no object answered.
+		nodeassert.deepStrictEqual(answers, [[]]);
+		nodeassert.deepStrictEqual(fired, ['vectorcontentstale']);
+		nodeassert.strictEqual(sent.length, 1);
+		nodeassert.ok(
+			sent[0].indexOf(
+				'.uno:VectorPrimitives?partid=S0&mode=0&since=5&epoch=100',
+			) >= 0,
+			'the request does not say what the client holds: ' + sent[0],
+		);
+
+		// The answer is a delta, or a header alone when nothing changed. Either
+		// way it closes the request, so the next time away asks again.
+		manager.handleVectorPrimitivesDelta({
+			partId: 'S0',
+			epoch: 100,
+			from: 5,
+			version: 5,
+			objects: [],
+		});
+		const again = recording(() => {
+			manager.requestPart(0, cool.VectorMode.Slides);
+			manager.revalidateCachedParts();
+			manager.requestPart(0, cool.VectorMode.Slides);
+		});
+		nodeassert.strictEqual(again.sent.length, 1);
+	});
+
+	// Coming back with many pages cached asks only for the ones drawn.
+	it('leaves a cached page that is not drawn after being away unasked', function () {
+		const manager = new ImpressVectorManager();
+		for (let i = 0; i < 10; i++)
+			manager.handleVectorPrimitivesResponse(cachedSlide(i));
+
+		const { sent } = recording(() => {
+			manager.revalidateCachedParts();
+			manager.requestPart(3, cool.VectorMode.Slides);
+		});
+
+		nodeassert.strictEqual(sent.length, 1);
+		nodeassert.ok(
+			sent[0].indexOf('partid=S3&') >= 0,
+			'another page was asked for: ' + sent[0],
+		);
+	});
+
+	// Coming back with many pages in view asks for them a few at a time, in the order they
+	// were drawn, and the next one asks when an answer lands.
+	it('asks what changed on the pages drawn after being away a few at a time', function () {
+		const manager = new ImpressVectorManager();
+		for (let i = 0; i < 5; i++)
+			manager.handleVectorPrimitivesResponse(cachedSlide(i));
+
+		const { sent } = recording(() => {
+			manager.revalidateCachedParts();
+			for (let i = 0; i < 5; i++)
+				manager.requestPart(i, cool.VectorMode.Slides);
+			// A second draw of a waiting page does not ask twice.
+			manager.requestPart(3, cool.VectorMode.Slides);
+		});
+		nodeassert.deepStrictEqual(
+			sent.map((message) => message.match(/partid=(S\d)/)?.[1]),
+			['S0', 'S1'],
+		);
+
+		// The header alone answers the first page, so the next waiting page asks.
+		const more = recording(() => {
+			manager.handleVectorPrimitivesDelta({
+				partId: 'S0',
+				epoch: 100,
+				from: 5,
+				version: 5,
+				objects: [],
+			});
+		});
+		nodeassert.deepStrictEqual(
+			more.sent.map((message) => message.match(/partid=(S\d)/)?.[1]),
+			['S2'],
+		);
+
+		// A whole page answers the second, and a page that arrived whole meanwhile is
+		// passed over for the one after it.
+		const fresh = cachedSlide(3);
+		fresh.version = 6;
+		manager.handleVectorPrimitivesResponse(fresh);
+		const last = recording(() => {
+			manager.handleVectorPrimitivesResponse(cachedSlide(1));
+		});
+		nodeassert.deepStrictEqual(
+			last.sent.map((message) => message.match(/partid=(S\d)/)?.[1]),
+			['S4'],
+		);
+	});
+
+	// The requests of a dropped connection get no answer, so the pages that asked and the
+	// ones waiting their turn are forgotten with them. The reconnect marks every page stale
+	// again, and the pages drawn then ask afresh, up to the few at a time.
+	it('lets the pages ask again after the connection dropped', function () {
+		const manager = new ImpressVectorManager();
+		for (let i = 0; i < 3; i++)
+			manager.handleVectorPrimitivesResponse(cachedSlide(i));
+
+		recording(() => {
+			manager.revalidateCachedParts();
+			for (let i = 0; i < 3; i++)
+				manager.requestPart(i, cool.VectorMode.Slides);
+		});
+		manager.forgetRequestsInFlight();
+
+		const { sent } = recording(() => {
+			manager.revalidateCachedParts();
+			manager.requestPart(2, cool.VectorMode.Slides);
+			manager.requestPart(0, cool.VectorMode.Slides);
+			manager.requestPart(1, cool.VectorMode.Slides);
+		});
+		nodeassert.deepStrictEqual(
+			sent.map((message) => message.match(/partid=(S\d)/)?.[1]),
+			['S2', 'S0'],
+		);
+	});
+
+	// A page that arrives whole after being away is current, so drawing it asks
+	// for nothing.
+	it('asks nothing for a page that arrived whole after being away', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse(cachedSlide(0));
+
+		const { sent } = recording(() => {
+			manager.revalidateCachedParts();
+			const fresh = cachedSlide(0);
+			fresh.version = 6;
+			manager.handleVectorPrimitivesResponse(fresh);
+			manager.requestPart(0, cool.VectorMode.Slides);
+		});
+
+		nodeassert.strictEqual(sent.length, 0);
+	});
+
+	// A pushed delta for a page that is not cached yet answers no request, so
+	// the full request for the page stays the one in flight.
+	it('keeps the request for a page open when a delta for it arrives first', function () {
+		const manager = new ImpressVectorManager();
+		const sent = SocketRecorder.during(() => {
+			manager.requestPartById('M0', cool.VectorMode.MasterPages);
+			manager.handleVectorPrimitivesDelta({
+				mode: cool.VectorMode.MasterPages,
+				partId: 'M0',
+				epoch: 100,
+				from: 1,
+				version: 2,
+				objects: [],
+			});
+			manager.requestPartById('M0', cool.VectorMode.MasterPages);
+		});
+
+		nodeassert.strictEqual(sent.length, 1);
+	});
+
+	// A request sent before the connection dropped gets no answer, so a reconnect forgets it
+	// and the next draw asks for the part again. A request still in flight is not sent twice.
+	it('asks again for a cached part once its request is forgotten', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse(cachedSlide(0));
+
+		const whileInFlight = recording(() => {
+			manager.revalidateCachedParts();
+			manager.requestPart(0, cool.VectorMode.Slides);
+			manager.revalidateCachedParts();
+			manager.requestPart(0, cool.VectorMode.Slides);
+		});
+		nodeassert.strictEqual(whileInFlight.sent.length, 1);
+
+		const afterReconnect = recording(() => {
+			manager.forgetRequestsInFlight();
+			manager.revalidateCachedParts();
+			manager.requestPart(0, cool.VectorMode.Slides);
+		});
+		nodeassert.strictEqual(afterReconnect.sent.length, 1);
+	});
+
+	// Move the time every page request was sent back past the timeout.
+	const agePageRequests = (manager: ImpressVectorManager): void => {
+		for (const request of (manager as any)._pageRequests.requests())
+			request.sent -= 2 * (ImpressVectorManager as any).requestTimeout;
+	};
+
+	// A request that gets no answer is given up after a while. No draw asks for a page that
+	// is not held, so it is asked for again by itself.
+	it('asks again for a page whose request got no answer in time', function () {
+		const manager = new ImpressVectorManager();
+
+		const sent = SocketRecorder.during(() => {
+			manager.requestPartById('M0', cool.VectorMode.MasterPages);
+			agePageRequests(manager);
+			(manager as any)._pageRequests.expire();
+		});
+
+		nodeassert.strictEqual(sent.length, 2);
+		nodeassert.strictEqual(sent[1], sent[0]);
+	});
+
+	// A cached page whose question for what changed got no answer is stale again, and the
+	// views draw again, so the page asks again.
+	it('asks again what changed on a page whose request got no answer in time', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse(cachedSlide(0));
+		let draws = 0;
+		manager.onVectorChanged(() => draws++);
+
+		const { sent } = recording(() => {
+			manager.revalidateCachedParts();
+			manager.requestPart(0, cool.VectorMode.Slides);
+			agePageRequests(manager);
+			(manager as any)._pageRequests.expire();
+			manager.requestPart(0, cool.VectorMode.Slides);
+		});
+
+		nodeassert.strictEqual(sent.length, 2);
+		// One draw for the pages marked stale, and one for the request given up.
+		nodeassert.strictEqual(draws, 2);
+	});
+
+	// A slide that shows one image.
+	const slideWithImage = (): cool.VectorPrimitivesResponse => {
+		const bitmap = {
+			type: 'bitmap',
+			checksum: 7,
+			matrix: [10, 0, 0, 10, 0, 0],
+		};
+		return { partId: 'S0', objects: [{ id: 11, primitives: [bitmap] }] };
+	};
+
+	// How many requests for that image the steps send.
+	const imageRequests = (steps: () => void): number =>
+		SocketRecorder.during(steps).filter(
+			(message) => message.indexOf('VectorRenderingGraphics?checksum=7') >= 0,
+		).length;
+
+	// The request for an image sent before the connection dropped gets no answer either, so
+	// a draw after the reconnect asks for the image again.
+	it('asks again for an image once its request is forgotten', function () {
+		const manager = new ImpressVectorManager();
+		const asked = imageRequests(() =>
+			manager.handleVectorPrimitivesResponse(slideWithImage()),
+		);
+		nodeassert.strictEqual(asked, 1);
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		const draw = () => manager.renderInto(new CanvasRecorder() as any, data);
+
+		nodeassert.strictEqual(imageRequests(draw), 0);
+		manager.forgetRequestsInFlight();
+		nodeassert.strictEqual(imageRequests(draw), 1);
+	});
+
+	// A request for an image that gets no answer is given up after a while, and the image
+	// is asked for again by itself while a page uses it.
+	it('asks again for an image whose request got no answer in time', function () {
+		const manager = new ImpressVectorManager();
+		imageRequests(() =>
+			manager.handleVectorPrimitivesResponse(slideWithImage()),
+		);
+		const requests = (manager as any)._resources.images._requests;
+		for (const request of requests.requests())
+			request.sent -= 2 * (VectorResourceTracker as any).requestTimeout;
+
+		nodeassert.strictEqual(
+			imageRequests(() => requests.expire()),
+			1,
+		);
+	});
+
+	// A page removed while the client was away is answered with the header
+	// alone, and its cache entry is dropped.
+	it('drops a cached part when the answer says the page is gone', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S3',
+			version: 5,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		manager.handleVectorPrimitivesResponse({
+			mode: 0,
+			partId: 'S3',
+		});
+
+		nodeassert.strictEqual(
+			manager.requestPart(3, cool.VectorMode.Slides),
+			undefined,
+		);
+	});
+
+	// A delta without a version cannot be checked against later ones, so the
+	// cache keeps what it held.
+	it('leaves a delta without a version unapplied', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 5,
+			objects: [{ id: 11, primitives: [] }],
+		});
+		manager.handleVectorPrimitivesDelta({
+			partId: 'S0',
+			objects: [{ id: 11, primitives: [{ type: 'polygonHairline' }] }],
+		});
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 5);
+		nodeassert.strictEqual(data.objects.get(11).primitives.length, 0);
+	});
+
+	// A full response older than a delta already applied does not roll the
+	// cache back.
+	it('ignores a full response older than the cache', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 6,
+			objects: [{ id: 11, primitives: [{ type: 'polygonHairline' }] }],
+		});
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 5,
+			objects: [{ id: 11, primitives: [] }],
+		});
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 6);
+		nodeassert.strictEqual(data.objects.get(11).primitives.length, 1);
+	});
+
+	// A delta that brings a new object without an order has no place to draw
+	// it, so the part is fetched whole.
+	it('drops the part when a delta brings a new object without an order', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [{ id: 11, primitives: [] }],
+		});
+		manager.handleVectorPrimitivesDelta({
+			partId: 'S0',
+			version: 2,
+			objects: [{ id: 22, primitives: [] }],
+		});
+		nodeassert.strictEqual(
+			manager.requestPart(0, cool.VectorMode.Slides),
+			undefined,
+		);
+	});
+
+	// A listener that is no longer wanted is not called again.
+	it('forgets a listener that was removed', function () {
+		const manager = new ImpressVectorManager();
+		let notified = 0;
+		const listener = () => notified++;
+		manager.onVectorChanged(listener);
+		manager.setHiddenLayers([1]);
+		nodeassert.strictEqual(notified, 1);
+		manager.offVectorChanged(listener);
+		manager.setHiddenLayers([2]);
+		nodeassert.strictEqual(notified, 1);
+	});
+
+	// Hiding a layer and replacing the page list change nothing at the
+	// engine, so the listeners hear that no object was answered rather
+	// than that a whole part arrived.
+	it('answers no object when a layer is hidden or the page list changes', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse(cachedSlide(0));
+		const answers: (number[] | undefined)[] = [];
+		manager.onVectorChanged((answered) => answers.push(answered));
+		manager.setHiddenLayers([1]);
+		manager.partListChanged();
+		nodeassert.deepStrictEqual(answers, [[], []]);
+	});
+
+	// The page rectangle rides on the page entry rather than on a field of
+	// its own, so it arrives with a full response and a delta that carries
+	// that entry updates it, which is how a resized page reaches the client.
+	it('takes the page rectangle from the page entry', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 1000, height: 800, primitives: [] },
+				{ id: 11, primitives: [] },
+			],
+		});
+
+		let data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.slideWidth, 1000);
+		nodeassert.strictEqual(data.slideHeight, 800);
+
+		manager.handleVectorPrimitivesDelta({
+			partId: 'S0',
+			version: 2,
+			order: [0, 11],
+			objects: [
+				{ id: 0, kind: 'page', width: 2000, height: 1600, primitives: [] },
+			],
+		});
+
+		data = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.slideWidth, 2000);
+		nodeassert.strictEqual(data.slideHeight, 1600);
+	});
+
+	// The page is an object like the others, first in the order. A delta
+	// carries its entry only when the background or the master page
+	// changed, and then it replaces the cached one.
+	it('replaces the page entry when a delta carries it', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [
+				{ id: 5, kind: 'page', primitives: [] },
+				{ id: 11, primitives: [] },
+			],
+		});
+
+		const delta: any = {
+			partId: 'S0',
+			version: 2,
+			order: [5, 11],
+			objects: [
+				{ id: 5, kind: 'page', primitives: [{ type: 'polygonHairline' }] },
+			],
+		};
+		manager.handleVectorPrimitivesDelta(delta);
+
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(data.version, 2);
+		nodeassert.strictEqual(data.objects.get(5).kind, 'page');
+		nodeassert.strictEqual(data.objects.get(5).primitives.length, 1);
+		nodeassert.deepStrictEqual(data.order, [5, 11]);
+	});
+
+	// Each object carries where it sits in the group tree, which layer it
+	// is on, whether it is an empty placeholder and where it paints. The
+	// manager keeps all of that so the view can hit-test and frame objects.
+	it('keeps the geometry and grouping of each object', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			objects: [
+				{ id: 11, parent: 0, layer: 0, primitives: [] },
+				{
+					id: 22,
+					parent: 11,
+					layer: 2,
+					emptyPlaceholder: true,
+					x: 10,
+					y: 20,
+					width: 300,
+					height: 200,
+					transform: [300, 0, 0, 200, 10, 20],
+					primitives: [],
+				},
+			],
+		});
+
+		const data = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.ok(data, 'part 0 is cached after its response');
+		const member = data.objects.get(22);
+		nodeassert.ok(member, 'the member is cached under its own id');
+		nodeassert.strictEqual(member.parent, 11);
+		nodeassert.strictEqual(member.layer, 2);
+		nodeassert.strictEqual(member.emptyPlaceholder, true);
+		nodeassert.deepStrictEqual(
+			[member.x, member.y, member.width, member.height],
+			[10, 20, 300, 200],
+		);
+		nodeassert.deepStrictEqual(member.transform, [300, 0, 0, 200, 10, 20]);
+	});
+
+	// Hiding a layer leaves the objects on it out of the drawing while the
+	// rest of the slide still paints, and showing it again brings them back.
+	it('skips the objects on a hidden layer when drawing', function () {
+		const manager = new ImpressVectorManager();
+		const hairline = { type: 'polygonHairline', path: 'M0 0 L1 1' };
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			objects: [
+				{ id: 11, layer: 0, primitives: [hairline] },
+				{ id: 22, layer: 5, primitives: [hairline] },
+			],
+		});
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+
+		manager.setHiddenLayers([5]);
+		let recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, data);
+		nodeassert.strictEqual(countCalls(recorder, 'stroke'), 1);
+
+		manager.setHiddenLayers([]);
+		recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, data);
+		nodeassert.strictEqual(countCalls(recorder, 'stroke'), 2);
+	});
+
+	// What an option names to draw over an object is drawn right after that
+	// object, before the next one, so a later object covers it like it
+	// covers the object itself.
+	it('draws what is named over an object before the objects after it', function () {
+		const manager = new ImpressVectorManager();
+		const hairline = { type: 'polygonHairline', path: 'M0 0 L1 1' };
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			objects: [
+				{ id: 11, primitives: [hairline] },
+				{ id: 22, primitives: [hairline] },
+			],
+		});
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+
+		const recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, data, {
+			drawOver: new Map([
+				[
+					11,
+					(context: CanvasRenderingContext2D) => context.fillRect(0, 0, 1, 1),
+				],
+			]),
+		});
+		const order = recorder.calls
+			.map((call) => call.method)
+			.filter((method) => method === 'stroke' || method === 'fillRect');
+		nodeassert.deepStrictEqual(order, ['stroke', 'fillRect', 'stroke']);
+	});
+
+	// Text that carries the automatic color is drawn with contrast against
+	// the surface behind it. The entry for the page is where the slide's
+	// own background arrives, so text on a dark slide comes out light even
+	// though the view around it is light.
+	it('draws automatic text against the background the page entry carries', function () {
+		const manager = new ImpressVectorManager();
+		const text = {
+			type: 'textSimplePortion',
+			text: 'Hi',
+			fontSize: 20,
+			matrix: [20, 0, 0, 20, 5, 7],
+			fontcolor: cool.VectorColors.AUTOMATIC,
+			familyname: 'Liberation Sans',
+		};
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 200,
+					height: 150,
+					backdrop: '#102030',
+					primitives: [],
+				},
+				{ id: 11, primitives: [text] },
+			],
+		});
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+
+		const recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, data);
+
+		const fillText = recorder.findCall('fillText');
+		nodeassert.ok(fillText, 'fillText not called');
+		nodeassert.strictEqual(fillText?.properties.fillStyle, '#FFFFFF');
+	});
+
+	it('names automatic text by the color it is drawn in on its page', function () {
+		const manager = new ImpressVectorManager();
+		const text = {
+			type: 'textSimplePortion',
+			text: 'Hi',
+			fontSize: 20,
+			matrix: [20, 0, 0, 20, 5, 7],
+			fontcolor: cool.VectorColors.AUTOMATIC,
+			familyname: 'Liberation Sans',
+		};
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 200,
+					height: 150,
+					backdrop: '#102030',
+					primitives: [],
+				},
+				{ id: 11, primitives: [text] },
+			],
+		});
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+
+		nodeassert.strictEqual(manager.textColorOf(data, text as any), '#FFFFFF');
+		nodeassert.strictEqual(
+			manager.textColorOf(data, { ...text, fontcolor: '#C9211E' } as any),
+			'#C9211E',
+		);
+	});
+
+	// The picture a drag shows of an object takes its colors from the page
+	// the object is on, even when another part was drawn before it.
+	it('draws a drag picture against the background of its own page', function () {
+		const manager = new ImpressVectorManager();
+		const text = {
+			type: 'textSimplePortion',
+			text: 'Hi',
+			fontSize: 20,
+			matrix: [20, 0, 0, 20, 5, 7],
+			fontcolor: cool.VectorColors.AUTOMATIC,
+			familyname: 'Liberation Sans',
+		};
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 200,
+					height: 150,
+					backdrop: '#102030',
+					primitives: [],
+				},
+				{ id: 11, primitives: [text] },
+			],
+		});
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S1',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 200, height: 150, primitives: [] },
+				{ id: 21, primitives: [text] },
+			],
+		});
+		const dark: any = manager.requestPart(0, cool.VectorMode.Slides);
+		const light: any = manager.requestPart(1, cool.VectorMode.Slides);
+
+		manager.renderInto(new CanvasRecorder() as any, dark);
+
+		const recorder = new CanvasRecorder();
+		manager.renderObjectsWith(
+			recorder as any,
+			light,
+			[21],
+			cool.Matrix2D.IDENTITY,
+		);
+
+		const fillText = recorder.findCall('fillText');
+		nodeassert.ok(fillText, 'fillText not called');
+		nodeassert.strictEqual(fillText?.properties.fillStyle, '#000000');
+	});
+
+	describe('on a dark view', function () {
+		const DARK = '#1C1C1C';
+		let originalSectionContainer: any;
+		beforeEach(function () {
+			originalSectionContainer = (app as any).sectionContainer;
+			(app as any).sectionContainer = {
+				getDocumentBackgroundColor: () => DARK,
+			};
+		});
+		afterEach(function () {
+			(app as any).sectionContainer = originalSectionContainer;
+		});
+
+		function whiteShapeOnSlide(manager: ImpressVectorManager): any {
+			const whiteFill = {
+				type: 'polyPolygonColor',
+				color: '#FFFFFF',
+				path: 'M 0 0 L 10 0 L 10 10 Z',
+			};
+			manager.handleVectorPrimitivesResponse({
+				partId: 'S0',
+				mode: cool.VectorMode.Slides,
+				version: 1,
+				objects: [
+					{ id: 0, kind: 'page', width: 200, height: 150, primitives: [] },
+					{ id: 11, primitives: [whiteFill] },
+				],
+			});
+			return manager.requestPart(0, cool.VectorMode.Slides);
+		}
+
+		function fillStyleOfShape(
+			manager: ImpressVectorManager,
+			data: any,
+			options?: any,
+		): string {
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, options);
+			const fill = recorder.findCall('fill');
+			nodeassert.ok(fill, 'fill not called');
+			return fill.properties.fillStyle;
+		}
+
+		it('draws a white shape dark in the view and white in a slideshow', function () {
+			const manager = new ImpressVectorManager();
+			const data = whiteShapeOnSlide(manager);
+
+			nodeassert.strictEqual(fillStyleOfShape(manager, data), DARK);
+			nodeassert.strictEqual(
+				fillStyleOfShape(manager, data, { authoredColors: true }),
+				'#FFFFFF',
+			);
+			// The view draws dark again after the slideshow.
+			nodeassert.strictEqual(fillStyleOfShape(manager, data), DARK);
+		});
+
+		it('mixes what lies outside an edited group towards the background of the view', function () {
+			// Settings that hold nothing give back the default they are asked with.
+			const originalPrefs = (window as any).prefs;
+			(window as any).prefs = {
+				get: (_key: string, byDefault: any) => byDefault,
+				getNumber: (_key: string, byDefault: number) => byDefault,
+			};
+			try {
+				nodeassert.strictEqual(
+					(ImpressVectorManager as any)._ghosting().color,
+					DARK,
+				);
+			} finally {
+				(window as any).prefs = originalPrefs;
+			}
+		});
+	});
+
+	// A slide names the master it draws under itself. The master is painted
+	// between the slide's own background and its objects, in the master's
+	// order. A shared object is drawn as the master carries it. An object
+	// that differs per slide is drawn from the slide's own copy, and is left
+	// out when the slide has no copy. An object the master hides behind
+	// slides is never drawn.
+	it('paints the master a page names under the page', function () {
+		const hairline = (path: string): any => ({ type: 'polygonHairline', path });
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M0',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 100,
+					height: 100,
+					primitives: [hairline('M0 0 L9 9')],
+				},
+				{ id: 1, hiddenBehindSlide: true, primitives: [hairline('M0 0 L1 1')] },
+				{ id: 2, primitives: [hairline('M0 0 L2 2')] },
+				{ id: 3, slideDependent: true, primitives: [hairline('M0 0 L3 3')] },
+				{ id: 4, slideDependent: true, primitives: [hairline('M0 0 L4 4')] },
+			],
+		});
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 100,
+					height: 100,
+					masterPartId: 'M0',
+					primitives: [hairline('M0 0 L6 6')],
+				},
+				{ id: 3, masterContent: true, primitives: [hairline('M0 0 L5 5')] },
+				{ id: 9, primitives: [hairline('M0 0 L7 7')] },
+			],
+		});
+
+		const slide: any = manager.requestPart(0, cool.VectorMode.Slides);
+		nodeassert.strictEqual(slide.masterPartId, 'M0');
+		nodeassert.strictEqual(
+			manager.isPartDrawable(0, cool.VectorMode.Slides),
+			true,
+		);
+
+		const recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, slide);
+		// The slide's background, the shared master object, the slide's copy
+		// of the per-slide one, then the slide's own object. The hidden master
+		// object and the copy-less one are left out.
+		nodeassert.deepStrictEqual(
+			recorder.calls
+				.filter((call: any) => call.method === 'stroke')
+				.map((call: any) => (call.args[0] as any).path),
+			['M0 0 L6 6', 'M0 0 L2 2', 'M0 0 L5 5', 'M0 0 L7 7'],
+		);
+	});
+
+	// A slide can turn the master's objects off. The page entry names the
+	// master layers it hides, and the objects on them are not drawn under
+	// that slide while another slide still shows them.
+	it('leaves out the master layers a page hides', function () {
+		const hairline = (path: string): any => ({ type: 'polygonHairline', path });
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M0',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 100, height: 100, primitives: [] },
+				{ id: 2, layer: 2, primitives: [hairline('M0 0 L2 2')] },
+				{ id: 3, layer: 1, primitives: [hairline('M0 0 L3 3')] },
+			],
+		});
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 100,
+					height: 100,
+					masterPartId: 'M0',
+					masterHiddenLayers: [2],
+					primitives: [],
+				},
+			],
+		});
+
+		const slide: any = manager.requestPart(0, cool.VectorMode.Slides);
+		const recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, slide);
+		nodeassert.deepStrictEqual(
+			recorder.calls
+				.filter((call: any) => call.method === 'stroke')
+				.map((call: any) => (call.args[0] as any).path),
+			['M0 0 L3 3'],
+		);
+	});
+
+	// A slide with a master of three objects, each drawn as its own hairline, under a page whose
+	// background is a hairline too.
+	function slideOverThreeMasterObjects(manager: ImpressVectorManager): any {
+		const hairline = (path: string): any => ({ type: 'polygonHairline', path });
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M0',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 100, height: 100, primitives: [] },
+				{ id: 1, primitives: [hairline('M0 0 L1 1')] },
+				{ id: 2, primitives: [hairline('M0 0 L2 2')] },
+				{ id: 3, primitives: [hairline('M0 0 L3 3')] },
+			],
+		});
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 100,
+					height: 100,
+					masterPartId: 'M0',
+					primitives: [hairline('M0 0 L6 6')],
+				},
+			],
+		});
+		return manager.requestPart(0, cool.VectorMode.Slides);
+	}
+
+	function strokedPaths(recorder: CanvasRecorder): string[] {
+		return recorder.calls
+			.filter((call: any) => call.method === 'stroke')
+			.map((call: any) => (call.args[0] as any).path);
+	}
+
+	// A slide can be drawn in parts split inside its master. The lowest part draws the page
+	// background and the master objects below the split. The part above draws only the master
+	// objects above the split, and lies over the part below.
+	it('draws the master objects a range names, and the page background only from the first', function () {
+		const manager = new ImpressVectorManager();
+		const slide = slideOverThreeMasterObjects(manager);
+
+		const lower = new CanvasRecorder();
+		manager.renderInto(lower as any, slide, {
+			masterRange: { start: 0, end: 3 },
+		});
+		nodeassert.deepStrictEqual(strokedPaths(lower), [
+			'M0 0 L6 6',
+			'M0 0 L1 1',
+			'M0 0 L2 2',
+		]);
+
+		const upper = new CanvasRecorder();
+		manager.renderInto(upper as any, slide, {
+			masterRange: { start: 3, end: 4 },
+		});
+		nodeassert.deepStrictEqual(strokedPaths(upper), ['M0 0 L3 3']);
+	});
+
+	// What an option names to draw over a master object, such as the frame of a background
+	// video, is drawn right after that object, so the master objects above it cover it.
+	it('draws what is named over a master object before the master objects after it', function () {
+		const manager = new ImpressVectorManager();
+		const slide = slideOverThreeMasterObjects(manager);
+
+		const recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, slide, {
+			drawOver: new Map([
+				[
+					2,
+					(context: CanvasRenderingContext2D) => context.fillRect(0, 0, 1, 1),
+				],
+			]),
+		});
+		const order = recorder.calls
+			.map((call) => call.method)
+			.filter((method) => method === 'stroke' || method === 'fillRect');
+		nodeassert.deepStrictEqual(order, [
+			'stroke',
+			'stroke',
+			'stroke',
+			'fillRect',
+			'stroke',
+		]);
+	});
+
+	// An edit running on a master object hides the object's own text, and the
+	// entry that carries what is typed is on the master part. A slide drawing
+	// under that master draws the entry, so the typed text shows on the slide.
+	it('draws a master edit on the slides under the master', function () {
+		const hairline = (path: string): any => ({ type: 'polygonHairline', path });
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M0',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 100, height: 100, primitives: [] },
+				{ id: 2, textEdit: true, primitives: [] },
+				{
+					id: -2,
+					kind: 'texteditoverlay',
+					parent: 2,
+					viewId: 1,
+					primitives: [hairline('M0 0 L4 4')],
+				},
+			],
+		});
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 100,
+					height: 100,
+					masterPartId: 'M0',
+					primitives: [],
+				},
+			],
+		});
+
+		const slide: any = manager.requestPart(0, cool.VectorMode.Slides);
+		const recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, slide);
+		nodeassert.deepStrictEqual(
+			recorder.calls
+				.filter((call: any) => call.method === 'stroke')
+				.map((call: any) => (call.args[0] as any).path),
+			['M0 0 L4 4'],
+		);
+	});
+
+	// A slide that names a master it does not have yet is not drawable, and
+	// the master is asked for. It becomes drawable once the master arrives.
+	it('waits for the master a page names before drawing it', function () {
+		const recorder = new SocketRecorder();
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S2',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [
+				{
+					id: 0,
+					kind: 'page',
+					width: 100,
+					height: 100,
+					masterPartId: 'M1',
+					primitives: [],
+				},
+			],
+		});
+		nodeassert.strictEqual(
+			manager.isPartDrawable(2, cool.VectorMode.Slides),
+			false,
+		);
+		nodeassert.ok(
+			recorder.sent.some(
+				(message) =>
+					message.indexOf('.uno:VectorPrimitives?partid=M1&mode=1') >= 0,
+			),
+			'the master the page names is fetched by its id',
+		);
+
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M1',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 100, height: 100, primitives: [] },
+			],
+		});
+		nodeassert.strictEqual(
+			manager.isPartDrawable(2, cool.VectorMode.Slides),
+			true,
+		);
+		recorder.restore();
+	});
+
+	// The engine reports the layers a view hides as a state change. The
+	// manager takes the list as it is, and a list that is not one hides
+	// nothing. A new list changes what the slide shows, so the views
+	// listening for vector changes redraw.
+	it('takes the hidden layers from the layer visibility state', function () {
+		const manager = new ImpressVectorManager();
+		let notified = 0;
+		manager.onVectorChanged(() => notified++);
+
+		manager.setHiddenLayers([3, 7]);
+		nodeassert.strictEqual(manager.isLayerVisible(3), false);
+		nodeassert.strictEqual(manager.isLayerVisible(7), false);
+		nodeassert.strictEqual(manager.isLayerVisible(4), true);
+		nodeassert.strictEqual(notified, 1);
+
+		// The same list again changes nothing.
+		manager.setHiddenLayers([7, 3]);
+		nodeassert.strictEqual(notified, 1);
+
+		manager.setHiddenLayers('nonsense');
+		nodeassert.strictEqual(manager.isLayerVisible(3), true);
+		nodeassert.strictEqual(notified, 2);
+	});
+
+	// A placeholder that holds no content yet carries its prompt text inside
+	// a wrapper only an editing view unfolds, so a thumbnail and a slideshow
+	// leave the prompt out and the editing view shows it.
+	it('draws the prompt of an empty placeholder in the edit view only', function () {
+		const manager = new ImpressVectorManager();
+		const prompt = {
+			type: 'exclusiveEditView',
+			children: [{ type: 'polygonHairline', path: 'M0 0 L1 1' }],
+		};
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			objects: [
+				{ id: 0, kind: 'page', width: 1000, height: 800, primitives: [] },
+				{ id: 11, primitives: [prompt] },
+			],
+		});
+		const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+
+		let recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, data);
+		nodeassert.strictEqual(countCalls(recorder, 'stroke'), 0);
+
+		recorder = new CanvasRecorder();
+		manager.renderInto(recorder as any, data, { editView: true });
+		nodeassert.strictEqual(countCalls(recorder, 'stroke'), 1);
+	});
+
+	// A text portion names its font face by id. The manager asks the
+	// engine for that font so it can be loaded and used for an exact match.
+	it('requests the font a text portion names', function () {
+		const recorder = new SocketRecorder();
+
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			objects: [
+				{
+					id: 1,
+					primitives: [
+						{ type: 'textSimplePortion', text: 'Hi', fontId: '1092a' } as any,
+					],
+				},
+			],
+		});
+
+		recorder.restore();
+		nodeassert.ok(
+			recorder.sent.some(
+				(message) => message.indexOf('.uno:VectorRenderingFont?id=1092a') >= 0,
+			),
+			'a font request carries the portion font id',
+		);
+	});
+
+	// Discarding the whole cache forgets every part, so the next use
+	// starts a fresh fetch.
+	it('drops all cached parts when the cache is discarded', function () {
+		const recorder = new SocketRecorder();
+
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [{ id: 11, primitives: [] }],
+		});
+		manager.discardAllCache();
+
+		nodeassert.strictEqual(
+			manager.requestPart(0, cool.VectorMode.Slides),
+			undefined,
+		);
+		nodeassert.ok(
+			recorder.sent.some(
+				(message) =>
+					message.indexOf('.uno:VectorPrimitives?partid=S0&mode=0') >= 0,
+			),
+			'the dropped part is fetched afresh',
+		);
+		recorder.restore();
+	});
+
+	// A graphics-memory reclaim drops the cached parts and tells the
+	// listeners, so views re-fetch on their next paint.
+	it('drops cached parts and notifies on graphics memory reclaim', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		let notified = 0;
+		manager.onVectorChanged(() => notified++);
+		manager.reclaimGraphicsMemory();
+
+		nodeassert.ok(notified > 0, 'listeners hear about the drop');
+		nodeassert.strictEqual(
+			manager.requestPart(0, cool.VectorMode.Slides),
+			undefined,
+		);
+	});
+
+	// The same index names a different page in each mode, so slide 0 and
+	// master page 0 are cached apart and each keeps its own content.
+	it('caches the same index in two modes as separate pages', function () {
+		const manager = new ImpressVectorManager();
+
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			mode: cool.VectorMode.Slides,
+			version: 1,
+			objects: [{ id: 11, primitives: [] }],
+		});
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M0',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [
+				{ id: 22, primitives: [] },
+				{ id: 33, primitives: [] },
+			],
+		});
+
+		const slide = manager.requestPart(0, cool.VectorMode.Slides);
+		const master = manager.requestPartById('M0', cool.VectorMode.MasterPages);
+		nodeassert.deepStrictEqual(slide.order, [11]);
+		nodeassert.deepStrictEqual(master.order, [22, 33]);
+	});
+
+	// A master page and the slide at the same index are cached apart, so
+	// the slide is still requested after the master page arrives.
+	it('does not let one mode satisfy a request for the other', function () {
+		const recorder = new SocketRecorder();
+
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M0',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [],
+		});
+
+		nodeassert.strictEqual(
+			manager.requestPart(0, cool.VectorMode.Slides),
+			undefined,
+		);
+		nodeassert.ok(
+			recorder.sent.some(
+				(message) =>
+					message.indexOf('.uno:VectorPrimitives?partid=S0&mode=0') >= 0,
+			),
+			'the slide at the same index is fetched on its own',
+		);
+
+		recorder.restore();
+	});
+
+	// A part the document does not hold is answered with the header alone.
+	// The request is closed, and the page is not asked for again until the
+	// page list is replaced, which is when the answer could differ.
+	it('asks again for a missing part once the page list is replaced', function () {
+		const recorder = new SocketRecorder();
+
+		// How many times the part was asked for.
+		const asked = (): number =>
+			recorder.sent.filter(
+				(message) => message.indexOf('.uno:VectorPrimitives?partid=M4') >= 0,
+			).length;
+
+		const manager = new ImpressVectorManager();
+		nodeassert.strictEqual(
+			manager.requestPartById('M4', cool.VectorMode.MasterPages),
+			undefined,
+		);
+		nodeassert.strictEqual(asked(), 1, 'the part is asked for once');
+
+		// The engine answers that it holds no such page.
+		manager.handleVectorPrimitivesResponse({
+			mode: cool.VectorMode.MasterPages,
+			partId: 'M4',
+		});
+
+		// Asking again sends nothing while the page list is the one that did
+		// not hold the page, and asks again once the list is replaced.
+		nodeassert.strictEqual(
+			manager.requestPartById('M4', cool.VectorMode.MasterPages),
+			undefined,
+		);
+		nodeassert.strictEqual(
+			asked(),
+			1,
+			'a page the document lacks was asked again',
+		);
+		// The server is told to forget the part it was asked for.
+		nodeassert.deepStrictEqual(recorder.sent.slice(1), [
+			'commandvalues command=.uno:VectorForgetPart?partid=M4',
+		]);
+		manager.partListChanged();
+		nodeassert.strictEqual(
+			manager.requestPartById('M4', cool.VectorMode.MasterPages),
+			undefined,
+		);
+		nodeassert.strictEqual(asked(), 2, 'the part is asked for again');
+
+		recorder.restore();
+	});
+
+	// Master view marks out each placeholder with the name of its area. The
+	// name travels with the aids, which the view that edits the page draws
+	// in a pass of its own, so the page content stays free of it.
+	it('paints the area name of a master placeholder', function () {
+		const response = loadVectorRenderingReference('testMasterAreaName');
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse(response);
+		const master = manager.requestPartById(
+			response.partId,
+			cool.VectorMode.MasterPages,
+		);
+		nodeassert.ok(master, 'the master part is cached');
+
+		const drawnText = (recorder: any): string =>
+			recorder.calls
+				.filter(
+					(call: any) =>
+						call.method === 'fillText' || call.method === 'strokeText',
+				)
+				.map((call: any) => call.args[0])
+				.join(' ');
+
+		const aids = new CanvasRecorder(400, 300);
+		manager.renderPlaceholderAids(aids as any, master);
+		nodeassert.ok(
+			drawnText(aids).indexOf('Footer Area') >= 0,
+			'the aids drew no area name',
+		);
+		nodeassert.ok(
+			aids.calls.some((call: any) => call.method === 'setLineDash'),
+			'the aids drew no dashed boundary',
+		);
+
+		const content = new CanvasRecorder(400, 300);
+		manager.renderInto(content as any, master, { editView: true });
+		nodeassert.strictEqual(
+			drawnText(content).indexOf('Footer Area'),
+			-1,
+			'the page content drew the area name',
+		);
+	});
+
+	// The aids that mark out a placeholder are an overlay of the view that
+	// edits the page, so the page content is drawn without them.
+	it('draws the placeholder aids apart from the page content', function () {
+		const hairline = (path: string): any => ({ type: 'polygonHairline', path });
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'M0',
+			mode: cool.VectorMode.MasterPages,
+			version: 1,
+			objects: [
+				{
+					id: 1,
+					primitives: [hairline('M0 0 L1 1')],
+					aids: [hairline('M0 0 L2 2'), hairline('M0 0 L3 3')],
+				},
+			],
+		});
+		const master: any = manager.requestPartById(
+			'M0',
+			cool.VectorMode.MasterPages,
+		);
+		nodeassert.ok(master, 'the master part is cached');
+
+		const content = new CanvasRecorder();
+		manager.renderInto(content as any, master, { editView: true });
+		nodeassert.strictEqual(countCalls(content, 'stroke'), 1);
+
+		const aids = new CanvasRecorder();
+		manager.renderPlaceholderAids(aids as any, master);
+		nodeassert.strictEqual(countCalls(aids, 'stroke'), 2);
+	});
+
+	// A response that names no mode is filed as the slide at that index.
+	it('treats a response with no mode as a slide', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S2',
+			version: 1,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		nodeassert.ok(manager.requestPart(2, cool.VectorMode.Slides));
+	});
+
+	// A page is cached under its id, so a slide inserted in front of it moves
+	// its index and nothing else: the page list names the page at the new
+	// index and the cache answers for it without asking the engine again.
+	it('keeps a cached page when its index moves', function () {
+		const recorder = new SocketRecorder();
+		const originalImpress = (app as any).impress;
+		try {
+			const manager = new ImpressVectorManager();
+			manager.handleVectorPrimitivesResponse({
+				partId: 'S0',
+				mode: cool.VectorMode.Slides,
+				version: 3,
+				objects: [{ id: 11, primitives: [] }],
+			});
+
+			// A new slide is inserted before it, and the status carries the new list.
+			(app as any).impress = {
+				partList: [
+					{ part: 'S9', mode: cool.VectorMode.Slides },
+					{ part: 'S0', mode: cool.VectorMode.Slides },
+				],
+			};
+			manager.partListChanged();
+
+			const moved: any = manager.requestPart(1, cool.VectorMode.Slides);
+			nodeassert.ok(moved, 'the page is still cached at its new index');
+			nodeassert.strictEqual(moved.version, 3);
+			nodeassert.deepStrictEqual(moved.order, [11]);
+			nodeassert.strictEqual(
+				recorder.sent.length,
+				0,
+				'nothing was asked for again',
+			);
+
+			// The new slide at the old index is another page, asked for by its id.
+			nodeassert.strictEqual(
+				manager.requestPart(0, cool.VectorMode.Slides),
+				undefined,
+			);
+			nodeassert.ok(
+				recorder.sent.some(
+					(message) =>
+						message.indexOf('.uno:VectorPrimitives?partid=S9&mode=0') >= 0,
+				),
+				'the inserted page is fetched by its id',
+			);
+		} finally {
+			(app as any).impress = originalImpress;
+			recorder.restore();
+		}
+	});
+
+	// A delta names the page by its id, so it reaches the page wherever the
+	// page now sits in its list.
+	it('applies a delta to a page whose index moved', function () {
+		const manager = new ImpressVectorManager();
+		manager.handleVectorPrimitivesResponse({
+			partId: 'S0',
+			version: 1,
+			objects: [{ id: 11, primitives: [] }],
+		});
+
+		// Two slides are inserted before it, and the status carries the new list.
+		(app as any).impress = {
+			partList: [
+				{ part: 'S7', mode: cool.VectorMode.Slides },
+				{ part: 'S8', mode: cool.VectorMode.Slides },
+				{ part: 'S0', mode: cool.VectorMode.Slides },
+			],
+		};
+		manager.partListChanged();
+
+		manager.handleVectorPrimitivesDelta({
+			partId: 'S0',
+			version: 2,
+			objects: [{ id: 11, primitives: [{ type: 'polygonHairline' }] }],
+		});
+
+		const data: any = manager.requestPart(2, cool.VectorMode.Slides);
+		nodeassert.ok(data, 'the page is found at its new index');
+		nodeassert.strictEqual(data.version, 2);
+		nodeassert.strictEqual(data.objects.get(11).primitives.length, 1);
+	});
+	// Two views can edit the same text box at once, each with an entry of its
+	// own carrying the same text. Only one of them is drawn: this view's own
+	// where it is one of the two, and otherwise the first.
+	it('draws one text edit entry per edited object', function () {
+		const hairline = (path: string): any => ({ type: 'polygonHairline', path });
+		const response: any = {
+			partId: 'S0',
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 100, height: 100, primitives: [] },
+				{ id: 11, textEdit: true, primitives: [] },
+				{
+					id: -2,
+					kind: 'texteditoverlay',
+					parent: 11,
+					viewId: 1,
+					primitives: [hairline('M0 0 L1 1')],
+				},
+				{
+					id: -3,
+					kind: 'texteditoverlay',
+					parent: 11,
+					viewId: 2,
+					primitives: [hairline('M0 0 L2 2'), hairline('M0 0 L3 3')],
+				},
+			],
+		};
+		const originalMap = (app as any).map;
+		try {
+			// This client is view 2, so its own entry is the one drawn.
+			(app as any).map = { _docLayer: { _viewId: 2 } };
+			let manager = new ImpressVectorManager();
+			manager.handleVectorPrimitivesResponse(response);
+			let recorder = new CanvasRecorder();
+			manager.renderInto(
+				recorder as any,
+				manager.requestPart(0, cool.VectorMode.Slides) as any,
+				{
+					editView: true,
+				},
+			);
+			nodeassert.strictEqual(countCalls(recorder, 'stroke'), 2);
+
+			// A view that is not editing the box draws the first entry.
+			(app as any).map = { _docLayer: { _viewId: 7 } };
+			manager = new ImpressVectorManager();
+			manager.handleVectorPrimitivesResponse(response);
+			recorder = new CanvasRecorder();
+			manager.renderInto(
+				recorder as any,
+				manager.requestPart(0, cool.VectorMode.Slides) as any,
+			);
+			nodeassert.strictEqual(countCalls(recorder, 'stroke'), 1);
+		} finally {
+			(app as any).map = originalMap;
+		}
+	});
+
+	describe('Thumbnails', function () {
+		let originalDocument: any;
+		let originalImage: any;
+		let originalMap: any;
+		let originalImpress: any;
+		let originalDpiScale: number;
+		let drawn: any[];
+		// One recorder per thumbnail drawn, in the order they were drawn.
+		let recorders: any[];
+
+		// The text a thumbnail drew, read back from its recorder.
+		const drawnText = (event: any): string =>
+			recorders[drawn.indexOf(event)].calls
+				.filter(
+					(call: any) =>
+						call.method === 'fillText' || call.method === 'strokeText',
+				)
+				.map((call: any) => call.args[0])
+				.join(' ');
+
+		beforeEach(function () {
+			drawn = [];
+			recorders = [];
+			originalDocument = (globalThis as any).document;
+			originalImage = (globalThis as any).Image;
+			originalMap = (app as any).map;
+			originalImpress = (app as any).impress;
+			originalDpiScale = app.roundedDpiScale;
+			app.roundedDpiScale = 1;
+			// A thumbnail draws to an offscreen canvas and reports itself
+			// through the map, so a recorder stands in for both.
+			(globalThis as any).document = {
+				createElement: function () {
+					return {
+						width: 0,
+						height: 0,
+						getContext: function () {
+							recorders.push(new CanvasRecorder(100, 100));
+							return recorders[recorders.length - 1];
+						},
+						toDataURL: function () {
+							return 'data:image/png;base64,';
+						},
+					};
+				},
+			};
+			// The finished thumbnail is handed over as an image, which node
+			// does not have.
+			(globalThis as any).Image = function () {};
+			(app as any).map = {
+				_docLayer: { _docType: 'presentation', _selectedPart: 0 },
+				fire: function (name: string, event: any) {
+					if (name === 'tilepreview') drawn.push(event);
+				},
+			};
+			(app as any).impress = {
+				partList: pageList(cool.VectorMode.Slides, 10),
+			};
+		});
+
+		afterEach(function () {
+			(globalThis as any).document = originalDocument;
+			(globalThis as any).Image = originalImage;
+			(app as any).map = originalMap;
+			(app as any).impress = originalImpress;
+			app.roundedDpiScale = originalDpiScale;
+		});
+
+		// A response for a page with a page entry of the given size and the
+		// given objects on it.
+		const page = (part: number, mode: number, objects: any[]): any => ({
+			mode: mode,
+			partId: (mode === cool.VectorMode.MasterPages ? 'M' : 'S') + String(part),
+			version: 1,
+			objects: [
+				{ id: 0, kind: 'page', width: 100, height: 100, primitives: [] },
+			].concat(objects),
+		});
+
+		const prompt: any = {
+			type: 'exclusiveEditView',
+			children: [{ type: 'textSimplePortion', text: 'Click to edit' }],
+		};
+
+		// A master page is the layout the slides are built on, and its
+		// placeholders are what there is to see on it. A thumbnail of one
+		// draws them, prompt text and all.
+		it('draws the prompt text of a master page thumbnail', function () {
+			(app as any).impress = {
+				partList: pageList(cool.VectorMode.MasterPages, 5),
+			};
+			const manager = new ImpressVectorManager();
+			manager.requestThumbnail(0, 0, cool.VectorMode.MasterPages, 100, 100);
+			manager.handleVectorPrimitivesResponse(
+				page(0, cool.VectorMode.MasterPages, [
+					{ id: 1, emptyPlaceholder: true, primitives: [prompt] },
+				]),
+			);
+
+			nodeassert.strictEqual(drawn.length, 1);
+			nodeassert.strictEqual(drawn[0].mode, cool.VectorMode.MasterPages);
+			// The preview names the page it shows by its id and by its index at
+			// render time.
+			nodeassert.strictEqual(drawn[0].part, 'M0');
+			nodeassert.strictEqual(drawn[0].partIndex, 0);
+			nodeassert.ok(
+				drawnText(drawn[0]).indexOf('Click to edit') >= 0,
+				'the master thumbnail drew no prompt text',
+			);
+		});
+
+		// A request for a page the document does not hold is answered with
+		// the header alone. The thumbnail is dropped, so a page that turns
+		// up at that index later is not drawn into a preview that has since
+		// stopped asking for it.
+		it('drops a thumbnail of a part the document does not hold', function () {
+			(app as any).impress = {
+				partList: pageList(cool.VectorMode.MasterPages, 5),
+			};
+			const manager = new ImpressVectorManager();
+			manager.requestThumbnail(0, 4, cool.VectorMode.MasterPages, 100, 100);
+
+			manager.handleVectorPrimitivesResponse({
+				mode: cool.VectorMode.MasterPages,
+				partId: 'M4',
+			});
+			nodeassert.strictEqual(drawn.length, 0);
+
+			manager.handleVectorPrimitivesResponse(
+				page(4, cool.VectorMode.MasterPages, []),
+			);
+			nodeassert.strictEqual(drawn.length, 0);
+		});
+
+		// A page asked for again after being away answers with a full response,
+		// and a preview already shown for it is drawn again from that.
+		it('draws a shown preview again when its page arrives anew', function () {
+			const manager = new ImpressVectorManager();
+			manager.requestThumbnail(0, 0, cool.VectorMode.Slides, 100, 100);
+			manager.handleVectorPrimitivesResponse(
+				page(0, cool.VectorMode.Slides, [{ id: 1, primitives: [] }]),
+			);
+			nodeassert.strictEqual(drawn.length, 1);
+
+			const again = page(0, cool.VectorMode.Slides, [
+				{ id: 1, primitives: [] },
+			]);
+			again.version = 2;
+			manager.handleVectorPrimitivesResponse(again);
+			nodeassert.strictEqual(drawn.length, 2);
+		});
+
+		// A preview of a page that may be behind the document is drawn from the
+		// cache at once, and asks what changed since the version held.
+		it('draws a stale preview from the cache and asks what changed', function () {
+			const manager = new ImpressVectorManager();
+			const held = page(0, cool.VectorMode.Slides, [{ id: 1, primitives: [] }]);
+			held.epoch = 100;
+			manager.handleVectorPrimitivesResponse(held);
+			manager.revalidateCachedParts();
+
+			const sent = SocketRecorder.during(() =>
+				manager.requestThumbnail(0, 0, cool.VectorMode.Slides, 100, 100),
+			);
+
+			nodeassert.strictEqual(drawn.length, 1);
+			nodeassert.strictEqual(sent.length, 1);
+			nodeassert.ok(
+				sent[0].indexOf('partid=S0&mode=0&since=1&epoch=100') >= 0,
+				'the request does not say what the client holds: ' + sent[0],
+			);
+		});
+
+		// A preview asked for twice while its page is pending is drawn once.
+		it('draws a waiting preview once however often it asked', function () {
+			const manager = new ImpressVectorManager();
+			manager.requestThumbnail(0, 0, cool.VectorMode.Slides, 100, 100);
+			manager.requestThumbnail(0, 0, cool.VectorMode.Slides, 120, 120);
+			manager.handleVectorPrimitivesResponse(
+				page(0, cool.VectorMode.Slides, [{ id: 1, primitives: [] }]),
+			);
+			nodeassert.strictEqual(drawn.length, 1);
+			nodeassert.strictEqual(drawn[0].width, 120);
+		});
+
+		// A slide stands on its own, so the prompt that invites an edit is
+		// not part of the picture.
+		it('leaves the prompt text out of a slide thumbnail', function () {
+			const manager = new ImpressVectorManager();
+			manager.requestThumbnail(0, 0, cool.VectorMode.Slides, 100, 100);
+			manager.handleVectorPrimitivesResponse(
+				page(0, cool.VectorMode.Slides, [
+					{ id: 1, emptyPlaceholder: true, primitives: [prompt] },
+				]),
+			);
+
+			nodeassert.strictEqual(drawn.length, 1);
+			nodeassert.strictEqual(
+				drawnText(drawn[0]).indexOf('Click to edit'),
+				-1,
+				'the slide thumbnail drew prompt text',
+			);
+		});
+
+		// The bitmaps of a master come in together, and every slide under the
+		// master shows them. The thumbnails of those slides draw again once
+		// for the whole burst, in a layouting task.
+		it('draws the thumbnails under a master again once for all its bitmaps', function () {
+			const realLayoutingService = app.layoutingService;
+			const realImage = (globalThis as any).Image;
+			app.layoutingService = new LayoutingService();
+			// A fetched bitmap decodes as soon as its data is set.
+			(globalThis as any).Image = function (this: any) {
+				Object.defineProperty(this, 'src', {
+					set: function () {
+						if (this.onload) this.onload();
+					},
+				});
+			};
+			try {
+				const manager = new ImpressVectorManager();
+				const bitmap = (checksum: number) => ({
+					type: 'bitmap',
+					checksum: checksum,
+					matrix: [10, 0, 0, 10, 0, 0],
+				});
+				const slide = (part: number): any => ({
+					mode: cool.VectorMode.Slides,
+					partId: 'S' + String(part),
+					version: 1,
+					objects: [
+						{
+							id: 0,
+							kind: 'page',
+							width: 100,
+							height: 100,
+							masterPartId: 'M0',
+							primitives: [],
+						},
+					],
+				});
+				manager.handleVectorPrimitivesResponse(
+					page(0, cool.VectorMode.MasterPages, [
+						{ id: 1, primitives: [bitmap(7), bitmap(8)] },
+					]),
+				);
+				manager.requestThumbnail(1, 0, cool.VectorMode.Slides, 100, 100);
+				manager.requestThumbnail(2, 1, cool.VectorMode.Slides, 100, 100);
+				manager.handleVectorPrimitivesResponse(slide(0));
+				manager.handleVectorPrimitivesResponse(slide(1));
+				nodeassert.strictEqual(drawn.length, 2);
+				drawn.length = 0;
+
+				manager.handleVectorRenderingGraphicsResponse({
+					checksum: 7,
+					data: 'data:image/png;base64,',
+				});
+				manager.handleVectorRenderingGraphicsResponse({
+					checksum: 8,
+					data: 'data:image/png;base64,',
+				});
+				nodeassert.strictEqual(
+					drawn.length,
+					0,
+					'drew before the layouting task',
+				);
+
+				while (app.layoutingService.hasTasksPending())
+					app.layoutingService.runTheTopTask();
+				nodeassert.deepStrictEqual(
+					drawn.map((event: any) => event.id).sort(),
+					[1, 2],
+				);
+			} finally {
+				app.layoutingService = realLayoutingService;
+				(globalThis as any).Image = realImage;
+			}
+		});
+
+		// A slide whose master is still to come keeps its thumbnail request
+		// waiting. The master draws each waiting thumbnail once.
+		it('draws a thumbnail waiting for its master once', function () {
+			const manager = new ImpressVectorManager();
+			const slide = (part: number): any => ({
+				mode: cool.VectorMode.Slides,
+				partId: 'S' + String(part),
+				version: 1,
+				objects: [
+					{
+						id: 0,
+						kind: 'page',
+						width: 100,
+						height: 100,
+						masterPartId: 'M0',
+						primitives: [],
+					},
+				],
+			});
+			manager.requestThumbnail(1, 0, cool.VectorMode.Slides, 100, 100);
+			manager.requestThumbnail(2, 1, cool.VectorMode.Slides, 100, 100);
+			manager.handleVectorPrimitivesResponse(slide(0));
+			manager.handleVectorPrimitivesResponse(slide(1));
+			nodeassert.strictEqual(drawn.length, 0, 'drew without the master');
+
+			manager.handleVectorPrimitivesResponse(
+				page(0, cool.VectorMode.MasterPages, [{ id: 1, primitives: [] }]),
+			);
+			nodeassert.deepStrictEqual(
+				drawn.map((event: any) => event.id).sort(),
+				[1, 2],
+			);
+		});
+	});
+
+	// A manager that measures text with the stub of the prediction tests.
+	class TestManager extends ImpressVectorManager {
+		protected _textMeasure(): cool.TextRunMeasure {
+			return predictionTest.measure;
+		}
+	}
+
+	// The same for the pages of a text document.
+	class WriterTestManager extends WriterVectorManager {
+		protected _textMeasure(): cool.TextRunMeasure {
+			return predictionTest.measure;
+		}
+	}
+
+	// The document state is set up as during a text edit.
+	describe('predicted text edits', function () {
+		// One text box with id 5 at (1000, 2000) holding one run of text.
+		function textBox(text: string): any {
+			return {
+				id: 5,
+				primitives: [
+					{
+						type: 'transform',
+						matrix: [1, 0, 0, 1, 1000, 2000],
+						children: [
+							{
+								type: 'textSimplePortion',
+								text,
+								textPosition: 0,
+								textLength: text.length,
+								matrix: [1, 0, 0, 1, 0, 0],
+								fontSize: 360,
+								familyname: 'Arial',
+								paragraph: 0,
+							},
+						],
+					},
+				],
+			};
+		}
+
+		function textOf(manager: ImpressVectorManager): string {
+			const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+			return data.objects.get(5).primitives[0].children[0].text;
+		}
+
+		let savedMap: any;
+		let savedSelections: any;
+		let savedCursor: any;
+		let savedSequence: number;
+		beforeEach(function () {
+			const anyApp = app as any;
+			savedMap = anyApp.map;
+			savedSelections = (window as any).TextSelections;
+			savedCursor = app.file.textCursor;
+			savedSequence = app.file.inputSequence;
+			anyApp.map = {
+				_docLayer: { _selectedPart: 0, _onUpdateCursor: function () {} },
+			};
+			(window as any).TextSelections = { isActive: () => false };
+			// The caret sits at the end of "Hi", which spans 1000..1200.
+			app.file.textCursor = {
+				visible: true,
+				rectangle: new cool.SimpleRectangle(1200, 1800, 0, 250),
+				logical: { paragraph: 0, index: 2 },
+			};
+			app.file.inputSequence = 10;
+			LocalCaret.forget();
+		});
+		afterEach(function () {
+			(app as any).map = savedMap;
+			(window as any).TextSelections = savedSelections;
+			app.file.textCursor = savedCursor;
+			app.file.inputSequence = savedSequence;
+			LocalCaret.forget();
+			cool.InputSequence.forget();
+		});
+
+		function managerWith(text: string): ImpressVectorManager {
+			const manager = new TestManager();
+			manager.handleVectorPrimitivesResponse({
+				partId: 'S0',
+				version: 1,
+				objects: [textBox(text)],
+			});
+			return manager;
+		}
+
+		// Sends the message of the edit predicted last, as the input numbered one above the
+		// last one sent.
+		function sendTheEdit(): void {
+			cool.InputSequence.stamp('textinput');
+		}
+
+		// A manager that holds "Hi" and predicted the 'a' sent as input 11.
+		function afterTypingA(): ImpressVectorManager {
+			const manager = managerWith('Hi');
+			manager.predictTextInsert('a');
+			sendTheEdit();
+			return manager;
+		}
+
+		// Sends a delta that holds the text box with that text and reflects that input.
+		function sendDelta(
+			manager: ImpressVectorManager,
+			inputSequence: number,
+			text: string,
+			version = 2,
+		): void {
+			manager.handleVectorPrimitivesDelta({
+				partId: 'S0',
+				version,
+				inputSequence,
+				order: [5],
+				objects: [textBox(text)],
+			});
+		}
+
+		// A text box with id 5 holding "line1" and "line2" on two lines of one paragraph,
+		// split by a line break, so index 5 is the end of the first run and the start of the
+		// second.
+		function twoLineBox(first = 'line1'): any {
+			const text = first + 'line2';
+			const run = (start: number, length: number, translateY: number): any => ({
+				type: 'textSimplePortion',
+				text,
+				textPosition: start,
+				textLength: length,
+				matrix: [1, 0, 0, 1, 0, translateY],
+				fontSize: 360,
+				familyname: 'Arial',
+				paragraph: 0,
+			});
+			return {
+				id: 5,
+				primitives: [
+					{
+						type: 'transform',
+						matrix: [1, 0, 0, 1, 1000, 2000],
+						children: [run(0, first.length, 0), run(first.length, 5, 400)],
+					},
+				],
+			};
+		}
+
+		// A caret update for that input that puts the caret in paragraph 0 at that index, in
+		// the object with that id when one is given.
+		function caretUpdate(
+			inputSequence: number,
+			index: number,
+			objectId?: number,
+		): cool.CaretUpdate {
+			const values: cool.CaretUpdate = {
+				inputSequence,
+				paragraph: '0',
+				index: String(index),
+			};
+			if (objectId !== undefined) values.object = String(objectId);
+			return values;
+		}
+
+		// The typed character is input 11. A delta for input 10 does not
+		// include it, so the edit is replayed and the caret stays after it.
+		it('keeps a predicted character when a delta predates it', function () {
+			const manager = managerWith('Hi');
+			nodeassert.ok(manager.predictTextInsert('a'));
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+			sendTheEdit();
+
+			sendDelta(manager, 10, 'Hi');
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+			nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+				paragraph: 0,
+				index: 3,
+			});
+			nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1300);
+		});
+
+		// Content for the edit's own input includes it, so the edit is dropped
+		// and later content stands as it is.
+		it('shows later content unchanged once the server includes the edit', function () {
+			const manager = afterTypingA();
+
+			sendDelta(manager, 11, 'Hia');
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+			// Another view appended text. Nothing is replayed on top.
+			sendDelta(manager, 11, 'Hia!', 3);
+			nodeassert.strictEqual(textOf(manager), 'Hia!');
+		});
+
+		// Content for the first of several keystrokes keeps the later ones, in
+		// order.
+		it('keeps the keystrokes a delta does not include yet, in order', function () {
+			const manager = afterTypingA();
+			manager.predictTextInsert('b');
+			sendTheEdit();
+			manager.predictTextDelete(1, 0);
+			sendTheEdit();
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+
+			sendDelta(manager, 11, 'Hia');
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+			nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+				paragraph: 0,
+				index: 3,
+			});
+		});
+
+		// A part dropped from the cache comes back in full, and the keystroke that the
+		// full response does not include yet shows on it again.
+		it('keeps a predicted character on a part fetched again in full', function () {
+			const manager = afterTypingA();
+			manager.clearCachedPart('S0');
+			manager.handleVectorPrimitivesResponse({
+				partId: 'S0',
+				version: 2,
+				inputSequence: 10,
+				objects: [textBox('Hi')],
+			});
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+		});
+
+		// A full response without an input sequence stands as it is, and the
+		// edits are dropped.
+		it('takes content without an input sequence as it is', function () {
+			const manager = afterTypingA();
+			manager.handleVectorPrimitivesResponse({
+				partId: 'S0',
+				version: 2,
+				objects: [textBox('Hi')],
+			});
+			nodeassert.strictEqual(textOf(manager), 'Hi');
+		});
+
+		// A caret update for an input older than a predicted edit leaves the
+		// local caret after the typed text. The update that reflects the edit
+		// applies.
+		it('keeps the local caret while a caret update lags behind a predicted edit', function () {
+			const manager = afterTypingA();
+			nodeassert.strictEqual(
+				manager.keepPredictedCaret(caretUpdate(10, 2)),
+				true,
+			);
+			nodeassert.strictEqual(
+				manager.keepPredictedCaret(caretUpdate(11, 3)),
+				false,
+			);
+			// The edit is still pending, so a stale delta still replays it.
+			sendDelta(manager, 10, 'Hi');
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+		});
+
+		// A caret elsewhere for the same input means the server changed the
+		// text differently, so the predicted edits are dropped and the server's
+		// content stands.
+		it('shows the server text when the server put the caret elsewhere', function () {
+			const manager = afterTypingA();
+			nodeassert.strictEqual(
+				manager.keepPredictedCaret(caretUpdate(11, 5)),
+				false,
+			);
+			sendDelta(manager, 10, 'Hi');
+			nodeassert.strictEqual(textOf(manager), 'Hi');
+		});
+
+		// A server that ignored the keystroke sends no delta for it, so the client
+		// asks for the whole part, and its answer replaces the predicted text.
+		it('replaces the predicted text with the whole part when the server put the caret elsewhere', function () {
+			const manager = afterTypingA();
+			const recorder = new SocketRecorder();
+			manager.keepPredictedCaret(caretUpdate(11, 2));
+			recorder.restore();
+			nodeassert.deepStrictEqual(recorder.sent, [
+				'commandvalues command=.uno:VectorPrimitives?partid=S0&mode=' +
+					String(cool.VectorMode.Slides),
+			]);
+
+			manager.handleVectorPrimitivesResponse({
+				partId: 'S0',
+				version: 1,
+				inputSequence: 11,
+				objects: [textBox('Hi')],
+			});
+			nodeassert.strictEqual(textOf(manager), 'Hi');
+		});
+
+		// A page waiting its turn to ask what changed can ask for the whole page meanwhile,
+		// when the server puts the caret elsewhere. That request brings the current page, so
+		// an answer lets the page after it ask instead.
+		it('lets the next waiting page ask when the waiting ones already asked for the whole page', function () {
+			const manager = new TestManager();
+			for (let i = 0; i < 5; i++)
+				manager.handleVectorPrimitivesResponse({
+					partId: 'S' + String(i),
+					version: 1,
+					objects: [textBox('Hi')],
+				});
+			const sent: string[] = [];
+			(app as any).socket.sendMessage = (message: string) => sent.push(message);
+			(app as any).map.fire = function () {};
+			manager.revalidateCachedParts();
+			for (let i = 0; i < 5; i++)
+				manager.requestPart(i, cool.VectorMode.Slides);
+
+			// Text typed on S2 and on S3, and a caret the server puts elsewhere on each.
+			for (const part of [2, 3]) {
+				(app as any).map._docLayer._selectedPart = part;
+				nodeassert.ok(manager.predictTextInsert('a'));
+				sendTheEdit();
+				manager.keepPredictedCaret(caretUpdate(app.file.inputSequence, 2));
+			}
+
+			for (const part of [0, 1])
+				manager.handleVectorPrimitivesResponse({
+					partId: 'S' + String(part),
+					version: 2,
+					objects: [textBox('Hi')],
+				});
+			(app as any).socket.sendMessage = function () {};
+			nodeassert.deepStrictEqual(
+				sent.map((message) => message.match(/partid=(S\d)/)?.[1]),
+				['S0', 'S1', 'S2', 'S3', 'S4'],
+			);
+		});
+
+		// When a predicted edit no longer fits the server's text, the client asks
+		// for the whole part again.
+		it('asks for the whole part when a replayed edit no longer fits', function () {
+			const manager = afterTypingA();
+			const recorder = new SocketRecorder();
+			// The server's text box has no paragraph 0, where the edit was typed.
+			const moved = textBox('Hi');
+			moved.primitives[0].children[0].paragraph = 1;
+			manager.handleVectorPrimitivesDelta({
+				partId: 'S0',
+				version: 2,
+				inputSequence: 10,
+				order: [5],
+				objects: [moved],
+			});
+			recorder.restore();
+			nodeassert.deepStrictEqual(recorder.sent, [
+				'commandvalues command=.uno:VectorPrimitives?partid=S0&mode=' +
+					String(cool.VectorMode.Slides),
+			]);
+		});
+
+		// A caret in another text box for the same input drops the predicted
+		// edits, even though the position inside that box matches.
+		it('shows the server text when the caret is in another object', function () {
+			const manager = afterTypingA();
+			nodeassert.strictEqual(
+				manager.keepPredictedCaret(caretUpdate(11, 3, 9)),
+				false,
+			);
+			sendDelta(manager, 10, 'Hi');
+			nodeassert.strictEqual(textOf(manager), 'Hi');
+		});
+
+		// The same input in the edited object confirms the caret.
+		it('keeps the predicted text when the caret update names the edited object', function () {
+			const manager = afterTypingA();
+			nodeassert.strictEqual(
+				manager.keepPredictedCaret(caretUpdate(11, 3, 5)),
+				false,
+			);
+			sendDelta(manager, 10, 'Hi');
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+		});
+
+		// During a running text edit the typed text sits in an entry whose
+		// parent is the edited object. A caret update naming that object keeps
+		// the edits, and one naming another object drops them.
+		it('keeps text typed in a running edit for a caret in the edited object, and shows the server text for a caret in another object', function () {
+			const editEntry = (text: string): any => ({
+				...textBox(text),
+				id: -2,
+				kind: 'texteditoverlay',
+				viewId: 0,
+				parent: 5,
+			});
+			const editText = (manager: ImpressVectorManager): string => {
+				const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+				return data.objects.get(-2).primitives[0].children[0].text;
+			};
+			const managerEditing = (): ImpressVectorManager => {
+				const manager = new TestManager();
+				manager.handleVectorPrimitivesResponse({
+					partId: 'S0',
+					version: 1,
+					objects: [{ id: 5, primitives: [], textEdit: true }, editEntry('Hi')],
+				});
+				return manager;
+			};
+			const delta = (): any => ({
+				partId: 'S0',
+				version: 2,
+				inputSequence: 10,
+				order: [5, -2],
+				objects: [editEntry('Hi')],
+			});
+
+			const confirmed = managerEditing();
+			confirmed.predictTextInsert('a');
+			sendTheEdit();
+			confirmed.keepPredictedCaret(caretUpdate(11, 3, 5));
+			confirmed.handleVectorPrimitivesDelta(delta());
+			nodeassert.strictEqual(editText(confirmed), 'Hia');
+
+			app.file.inputSequence = 10;
+			app.file.textCursor.rectangle = new cool.SimpleRectangle(
+				1200,
+				1800,
+				0,
+				250,
+			);
+			app.file.textCursor.logical = { paragraph: 0, index: 2 };
+			const moved = managerEditing();
+			moved.predictTextInsert('a');
+			sendTheEdit();
+			moved.keepPredictedCaret(caretUpdate(11, 3, 9));
+			moved.handleVectorPrimitivesDelta(delta());
+			nodeassert.strictEqual(editText(moved), 'Hi');
+		});
+
+		// The caret ends "line1", where index 5 also starts "line2". After the replay the
+		// caret stays at the end of the first line, at 1000 plus the six characters of
+		// "line1x", with its top 288 above the first baseline.
+		it('keeps the caret on its line after replaying an edit at a line break', function () {
+			const manager = new TestManager();
+			manager.handleVectorPrimitivesResponse({
+				partId: 'S0',
+				version: 1,
+				objects: [twoLineBox()],
+			});
+			app.file.textCursor.rectangle = new cool.SimpleRectangle(
+				1500,
+				1800,
+				0,
+				250,
+			);
+			app.file.textCursor.logical = { paragraph: 0, index: 5 };
+			nodeassert.ok(manager.predictTextInsert('x'));
+			sendTheEdit();
+
+			manager.handleVectorPrimitivesDelta({
+				partId: 'S0',
+				version: 2,
+				inputSequence: 10,
+				order: [5],
+				objects: [twoLineBox()],
+			});
+			const data: any = manager.requestPart(0, cool.VectorMode.Slides);
+			nodeassert.strictEqual(
+				data.objects.get(5).primitives[0].children[0].text,
+				'line1xline2',
+			);
+			nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1600);
+			nodeassert.strictEqual(app.file.textCursor.rectangle.y1, 1712);
+		});
+
+		// An empty index says nothing about where the server put the caret, so the edit
+		// stays pending and a later delta that predates it replays it.
+		it('keeps the predicted text when a caret update has an empty index', function () {
+			const manager = afterTypingA();
+			nodeassert.strictEqual(
+				manager.keepPredictedCaret({
+					inputSequence: 11,
+					paragraph: '0',
+					index: '',
+				}),
+				false,
+			);
+			sendDelta(manager, 10, 'Hi');
+			nodeassert.strictEqual(textOf(manager), 'Hia');
+		});
+
+		// A caret update without a sequence cannot be compared, so it applies.
+		it('moves the caret for a caret update without an input sequence', function () {
+			const manager = managerWith('Hi');
+			manager.predictTextInsert('a');
+			nodeassert.strictEqual(
+				manager.keepPredictedCaret({ paragraph: '0', index: '2' }),
+				false,
+			);
+		});
+
+		describe('caret moved here', function () {
+			let recorder: SocketRecorder;
+			let sent: string[];
+			let savedTimerRegistry: any;
+			// The selection rectangles drawn here, as [x, y, width, height], one entry
+			// per draw.
+			let drawn: number[][][];
+			// The handle rectangles set here, as [x, y, width, height] or null.
+			let handles: (number[] | null)[];
+			let savedSetStartRectangle: any;
+			let savedSetEndRectangle: any;
+			const handleOf = (rectangle: cool.SimpleRectangle | null) =>
+				rectangle
+					? [rectangle.x1, rectangle.y1, rectangle.width, rectangle.height]
+					: null;
+			beforeEach(function () {
+				recorder = new SocketRecorder();
+				sent = recorder.sent;
+				savedTimerRegistry = (app as any).timerRegistry;
+				(app as any).timerRegistry = new TimerRegistry();
+				drawn = [];
+				handles = [];
+				(TextSelections as any).active = false;
+				const documentLayer = (app as any).map._docLayer;
+				documentLayer.showTextSelection = (rectangles: number[][]) =>
+					drawn.push(rectangles);
+				savedSetStartRectangle = TextSelections.setStartRectangle;
+				savedSetEndRectangle = TextSelections.setEndRectangle;
+				TextSelections.setStartRectangle = (rectangle) =>
+					handles.push(handleOf(rectangle));
+				TextSelections.setEndRectangle = (rectangle) =>
+					handles.push(handleOf(rectangle));
+			});
+			afterEach(function () {
+				LocalCaret.forget();
+				recorder.restore();
+				(app as any).timerRegistry = savedTimerRegistry;
+				(TextSelections as any).active = false;
+				TextSelections.setStartRectangle = savedSetStartRectangle;
+				TextSelections.setEndRectangle = savedSetEndRectangle;
+			});
+
+			it('moves the caret one character left without telling the server', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.moveCaretByCharacter(-1));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 1,
+				});
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1100);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('leaves a step past the end of the text to the server', function () {
+				const manager = managerWith('Hi');
+				nodeassert.strictEqual(manager.moveCaretByCharacter(1), false);
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 2,
+				});
+			});
+
+			it('moves the caret to the start of the next line at a line break', function () {
+				const manager = new TestManager();
+				manager.handleVectorPrimitivesResponse({
+					partId: 'S0',
+					version: 1,
+					objects: [twoLineBox()],
+				});
+				// The caret is before the last character of "line1".
+				app.file.textCursor.rectangle = new cool.SimpleRectangle(
+					1400,
+					1800,
+					0,
+					250,
+				);
+				app.file.textCursor.logical = { paragraph: 0, index: 4 };
+				nodeassert.ok(manager.moveCaretByCharacter(1));
+				nodeassert.ok(manager.moveCaretByCharacter(1));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 6,
+				});
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1100);
+				nodeassert.strictEqual(app.file.textCursor.rectangle.y1, 2112);
+			});
+
+			it('moves the caret down and up a line and keeps its column over a shorter line', function () {
+				const manager = new TestManager();
+				manager.handleVectorPrimitivesResponse({
+					partId: 'S0',
+					version: 1,
+					objects: [twoLineBox('longline1')],
+				});
+				// The caret is before the last character of "longline1", at 1800.
+				app.file.textCursor.rectangle = new cool.SimpleRectangle(
+					1800,
+					1800,
+					0,
+					250,
+				);
+				app.file.textCursor.logical = { paragraph: 0, index: 8 };
+
+				// "line2" ends at 1500, so the caret goes to its end.
+				nodeassert.ok(manager.moveCaretByLine(1));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 14,
+				});
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1500);
+				nodeassert.strictEqual(app.file.textCursor.rectangle.y1, 2112);
+
+				nodeassert.ok(manager.moveCaretByLine(-1));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 8,
+				});
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1800);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('tells the server where the caret is once, before a message that may read it', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1);
+				manager.moveCaretByCharacter(-1);
+				LocalCaret.tellBefore('tilecombine nviewid=0 part=0');
+				nodeassert.deepStrictEqual(sent, []);
+				LocalCaret.tellBefore('key type=input char=0 key=1280');
+				LocalCaret.tellBefore('key type=up char=0 key=1280');
+				nodeassert.deepStrictEqual(sent, [
+					'textcursor object=5 paragraph=0 index=0 sequence=11',
+				]);
+			});
+
+			it('keeps the caret here while the mouse hovers, and tells the server before a drag', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1);
+				LocalCaret.tellBefore(
+					'mouse type=move x=10 y=20 count=1 buttons=0 modifier=0 sequence=11',
+				);
+				nodeassert.deepStrictEqual(sent, []);
+				LocalCaret.tellBefore(
+					'mouse type=move x=10 y=20 count=1 buttons=1 modifier=0 sequence=12',
+				);
+				nodeassert.strictEqual(sent.length, 1);
+				nodeassert.ok(
+					sent[0].startsWith('textcursor object=5 paragraph=0 index=1 '),
+				);
+			});
+
+			it('tells the server where the caret is once the caret rests', function () {
+				installFakeClock();
+				try {
+					const manager = managerWith('Hi');
+					manager.moveCaretByCharacter(-1);
+					advanceClock(200);
+					// A second move starts the wait again.
+					manager.moveCaretByCharacter(-1);
+					advanceClock(299);
+					nodeassert.deepStrictEqual(sent, []);
+					advanceClock(1);
+					nodeassert.deepStrictEqual(sent, [
+						'textcursor object=5 paragraph=0 index=0 sequence=11',
+					]);
+				} finally {
+					LocalCaret.forget();
+					restoreClock();
+				}
+			});
+
+			it('tells the server once when a message goes out before the caret rests', function () {
+				installFakeClock();
+				try {
+					const manager = managerWith('Hi');
+					manager.moveCaretByCharacter(-1);
+					LocalCaret.tellBefore('key type=input char=97 key=0');
+					advanceClock(1000);
+					nodeassert.strictEqual(sent.length, 1);
+				} finally {
+					LocalCaret.forget();
+					restoreClock();
+				}
+			});
+
+			it('types a character where the caret moved, after telling the server', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1);
+				nodeassert.ok(manager.predictTextInsert('a'));
+				nodeassert.strictEqual(textOf(manager), 'Hai');
+				nodeassert.deepStrictEqual(sent, [
+					'textcursor object=5 paragraph=0 index=1 sequence=11',
+				]);
+				// The character goes out as input 12, after the caret.
+				sendTheEdit();
+				nodeassert.strictEqual(
+					manager.keepPredictedCaret(caretUpdate(11, 1)),
+					true,
+				);
+				nodeassert.strictEqual(
+					manager.keepPredictedCaret(caretUpdate(12, 2)),
+					false,
+				);
+			});
+
+			it('keeps the caret it moved over caret updates from before the server knew of it', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1);
+				nodeassert.strictEqual(
+					manager.keepPredictedCaret(caretUpdate(10, 2)),
+					true,
+				);
+				LocalCaret.tell();
+				nodeassert.strictEqual(
+					manager.keepPredictedCaret(caretUpdate(10, 2)),
+					true,
+				);
+				nodeassert.strictEqual(
+					manager.keepPredictedCaret(caretUpdate(11, 1)),
+					false,
+				);
+				nodeassert.strictEqual(LocalCaret.ahead(), null);
+			});
+
+			it('puts the caret where a click lands in the edited text without telling the server', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.placeCaretAt(1120, 1950, 5));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 1,
+				});
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1100);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('puts the caret where a click lands in text typed after an earlier click', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.placeCaretAt(1120, 1950, 5));
+				nodeassert.ok(manager.predictTextInsert('a'));
+				// "Hai" now spans 1000..1300, so the click lands after the "i".
+				nodeassert.ok(manager.placeCaretAt(1280, 1950, 5));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 3,
+				});
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1300);
+			});
+
+			it('selects the word under a double click without telling the server', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.selectWordAt(1120, 1950, 5));
+				nodeassert.deepStrictEqual(app.file.textCursor.anchor, {
+					paragraph: 0,
+					index: 0,
+				});
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 2,
+				});
+				nodeassert.deepStrictEqual(drawn, [[[1000, 1712, 200, 432]]]);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('selects the paragraph under a triple click, over its lines', function () {
+				const manager = new TestManager();
+				manager.handleVectorPrimitivesResponse({
+					partId: 'S0',
+					version: 1,
+					objects: [twoLineBox()],
+				});
+				app.file.textCursor.rectangle = new cool.SimpleRectangle(
+					1400,
+					1800,
+					0,
+					250,
+				);
+				app.file.textCursor.logical = { paragraph: 0, index: 4 };
+				nodeassert.ok(manager.selectParagraphAt(1120, 1950, 5));
+				nodeassert.deepStrictEqual(app.file.textCursor.anchor, {
+					paragraph: 0,
+					index: 0,
+				});
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 10,
+				});
+				nodeassert.strictEqual(drawn[0].length, 2);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('leaves a click on another object to the server', function () {
+				const manager = managerWith('Hi');
+				nodeassert.strictEqual(manager.placeCaretAt(1120, 1950, 9), false);
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 2,
+				});
+			});
+
+			it('answers a click on a table only on the text of the cell being edited', function () {
+				const manager = new TestManager();
+				manager.handleVectorPrimitivesResponse({
+					partId: 'S0',
+					version: 1,
+					objects: [
+						{ id: 7, primitives: [], textEdit: true, objectKind: 35 },
+						{
+							...textBox('Hi'),
+							kind: 'texteditoverlay',
+							viewId: 0,
+							parent: 7,
+							x: 1000,
+							y: 1700,
+							width: 300,
+							height: 450,
+						},
+					],
+				});
+				// Right of the text, where the next cell may be.
+				nodeassert.strictEqual(manager.placeCaretAt(1350, 1950, 7), false);
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 2,
+				});
+				nodeassert.ok(manager.placeCaretAt(1120, 1950, 7));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 1,
+				});
+			});
+
+			it('selects text with Shift and an arrow, and tells the server the selection with the caret', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.moveCaretByCharacter(-1, true));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 1,
+				});
+				nodeassert.deepStrictEqual(app.file.textCursor.anchor, {
+					paragraph: 0,
+					index: 2,
+				});
+				// "i" spans 1100..1200 on the line from 1712 to 2144.
+				nodeassert.deepStrictEqual(drawn, [[[1100, 1712, 100, 432]]]);
+				nodeassert.deepStrictEqual(handles, [
+					[1100, 1712, 0, 432],
+					[1200, 1712, 0, 432],
+				]);
+
+				LocalCaret.tellBefore('key type=up char=0 key=4096');
+				nodeassert.deepStrictEqual(sent, [
+					'textcursor object=5 paragraph=0 index=1 anchorparagraph=0 anchorindex=2 sequence=11',
+				]);
+			});
+
+			it('selects a word with Ctrl, Shift and an arrow', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.moveCaretByWord(-1, true));
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 0,
+				});
+				nodeassert.deepStrictEqual(app.file.textCursor.anchor, {
+					paragraph: 0,
+					index: 2,
+				});
+				nodeassert.deepStrictEqual(drawn[0], [[1000, 1712, 200, 432]]);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('drops the selection when Shift and an arrow bring the caret back to the anchor', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1, true);
+				(TextSelections as any).active = true;
+				drawn = [];
+				nodeassert.ok(manager.moveCaretByCharacter(1, true));
+				nodeassert.strictEqual(app.file.textCursor.anchor, null);
+				nodeassert.deepStrictEqual(drawn, [[]]);
+			});
+
+			it('leaves an arrow without Shift over selected text to the server', function () {
+				const manager = managerWith('Hi');
+				(TextSelections as any).active = true;
+				app.file.textCursor.anchor = { paragraph: 0, index: 0 };
+				nodeassert.strictEqual(manager.moveCaretByCharacter(-1), false);
+				nodeassert.strictEqual(manager.moveCaretByLine(1), false);
+			});
+
+			it('leaves Shift and an arrow to the server when the start of the selection is not known', function () {
+				const manager = managerWith('Hi');
+				(TextSelections as any).active = true;
+				app.file.textCursor.anchor = null;
+				nodeassert.strictEqual(manager.moveCaretByCharacter(-1, true), false);
+			});
+
+			it('drops the selection where a click puts the caret', function () {
+				const manager = managerWith('Hi');
+				(TextSelections as any).active = true;
+				app.file.textCursor.anchor = { paragraph: 0, index: 0 };
+				nodeassert.ok(manager.placeCaretAt(1120, 1950, 5));
+				nodeassert.strictEqual(app.file.textCursor.anchor, null);
+				nodeassert.deepStrictEqual(drawn, [[]]);
+			});
+
+			it('deletes the selected text with Backspace, and the caret lands where it began', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.moveCaretByCharacter(-1, true));
+				(TextSelections as any).active = true;
+				drawn = [];
+				nodeassert.ok(manager.predictTextDelete(1, 0));
+				nodeassert.strictEqual(textOf(manager), 'H');
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 1,
+				});
+				nodeassert.strictEqual(app.file.textCursor.anchor, null);
+				nodeassert.deepStrictEqual(drawn, [[]]);
+				// The engine learns the selection with the caret before the
+				// deletion.
+				nodeassert.deepStrictEqual(sent, [
+					'textcursor object=5 paragraph=0 index=1 anchorparagraph=0 anchorindex=2 sequence=11',
+				]);
+
+				// A delta from before the deletion replays it.
+				sendTheEdit();
+				sendDelta(manager, 11, 'Hi');
+				nodeassert.strictEqual(textOf(manager), 'H');
+			});
+
+			it('deletes the selected text with Delete when the selection runs forward', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.moveCaretByWord(-1));
+				nodeassert.ok(manager.moveCaretByCharacter(1, true));
+				(TextSelections as any).active = true;
+				nodeassert.ok(manager.predictTextDelete(0, 1));
+				nodeassert.strictEqual(textOf(manager), 'i');
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 0,
+				});
+				nodeassert.strictEqual(app.file.textCursor.anchor, null);
+			});
+
+			it('deletes one more character for each key past the one that takes the selection', function () {
+				// The caret sits before the "!", so the second key takes the "H".
+				const manager = managerWith('Hi!');
+				nodeassert.ok(manager.moveCaretByCharacter(-1, true));
+				(TextSelections as any).active = true;
+				nodeassert.ok(manager.predictTextDelete(2, 0));
+				nodeassert.strictEqual(textOf(manager), '!');
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 0,
+				});
+			});
+
+			it('leaves a deletion over selected text to the server when the selection start is not known', function () {
+				const manager = managerWith('Hi');
+				(TextSelections as any).active = true;
+				app.file.textCursor.anchor = null;
+				nodeassert.strictEqual(manager.predictTextDelete(1, 0), false);
+				nodeassert.strictEqual(textOf(manager), 'Hi');
+			});
+
+			it('leaves an edit over a selection that reaches another paragraph to the server', function () {
+				// A selection over the paragraph break alone draws no rectangle.
+				const manager = managerWith('Hi');
+				app.file.textCursor.logical = { paragraph: 0, index: 2 };
+				app.file.textCursor.anchor = { paragraph: 1, index: 0 };
+				nodeassert.strictEqual(manager.canPredictAtCaret(), false);
+				nodeassert.strictEqual(manager.predictTextDelete(1, 0), false);
+				nodeassert.strictEqual(manager.predictTextInsert('x'), false);
+				nodeassert.strictEqual(textOf(manager), 'Hi');
+			});
+
+			it('deletes nothing for a key that removes no character', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.moveCaretByCharacter(-1, true));
+				(TextSelections as any).active = true;
+				nodeassert.strictEqual(manager.predictTextDelete(0, 0), false);
+				nodeassert.strictEqual(textOf(manager), 'Hi');
+			});
+
+			it('replaces the selected text with the typed character', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.moveCaretByWord(-1, true));
+				(TextSelections as any).active = true;
+				drawn = [];
+				nodeassert.ok(manager.predictTextInsert('a'));
+				nodeassert.strictEqual(textOf(manager), 'a');
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 1,
+				});
+				nodeassert.strictEqual(app.file.textCursor.anchor, null);
+				nodeassert.deepStrictEqual(drawn, [[]]);
+				// "a" is 100 wide from 1000.
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1100);
+
+				// A delta from before the key replays both edits in one.
+				sendTheEdit();
+				sendDelta(manager, 11, 'Hi');
+				nodeassert.strictEqual(textOf(manager), 'a');
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 1,
+				});
+			});
+
+			it('leaves typing over selected text to the server when the selection start is not known', function () {
+				const manager = managerWith('Hi');
+				(TextSelections as any).active = true;
+				app.file.textCursor.anchor = null;
+				nodeassert.strictEqual(manager.predictTextInsert('a'), false);
+				nodeassert.strictEqual(textOf(manager), 'Hi');
+			});
+
+			it('selects the text a drag goes over', function () {
+				const manager = managerWith('Hi');
+				nodeassert.ok(manager.startTextDrag(1020, 1950, 5));
+				// Past the end of the text, the drag reaches the end of the line.
+				manager.dragTextTo(1900, 2600);
+				manager.endTextDrag();
+				nodeassert.deepStrictEqual(app.file.textCursor.anchor, {
+					paragraph: 0,
+					index: 0,
+				});
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 2,
+				});
+				nodeassert.deepStrictEqual(drawn[0], [[1000, 1712, 200, 432]]);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('draws the selection the server sent with the caret update that catches up', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1, true);
+				LocalCaret.tell();
+				// The server sends the selection before the caret update, after an
+				// older selection.
+				nodeassert.ok(LocalCaret.hold('textselection: 1000, 1712, 200, 432'));
+				nodeassert.ok(
+					LocalCaret.hold('textselectionstart: 1100, 1712, 1, 432'),
+				);
+				nodeassert.ok(LocalCaret.hold('textselection: 1100, 1712, 100, 432'));
+				nodeassert.deepStrictEqual(LocalCaret.takeHeld(), []);
+
+				nodeassert.strictEqual(
+					manager.keepPredictedCaret(caretUpdate(11, 1)),
+					false,
+				);
+				nodeassert.deepStrictEqual(LocalCaret.takeHeld(), [
+					'textselectionstart: 1100, 1712, 1, 432',
+					'textselection: 1100, 1712, 100, 432',
+				]);
+				nodeassert.strictEqual(LocalCaret.hold('textselection: '), false);
+			});
+
+			it('tells the server where the caret is when the caret is hidden before it rests', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1);
+				nodeassert.deepStrictEqual(LocalCaret.release(), []);
+				nodeassert.deepStrictEqual(sent, [
+					'textcursor object=5 paragraph=0 index=1 sequence=11',
+				]);
+				nodeassert.strictEqual(LocalCaret.ahead(), null);
+			});
+
+			it('hands over the selection the server sent when the text edit ends before the caret catches up', function () {
+				const manager = managerWith('Hi');
+				manager.moveCaretByCharacter(-1, true);
+				LocalCaret.tell();
+				nodeassert.ok(LocalCaret.hold('textselection: '));
+				nodeassert.deepStrictEqual(LocalCaret.release(), ['textselection: ']);
+				// The caret here is gone with the edit, so the next update is the
+				// engine's.
+				nodeassert.strictEqual(
+					manager.keepPredictedCaret(caretUpdate(1, 0)),
+					false,
+				);
+				nodeassert.deepStrictEqual(LocalCaret.takeHeld(), []);
+			});
+
+			it('keeps the caret it moved after a typed character the server has not shown', function () {
+				const manager = afterTypingA();
+				nodeassert.ok(manager.moveCaretByCharacter(-1));
+				sendDelta(manager, 10, 'Hi');
+				nodeassert.strictEqual(textOf(manager), 'Hia');
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 2,
+				});
+				nodeassert.strictEqual(app.file.textCursor.rectangle.x1, 1200);
+			});
+		});
+	});
+
+	// The render manager made before the document type is known draws bitmap tiles. A
+	// presentation that draws from vectors replaces it, and the work that waits for the first
+	// visuals runs once the first page arrives.
+	it('runs the work that waits for the first visuals once the first vector page arrives', function () {
+		const originalInstance = (RenderManager as any)._instance;
+		const originalIsEnabled = cool.VectorRenderingConfig.isEnabled;
+		try {
+			const provisional: any = new BitmapTileManager();
+			// The provisional manager holds no tiles, so it has nothing to release.
+			provisional.discardAllCache = function () {};
+			(RenderManager as any)._instance = provisional;
+
+			let runs = 0;
+			RenderManager.appendAfterVisualsReady(() => {
+				runs++;
+			});
+
+			(cool.VectorRenderingConfig as any).isEnabled = () => true;
+			const manager = (RenderManager as any).makeInstance('presentation');
+			nodeassert.ok(manager instanceof ImpressVectorManager);
+			nodeassert.strictEqual(runs, 0, 'nothing runs before the first page');
+
+			manager.handleVectorPrimitivesResponse({ partId: 'S0', objects: [] });
+			nodeassert.strictEqual(runs, 1, 'the work runs with the first page');
+		} finally {
+			(cool.VectorRenderingConfig as any).isEnabled = originalIsEnabled;
+			(RenderManager as any)._instance = originalInstance;
+		}
+	});
+
+	// An animation draws an object in a state of its own: left out, moved by
+	// a transform, faded, or in other colors. The members of a group follow
+	// the group, and a paragraph with a state of its own is drawn apart from
+	// its object.
+	describe('Draw states', function () {
+		const hairline = { type: 'polygonHairline', path: 'M0 0 L1 1' };
+		const filled = {
+			type: 'polyPolygonColor',
+			path: 'M 0 0 L 10 0 L 10 10 Z',
+			color: '#112233',
+		};
+		function paragraph(text: string): any {
+			return {
+				type: 'textHierarchyParagraph',
+				children: [
+					{
+						type: 'textSimplePortion',
+						text: text,
+						fontSize: 20,
+						matrix: [20, 0, 0, 20, 5, 7],
+						fontcolor: '#112233',
+						familyname: 'Liberation Sans',
+					},
+				],
+			};
+		}
+
+		function cachedPart(manager: ImpressVectorManager, objects: any[]): any {
+			manager.handleVectorPrimitivesResponse({ partId: 'S0', objects });
+			return manager.requestPart(0, cool.VectorMode.Slides);
+		}
+
+		it('draws only the objects in the paint range, the page with the first', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{
+					id: 0,
+					kind: 'page',
+					width: 100,
+					height: 100,
+					primitives: [hairline],
+				},
+				{ id: 11, primitives: [hairline] },
+				{ id: 22, primitives: [filled] },
+				{ id: 33, primitives: [hairline] },
+			]);
+
+			const below = new CanvasRecorder();
+			manager.renderInto(below as any, data, {
+				paintRange: { start: 0, end: 2 },
+			});
+			nodeassert.strictEqual(countCalls(below, 'stroke'), 2);
+			nodeassert.strictEqual(countCalls(below, 'fill'), 0);
+
+			const above = new CanvasRecorder();
+			manager.renderInto(above as any, data, {
+				paintRange: { start: 2, end: 4 },
+			});
+			nodeassert.strictEqual(countCalls(above, 'stroke'), 1);
+			nodeassert.strictEqual(countCalls(above, 'fill'), 1);
+		});
+
+		it('leaves out a hidden object', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{ id: 11, primitives: [hairline] },
+				{ id: 22, primitives: [hairline] },
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([[22, { hidden: true }]]),
+			});
+
+			nodeassert.strictEqual(countCalls(recorder, 'stroke'), 1);
+		});
+
+		it('draws an object under its transform, opacity and colors', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [{ id: 11, primitives: [filled] }]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([
+					[
+						11,
+						{
+							transform: [2, 0, 0, 2, 5, 7],
+							alpha: 0.5,
+							colorOverride: { fill: 'rgb(10,20,30)' },
+						},
+					],
+				]),
+			});
+
+			const fill = recorder.findCall('fill');
+			nodeassert.ok(fill);
+			nodeassert.strictEqual(fill.properties.fillStyle, 'rgb(10,20,30)');
+			nodeassert.strictEqual(fill.properties.globalAlpha, 0.5);
+			nodeassert.deepStrictEqual(
+				recorder.findCall('transform')?.args,
+				[2, 0, 0, 2, 5, 7],
+			);
+		});
+
+		it('draws the next object as it comes', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{ id: 11, primitives: [filled] },
+				{ id: 22, primitives: [filled] },
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([
+					[11, { alpha: 0.5, colorOverride: { fill: 'rgb(10,20,30)' } }],
+				]),
+			});
+
+			const fills = recorder.callsOf('fill');
+			nodeassert.strictEqual(fills.length, 2);
+			nodeassert.strictEqual(fills[1].properties.fillStyle, filled.color);
+		});
+
+		it('draws a paragraph that moves on its own without the object around it', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{
+					id: 11,
+					primitives: [
+						filled,
+						{
+							type: 'textHierarchyBlock',
+							children: [paragraph('One'), paragraph('Two')],
+						},
+					],
+				},
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([[11, { paragraphs: new Map([[1, { alpha: 0.5 }]]) }]]),
+			});
+
+			// The fill comes once, with the object, and the moving paragraph
+			// brings its text alone.
+			nodeassert.strictEqual(recorder.callsOf('fill').length, 1);
+			const texts = recorder.callsOf('fillText');
+			nodeassert.deepStrictEqual(
+				texts.map((call) => call.args[0]),
+				['One', 'Two'],
+			);
+			nodeassert.strictEqual(texts[1].properties.globalAlpha, 0.5);
+		});
+
+		it('moves the members of a group with the group', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{ id: 11 },
+				{ id: 22, parent: 11, primitives: [filled] },
+				{ id: 33, primitives: [filled] },
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([[11, { colorOverride: { fill: 'rgb(10,20,30)' } }]]),
+			});
+
+			const fills = recorder.callsOf('fill');
+			nodeassert.strictEqual(fills.length, 2);
+			nodeassert.strictEqual(fills[0].properties.fillStyle, 'rgb(10,20,30)');
+			nodeassert.strictEqual(fills[1].properties.fillStyle, filled.color);
+		});
+
+		it('draws an animated paragraph apart from its object', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{
+					id: 11,
+					primitives: [
+						{
+							type: 'textHierarchyBlock',
+							children: [
+								paragraph('One'),
+								paragraph('Two'),
+								paragraph('Three'),
+							],
+						},
+					],
+				},
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([
+					[
+						11,
+						{
+							paragraphs: new Map([
+								[1, { alpha: 0.5, colorOverride: { text: 'rgb(10,20,30)' } }],
+							]),
+						},
+					],
+				]),
+			});
+
+			const texts = recorder.callsOf('fillText');
+			nodeassert.deepStrictEqual(
+				texts.map((call) => call.args[0]),
+				['One', 'Three', 'Two'],
+			);
+			nodeassert.strictEqual(texts[0].properties.fillStyle, '#112233');
+			nodeassert.strictEqual(texts[2].properties.fillStyle, 'rgb(10,20,30)');
+			nodeassert.strictEqual(texts[2].properties.globalAlpha, 0.5);
+		});
+
+		it('draws the text of an object in the font look its state gives', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{
+					id: 11,
+					primitives: [
+						{ type: 'textHierarchyBlock', children: [paragraph('One')] },
+					],
+				},
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([
+					[
+						11,
+						{
+							textOverride: {
+								family: 'Liberation Serif',
+								weight: 8,
+								italic: true,
+								underline: true,
+							},
+						},
+					],
+				]),
+			});
+
+			const texts = recorder.callsOf('fillText');
+			nodeassert.strictEqual(texts.length, 1);
+			nodeassert.strictEqual(
+				texts[0].properties.font,
+				'italic 700 20px "Liberation Serif"',
+			);
+			// The run has no underline of its own, so the line comes from the look.
+			nodeassert.strictEqual(recorder.callsOf('stroke').length, 1);
+		});
+
+		it('grows the text of an object about the middle of its paragraphs', function () {
+			const manager = new ImpressVectorManager();
+			const first = paragraph('One');
+			first.bounds = [0, 0, 100, 20];
+			const second = paragraph('Two');
+			second.bounds = [0, 20, 100, 40];
+			const data = cachedPart(manager, [
+				{
+					id: 11,
+					primitives: [
+						{ type: 'textHierarchyBlock', children: [first, second] },
+					],
+				},
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([[11, { textOverride: { sizeScale: 2 } }]]),
+			});
+
+			const firstText = recorder.calls.indexOf(recorder.callsOf('fillText')[0]);
+			const steps = recorder.calls
+				.slice(0, firstText)
+				.filter((call) => ['translate', 'scale'].includes(call.method))
+				.map((call) => [call.method, ...call.args]);
+			nodeassert.deepStrictEqual(steps, [
+				['translate', 50, 20],
+				['scale', 2, 2],
+				['translate', -50, -20],
+			]);
+		});
+
+		it('draws only the part of an object its clip names', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [{ id: 11, primitives: [filled] }]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([
+					[
+						11,
+						{
+							clip: {
+								transform: [400, 0, 0, 200, 100, 50],
+								frame: [0, 0, 1, 1],
+								pieces: [{ rectangle: [0, 0, 0.5, 1] }],
+							},
+						},
+					],
+				]),
+			});
+
+			// The frame, then the pieces, both laid down in the clip's own
+			// coordinates, before the object draws.
+			const clips = recorder.callsOf('clip');
+			nodeassert.strictEqual(clips.length, 2);
+			nodeassert.deepStrictEqual(clips[1].args[0].calls, [
+				{ method: 'rect', args: [0, 0, 0.5, 1] },
+			]);
+			nodeassert.strictEqual(clips[1].args[1], 'nonzero');
+			nodeassert.deepStrictEqual(
+				recorder.findCall('transform')?.args,
+				[400, 0, 0, 200, 100, 50],
+			);
+			nodeassert.ok(
+				recorder.calls.indexOf(clips[1]) <
+					recorder.calls.indexOf(recorder.findCall('fill')!),
+			);
+
+			// The fill draws in the object's own coordinates again.
+			nodeassert.deepStrictEqual(recorder.findCall('setTransform')?.args, [
+				{ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+			]);
+		});
+
+		it('draws the frame without the pieces of an inverted clip', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [{ id: 11, primitives: [filled] }]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([
+					[
+						11,
+						{
+							clip: {
+								transform: [1, 0, 0, 1, 0, 0],
+								frame: [0, 0, 1, 1],
+								pieces: [{ ellipse: [0.5, 0.5, 0.2, 0.2] }],
+								inverted: true,
+							},
+						},
+					],
+				]),
+			});
+
+			const area = recorder.callsOf('clip')[1];
+			nodeassert.strictEqual(area.args[1], 'evenodd');
+			nodeassert.deepStrictEqual(
+				area.args[0].calls.map((call: any) => call.method),
+				['rect', 'moveTo', 'ellipse', 'closePath'],
+			);
+		});
+
+		it('leaves out a hidden paragraph and keeps the rest', function () {
+			const manager = new ImpressVectorManager();
+			const data = cachedPart(manager, [
+				{
+					id: 11,
+					primitives: [
+						{
+							type: 'textHierarchyBlock',
+							children: [paragraph('One'), paragraph('Two')],
+						},
+					],
+				},
+			]);
+
+			const recorder = new CanvasRecorder();
+			manager.renderInto(recorder as any, data, {
+				states: new Map([
+					[11, { paragraphs: new Map([[0, { hidden: true }]]) }],
+				]),
+			});
+
+			nodeassert.deepStrictEqual(
+				recorder.callsOf('fillText').map((call) => call.args[0]),
+				['Two'],
+			);
+		});
+	});
+
+	describe('predicted text edits on a text document page', function () {
+		// The page '7' lies at (284, 284) in the document. Its text frame 96 lies at
+		// (1000, 2000) on the page, and the frame's one line has its baseline 300 below the
+		// frame's top left, which the primitives of the frame are relative to.
+		const page = {
+			id: 0,
+			kind: 'page',
+			width: 12240,
+			height: 15840,
+			primitives: [],
+		};
+		function frame(text: string): any {
+			return {
+				id: 96,
+				kind: 'textframe',
+				x: 1000,
+				y: 2000,
+				width: 5000,
+				height: 400,
+				primitives: [
+					{
+						type: 'textSimplePortion',
+						text,
+						textPosition: 0,
+						textLength: text.length,
+						matrix: [1, 0, 0, 1, 0, 300],
+						fontSize: 360,
+						familyname: 'Arial',
+						paragraph: 0,
+						lineAscent: 288,
+						lineHeight: 400,
+						textAreaWidth: 5000,
+						align: 'left',
+					},
+				],
+			};
+		}
+
+		function textOf(manager: WriterVectorManager): string {
+			const data: any = manager.requestTextPage('7');
+			return data.objects.get(96).primitives[0].text;
+		}
+
+		let savedMap: any;
+		let savedSelections: any;
+		let savedCursor: any;
+		let savedSequence: number;
+		let savedWriter: any;
+		let savedHitContext: any;
+		beforeEach(function () {
+			const anyApp = app as any;
+			// A click finds the text frame under it by the extent of its text.
+			savedHitContext = (cool.VectorHitTest as any)._context;
+			(cool.VectorHitTest as any)._context = new HitTestContext();
+			savedMap = anyApp.map;
+			savedSelections = (window as any).TextSelections;
+			savedCursor = app.file.textCursor;
+			savedSequence = app.file.inputSequence;
+			savedWriter = app.file.writer;
+			anyApp.map = { _docLayer: { _onUpdateCursor: function () {} } };
+			(window as any).TextSelections = { isActive: () => false };
+			app.file.writer = {
+				pageRectangleList: [[284, 284, 12240, 15840]],
+				pageIds: ['7'],
+			};
+			// The caret is at the end of "Hello" in frame 96.
+			app.file.textCursor = {
+				visible: true,
+				rectangle: new cool.SimpleRectangle(1784, 2296, 0, 400),
+				logical: { paragraph: 0, index: 5 },
+				object: 96,
+			};
+			app.file.inputSequence = 10;
+			LocalCaret.forget();
+		});
+		afterEach(function () {
+			(app as any).map = savedMap;
+			(window as any).TextSelections = savedSelections;
+			app.file.textCursor = savedCursor;
+			app.file.inputSequence = savedSequence;
+			app.file.writer = savedWriter;
+			(cool.VectorHitTest as any)._context = savedHitContext;
+			LocalCaret.forget();
+			cool.InputSequence.forget();
+		});
+
+		function managerWith(text: string): WriterVectorManager {
+			const manager = new WriterTestManager();
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 1,
+				objects: [page, frame(text)],
+			});
+			return manager;
+		}
+
+		// Sends the edit predicted last, numbered as the next input.
+		function sendTheEdit(): void {
+			cool.InputSequence.stamp('textinput');
+		}
+
+		it('types into the text frame the caret names and puts the caret in document twips', function () {
+			const manager = managerWith('Hello');
+
+			nodeassert.strictEqual(manager.predictTextInsert('!'), true);
+
+			nodeassert.strictEqual(textOf(manager), 'Hello!');
+			// The caret is at the page offset plus the frame offset plus six characters of 100 twips.
+			nodeassert.strictEqual(
+				app.file.textCursor.rectangle?.x1,
+				284 + 1000 + 600,
+			);
+			nodeassert.strictEqual(
+				app.file.textCursor.rectangle?.y1,
+				284 + 2000 + 300 - 288,
+			);
+		});
+
+		it('deletes the character before the caret in the text frame', function () {
+			const manager = managerWith('Hello');
+
+			nodeassert.strictEqual(manager.predictTextDelete(1, 0), true);
+
+			nodeassert.strictEqual(textOf(manager), 'Hell');
+			nodeassert.strictEqual(
+				app.file.textCursor.rectangle?.x1,
+				284 + 1000 + 400,
+			);
+		});
+
+		it('leaves the text alone when no cached page holds the frame of the caret', function () {
+			const manager = managerWith('Hello');
+			app.file.textCursor.object = 97;
+
+			nodeassert.strictEqual(manager.predictTextInsert('!'), false);
+
+			nodeassert.strictEqual(textOf(manager), 'Hello');
+		});
+
+		it('leaves typing that wraps the paragraph to another line to the server', function () {
+			const manager = new WriterTestManager();
+			const narrow = frame('Hello world');
+			// The line holds eleven characters of 100 twips, so the frames below it stay where
+			// they are only while the paragraph keeps its one line.
+			narrow.primitives[0].textAreaWidth = 1100;
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 1,
+				objects: [page, narrow],
+			});
+
+			nodeassert.strictEqual(manager.predictTextInsert('!'), false);
+
+			nodeassert.strictEqual(textOf(manager), 'Hello world');
+		});
+
+		it('leaves the text of a drawing object to the server', function () {
+			const manager = new WriterTestManager();
+			// A drawing object's entry id lies above the frame ids.
+			const shapeId = 4294967296 + 96;
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 1,
+				objects: [
+					page,
+					frame('Hello'),
+					{ ...frame('Hello'), id: shapeId, kind: 'shape' },
+				],
+			});
+			app.file.textCursor.object = shapeId;
+
+			nodeassert.strictEqual(manager.predictTextInsert('!'), false);
+
+			nodeassert.strictEqual(textOf(manager), 'Hello');
+		});
+
+		// The text frame 96 with its paragraph as three portions. The first one carries the
+		// string and its number, and the other two name that number. The last one lies inside
+		// a group.
+		function frameWithSharedText(text: string): any {
+			const entry = frame(text);
+			const first = entry.primitives[0];
+			const third = text.length / 3;
+			entry.primitives = [
+				{ ...first, textId: 0, textLength: third },
+				{
+					...first,
+					text: undefined,
+					textRef: 0,
+					textPosition: third,
+					textLength: third,
+					weight: 7,
+				},
+				{
+					type: 'group',
+					children: [
+						{
+							...first,
+							text: undefined,
+							textRef: 0,
+							textPosition: 2 * third,
+							textLength: third,
+						},
+					],
+				},
+			];
+			return entry;
+		}
+
+		// The portions of the text frame 96, in the order they are drawn.
+		function portionsOf(manager: WriterVectorManager): any[] {
+			const data: any = manager.requestTextPage('7');
+			const primitives = data.objects.get(96).primitives;
+			return [primitives[0], primitives[1], primitives[2].children[0]];
+		}
+
+		it('gives every portion of a paragraph the string the page carries once', function () {
+			const manager = new WriterTestManager();
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 1,
+				objects: [page, frameWithSharedText('plain bold text')],
+			});
+
+			const portions = portionsOf(manager);
+			for (const portion of portions)
+				nodeassert.strictEqual(portion.text, 'plain bold text');
+			// Each portion keeps its own range of the string.
+			nodeassert.deepStrictEqual(
+				portions.map((portion) => portion.textPosition),
+				[0, 5, 10],
+			);
+		});
+
+		it('gives a portion its string when the portion that carries it comes later', function () {
+			const manager = new WriterTestManager();
+			const entry = frameWithSharedText('plain bold text');
+			entry.primitives.reverse();
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 1,
+				objects: [page, entry],
+			});
+
+			const data: any = manager.requestTextPage('7');
+			const primitives = data.objects.get(96).primitives;
+			nodeassert.strictEqual(primitives[0].children[0].text, 'plain bold text');
+			nodeassert.strictEqual(primitives[1].text, 'plain bold text');
+		});
+
+		it('gives the portions of an entry in a delta the string the entry carries once', function () {
+			const manager = managerWith('Hello');
+
+			manager.handleVectorPrimitivesDelta({
+				partId: '7',
+				version: 2,
+				objects: [frameWithSharedText('plain bold text')],
+			});
+
+			for (const portion of portionsOf(manager))
+				nodeassert.strictEqual(portion.text, 'plain bold text');
+		});
+
+		it('keeps the filled strings of an entry that a delta only moves', function () {
+			const manager = new WriterTestManager();
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 1,
+				objects: [page, frameWithSharedText('plain bold text')],
+			});
+
+			// An entry that only moved comes with its box and without primitives.
+			const moved = frame('');
+			delete moved.primitives;
+			moved.y = 2400;
+			manager.handleVectorPrimitivesDelta({
+				partId: '7',
+				version: 2,
+				objects: [moved],
+			});
+
+			for (const portion of portionsOf(manager))
+				nodeassert.strictEqual(portion.text, 'plain bold text');
+		});
+
+		it('keeps a typed character over a delta from before it, once', function () {
+			const manager = managerWith('Hello');
+			manager.predictTextInsert('!');
+			sendTheEdit();
+
+			// The delta answers input 10, so the character typed as input 11 is drawn again.
+			manager.handleVectorPrimitivesDelta({
+				partId: '7',
+				version: 2,
+				inputSequence: 10,
+				objects: [frame('Hello')],
+			});
+			nodeassert.strictEqual(textOf(manager), 'Hello!');
+
+			// This delta holds it, and it is not drawn twice.
+			manager.handleVectorPrimitivesDelta({
+				partId: '7',
+				version: 3,
+				inputSequence: 11,
+				objects: [frame('Hello!')],
+			});
+			nodeassert.strictEqual(textOf(manager), 'Hello!');
+		});
+
+		it('takes typed text out once the delta that answers it leaves its text frame unchanged', function () {
+			const manager = managerWith('Hello');
+			manager.predictTextInsert('!');
+			sendTheEdit();
+
+			// The delta answers input 11 and only moves the frame, as the engine did not take
+			// the text, so the page is asked for whole.
+			const sent = SocketRecorder.during(() => {
+				manager.handleVectorPrimitivesDelta({
+					partId: '7',
+					version: 2,
+					inputSequence: 11,
+					objects: [{ ...frame('Hello'), y: 2400, primitives: undefined }],
+				});
+			});
+			nodeassert.deepStrictEqual(
+				sent.map((message) => message.split('&')[0]),
+				['commandvalues command=.uno:VectorPrimitives?partid=7'],
+			);
+
+			// The whole page shows the text as the engine has it.
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 3,
+				objects: [page, frame('Hello')],
+			});
+			nodeassert.strictEqual(textOf(manager), 'Hello');
+		});
+
+		// A manager that asked the server for the page '7' and holds the answer.
+		function managerThatAsked(text: string): WriterVectorManager {
+			const manager = new WriterTestManager();
+			manager.requestTextPage('7');
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 1,
+				objects: [page, frame(text)],
+			});
+			return manager;
+		}
+
+		const forgetPage7 = 'commandvalues command=.uno:VectorForgetPart?partid=7';
+
+		// The ids of the pages that the messages ask for, in the order they were sent.
+		function pagesAskedFor(sent: string[]): (string | undefined)[] {
+			return sent
+				.filter((message) => message.indexOf('.uno:VectorPrimitives?') >= 0)
+				.map((message) => message.match(/partid=(\d+)/)?.[1]);
+		}
+
+		it('forgets a cached page that left the page list and types nothing on it', function () {
+			const manager = managerThatAsked('Hello');
+			app.file.writer = {
+				pageRectangleList: [[284, 284, 12240, 15840]],
+				pageIds: ['8'],
+			};
+
+			const sent = SocketRecorder.during(() => manager.partListChanged());
+
+			nodeassert.deepStrictEqual(sent, [forgetPage7]);
+			nodeassert.strictEqual(manager.predictTextInsert('!'), false);
+		});
+
+		it('tells the server nothing about a dropped page it was never asked for', function () {
+			const manager = managerWith('Hello');
+			app.file.writer = {
+				pageRectangleList: [[284, 284, 12240, 15840]],
+				pageIds: ['8'],
+			};
+
+			const sent = SocketRecorder.during(() => manager.partListChanged());
+
+			nodeassert.deepStrictEqual(sent, []);
+		});
+
+		it('tells the server once to forget each page when every page is dropped', function () {
+			const drops: ((manager: WriterVectorManager) => void)[] = [
+				(manager) => manager.clearAllParts(),
+				(manager) => manager.reclaimGraphicsMemory(),
+				(manager) => manager.discardAllCache(),
+			];
+			for (const drop of drops) {
+				const manager = managerThatAsked('Hello');
+
+				const sent = SocketRecorder.during(() => {
+					drop(manager);
+					drop(manager);
+				});
+
+				nodeassert.deepStrictEqual(sent, [forgetPage7]);
+			}
+		});
+
+		it('tells the server to forget a page that a delta dropped before it asks for the page again', function () {
+			const manager = managerThatAsked('Hello');
+
+			// The delta starts above the version held, so the page is dropped.
+			const sent = SocketRecorder.during(() => {
+				manager.handleVectorPrimitivesDelta({
+					partId: '7',
+					from: 5,
+					version: 6,
+					objects: [],
+				});
+				manager.requestTextPage('7');
+			});
+
+			nodeassert.deepStrictEqual(
+				sent.map((message) => message.split('&')[0]),
+				[forgetPage7, 'commandvalues command=.uno:VectorPrimitives?partid=7'],
+			);
+		});
+
+		it('leaves out the answer to a request that was out when its page was dropped', function () {
+			const manager = managerThatAsked('Hello');
+			(app as any).map.fire = function () {};
+			// The page asks what changed, and leaves the page list before the answer comes.
+			manager.revalidateCachedParts();
+			manager.requestTextPage('7');
+			app.file.writer = {
+				pageRectangleList: [[284, 284, 12240, 15840]],
+				pageIds: ['8'],
+			};
+			const sent = SocketRecorder.during(() => manager.partListChanged());
+			nodeassert.deepStrictEqual(sent, [forgetPage7]);
+
+			manager.handleVectorPrimitivesResponse({
+				partId: '7',
+				coordinates: 'entry',
+				version: 2,
+				objects: [page, frame('Hello')],
+			});
+
+			// The server pushes no changes of the page, so the page is asked for again once
+			// it is back in the page list.
+			app.file.writer = {
+				pageRectangleList: [[284, 284, 12240, 15840]],
+				pageIds: ['7'],
+			};
+			const askedAgain = SocketRecorder.during(() => {
+				nodeassert.strictEqual(manager.requestTextPage('7'), undefined);
+			});
+			nodeassert.deepStrictEqual(pagesAskedFor(askedAgain), ['7']);
+		});
+
+		it('asks for the pages around the view a few at a time', function () {
+			const manager = new WriterTestManager();
+			const around = ['11', '12', '13'];
+			manager.keepTextPages(new Set(around));
+
+			const first = SocketRecorder.during(() => {
+				for (const pageId of around) manager.requestTextPageAhead(pageId);
+				// A page that waits for an earlier request to be answered is not asked for twice.
+				for (const pageId of around) manager.requestTextPageAhead(pageId);
+			});
+			nodeassert.deepStrictEqual(pagesAskedFor(first), ['11', '12']);
+
+			// An answer lets the next page ask.
+			const next = SocketRecorder.during(() =>
+				manager.handleVectorPrimitivesResponse({
+					partId: '11',
+					coordinates: 'entry',
+					version: 1,
+					objects: [page, frame('Hello')],
+				}),
+			);
+			nodeassert.deepStrictEqual(pagesAskedFor(next), ['13']);
+		});
+
+		it('asks at once for a page that comes into view while it waits its turn', function () {
+			const manager = new WriterTestManager();
+			const around = ['11', '12', '13'];
+			manager.keepTextPages(new Set(around));
+
+			const sent = SocketRecorder.during(() => {
+				for (const pageId of around) manager.requestTextPageAhead(pageId);
+				manager.requestTextPage('13');
+			});
+
+			nodeassert.deepStrictEqual(pagesAskedFor(sent), ['11', '12', '13']);
+		});
+
+		it('asks nothing for a waiting page that is wanted no more when its turn comes', function () {
+			const manager = new WriterTestManager();
+			const around = ['11', '12', '13'];
+			manager.keepTextPages(new Set(around));
+			SocketRecorder.during(() => {
+				for (const pageId of around) manager.requestTextPageAhead(pageId);
+			});
+
+			// The view moved, and the page '13' is not among the wanted pages now.
+			manager.keepTextPages(new Set(['11', '12']));
+			const next = SocketRecorder.during(() =>
+				manager.handleVectorPrimitivesResponse({
+					partId: '11',
+					coordinates: 'entry',
+					version: 1,
+					objects: [page, frame('Hello')],
+				}),
+			);
+
+			nodeassert.deepStrictEqual(pagesAskedFor(next), []);
+		});
+
+		describe('caret moved here', function () {
+			let recorder: SocketRecorder;
+			let sent: string[];
+			let savedTimerRegistry: any;
+			// The selection rectangles drawn here, as [x, y, width, height], one entry
+			// per draw.
+			let drawn: number[][][];
+			let savedSetStartRectangle: any;
+			let savedSetEndRectangle: any;
+			beforeEach(function () {
+				recorder = new SocketRecorder();
+				sent = recorder.sent;
+				savedTimerRegistry = (app as any).timerRegistry;
+				(app as any).timerRegistry = new TimerRegistry();
+				drawn = [];
+				(TextSelections as any).active = false;
+				(app as any).map._docLayer.showTextSelection = (
+					rectangles: number[][],
+				) => drawn.push(rectangles);
+				savedSetStartRectangle = TextSelections.setStartRectangle;
+				savedSetEndRectangle = TextSelections.setEndRectangle;
+				TextSelections.setStartRectangle = () => {};
+				TextSelections.setEndRectangle = () => {};
+			});
+			afterEach(function () {
+				LocalCaret.forget();
+				recorder.restore();
+				(app as any).timerRegistry = savedTimerRegistry;
+				(TextSelections as any).active = false;
+				TextSelections.setStartRectangle = savedSetStartRectangle;
+				TextSelections.setEndRectangle = savedSetEndRectangle;
+			});
+
+			it('moves the caret a character left in the text frame and draws it on the page', function () {
+				const manager = managerWith('Hello');
+
+				nodeassert.ok(manager.moveCaretByCharacter(-1));
+
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 4,
+				});
+				nodeassert.strictEqual(
+					app.file.textCursor.rectangle?.x1,
+					284 + 1000 + 400,
+				);
+				nodeassert.deepStrictEqual(sent, []);
+			});
+
+			it('selects with Shift and draws the selection on the page', function () {
+				const manager = managerWith('Hello');
+
+				manager.moveCaretByCharacter(-1, true);
+				manager.moveCaretByCharacter(-1, true);
+
+				const last = drawn[drawn.length - 1];
+				nodeassert.strictEqual(last.length, 1);
+				nodeassert.strictEqual(last[0][0], 284 + 1000 + 300);
+				nodeassert.strictEqual(last[0][2], 200);
+				nodeassert.deepStrictEqual(app.file.textCursor.anchor, {
+					paragraph: 0,
+					index: 5,
+				});
+			});
+
+			it('tells the server the text frame and the index of the caret', function () {
+				const manager = managerWith('Hello');
+				manager.moveCaretByCharacter(-1);
+
+				LocalCaret.tell();
+
+				nodeassert.deepStrictEqual(sent, [
+					'textcursor object=96 paragraph=0 index=4 sequence=11',
+				]);
+			});
+
+			it('puts the caret in the text frame under a click', function () {
+				const manager = managerWith('Hello');
+				const x = 284 + 1000 + 280;
+				const y = 284 + 2000 + 200;
+
+				nodeassert.strictEqual(manager.textFrameAt(x, y), 96);
+				nodeassert.ok(manager.placeCaretAt(x, y, manager.textFrameAt(x, y)));
+
+				nodeassert.deepStrictEqual(app.file.textCursor.logical, {
+					paragraph: 0,
+					index: 3,
+				});
+				nodeassert.strictEqual(app.file.textCursor.object, 96);
+			});
+
+			it('finds no text frame off the frames of a page', function () {
+				const manager = managerWith('Hello');
+
+				nodeassert.strictEqual(
+					manager.textFrameAt(284 + 100, 284 + 100),
+					undefined,
+				);
+			});
+
+			it('finds no text frame where a picture lies over the text', function () {
+				const manager = new WriterTestManager();
+				const picture = {
+					id: 98,
+					kind: 'notextframe',
+					parent: 96,
+					x: 1200,
+					y: 2000,
+					width: 400,
+					height: 400,
+					primitives: [],
+				};
+				manager.handleVectorPrimitivesResponse({
+					partId: '7',
+					coordinates: 'entry',
+					version: 1,
+					objects: [page, frame('Hello'), picture],
+				});
+
+				nodeassert.strictEqual(
+					manager.textFrameAt(284 + 1300, 284 + 2200),
+					undefined,
+				);
+				nodeassert.strictEqual(manager.textFrameAt(284 + 1050, 284 + 2200), 96);
+			});
+
+			it('lets a drag go to the server once it leaves the text frame it started in', function () {
+				const manager = managerWith('Hello');
+				const x = 284 + 1000 + 280;
+				const y = 284 + 2000 + 200;
+
+				nodeassert.ok(manager.startTextDrag(x, y, manager.textFrameAt(x, y)));
+
+				nodeassert.strictEqual(
+					manager.textDragLeavesItsText(x + 100, y),
+					false,
+				);
+				nodeassert.strictEqual(
+					manager.textDragLeavesItsText(284 + 100, 284 + 100),
+					true,
+				);
+			});
+
+			it('leaves a triple click to the server, which selects a sentence', function () {
+				const manager = managerWith('Hello');
+				const x = 284 + 1000 + 280;
+				const y = 284 + 2000 + 200;
+
+				nodeassert.strictEqual(
+					manager.selectParagraphAt(x, y, manager.textFrameAt(x, y)),
+					false,
+				);
+			});
+		});
+	});
+});

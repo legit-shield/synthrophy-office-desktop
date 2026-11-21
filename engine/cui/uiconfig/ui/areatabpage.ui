@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Generated with glade 3.40.0 -->
+<interface domain="cui">
+  <requires lib="gtk+" version="3.24"/>
+  <object class="GtkBox" id="AreaTabPage">
+    <property name="visible">True</property>
+    <property name="can-focus">False</property>
+    <property name="hexpand">True</property>
+    <property name="vexpand">True</property>
+    <property name="border-width">6</property>
+    <property name="spacing">6</property>
+    <child>
+      <object class="GtkBox" id="box1">
+        <property name="visible">True</property>
+        <property name="can-focus">False</property>
+        <property name="hexpand">True</property>
+        <property name="vexpand">True</property>
+        <property name="orientation">vertical</property>
+        <property name="spacing">3</property>
+        <child>
+          <object class="GtkBox" id="tablebox">
+            <property name="visible">True</property>
+            <property name="can-focus">False</property>
+            <property name="halign">center</property>
+            <property name="margin-top">3</property>
+            <property name="hexpand">True</property>
+            <property name="spacing">12</property>
+            <child>
+              <object class="GtkComboBoxText" id="tablelb">
+                <property name="can-focus">False</property>
+                <property name="active">0</property>
+                <items>
+                  <item id="cellid" translatable="yes" context="areatabpage|tablelb">Cell</item>
+                  <item id="rowid" translatable="yes" context="areatabpage|tablelb">Row</item>
+                  <item id="tableid" translatable="yes" context="areatabpage|tablelb">Table</item>
+                </items>
+                <child internal-child="accessible">
+                  <object class="AtkObject" id="tablelb-atkobject">
+                    <property name="AtkObject::accessible-name" translatable="yes" context="areatabpage|tablelb-atkobject">Apply to</property>
+                    <property name="AtkObject::accessible-description" translatable="yes" context="areatabpage|extended_tip|tablelb">Set the fill options for the selected drawing object or document element.</property>
+                  </object>
+                </child>
+              </object>
+              <packing>
+                <property name="expand">True</property>
+                <property name="fill">True</property>
+                <property name="position">0</property>
+              </packing>
+            </child>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="position">0</property>
+          </packing>
+        </child>
+        <child>
+          <object class="GtkNotebook" id="nbFillType">
+            <property name="visible">True</property>
+            <property name="can-focus">True</property>
+            <property name="hexpand">True</property>
+            <property name="vexpand">True</property>
+            <property name="show-border">False</property>
+
+            <!-- Color Tab -->
+            <child>
+              <object class="GtkGrid" id="gdColor">
+                <property name="visible">True</property>
+                <property name="can-focus">False</property>
+                <property name="margin-start">6</property>
+                <property name="margin-end">6</property>
+                <property name="margin-top">6</property>
+                <property name="margin-bottom">6</property>
+                <property name="vexpand">True</property>
+                <property name="row-spacing">6</property>
+                <property name="column-spacing">6</property>
+                <child>
+                  <placeholder/>
+                </child>
+              </object>
+            </child>
+            <child type="tab">
+              <object class="GtkLabel" id="lbcolor">
+                <property name="visible">True</property>
+                <property name="can-focus">False</property>
+                <property name="label" translatable="yes" context="areatabpage|btncolor">Color</property>
+              </object>
+            </child>
+
+            <!-- Use Background Tab -->
+            <child>
+              <object class="GtkGrid" id="gdUseBackground">
+                <property name="visible">True</property>
+                <property name="can-focus">False</property>
+                <property name="margin-start">6</property>
+                <property name="margin-end">6</property>
+                <property name="margin-top">6</property>
+                <property name="margin-bottom">6</property>
+                <property name="vexpand">True</property>
+                <property name="row-spacing">6</property>
+                <property name="column-spacing">6</property>
+                <child>
+                  <placeholder/>
+                </child>
+              </object>
+            </child>
+            <child type="tab">
+              <object class="GtkLabel" id="lbusebackground">
+                <property name="visible">True</property>
+                <property name="can-focus">False</property>
+                <property name="label" translatable="yes" context="areatabpage|btnusebackground">Use Background</property>
+              </object>
+            </child>
+          </object>
+          <packing>
+            <property name="expand">True</property>
+            <property name="fill">True</property>
+            <property name="position">1</property>
+          </packing>
+        </child>
+      </object>
+      <packing>
+        <property name="expand">False</property>
+        <property name="fill">True</property>
+        <property name="position">1</property>
+      </packing>
+    </child>
+    <child internal-child="accessible">
+      <object class="AtkObject" id="AreaTabPage-atkobject">
+        <property name="AtkObject::accessible-description" translatable="yes" context="areatabpage|extended_tip|AreaTabPage">Set the fill options for the selected drawing object or document element.</property>
+      </object>
+    </child>
+  </object>
+</interface>

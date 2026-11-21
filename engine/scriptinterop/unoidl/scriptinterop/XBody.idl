@@ -1,0 +1,99 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** The main body of a text document, which holds its paragraphs and tables.
+
+    @gas Body
+ */
+interface XBody: XContainerElement {
+    /** Appends a new paragraph at the end of the body holding the given image.
+
+        The image keeps its natural size.
+
+        @throws RuntimeException
+            if blob is null or its bytes cannot be read as an image.
+
+        @gas Body.appendImage
+     */
+    XInlineImage appendImage([in] XBlob blob);
+
+    /** Appends a new numbered list item at the end of the body.
+
+        The paragraph gets the "List Number" paragraph style, or plain arabic numbering if the
+        document has no such style. Its getType() is LIST_ITEM.
+
+        @gas Body.appendListItem
+     */
+    XParagraph appendListItem([in] string text);
+
+    /** Appends a new paragraph at the end of the body.
+
+        The new paragraph is neither a list item nor a heading, even when the paragraph before it
+        is one.
+
+        @gas Body.appendParagraph
+     */
+    XParagraph appendParagraph([in] string text);
+
+    /** Returns the paragraphs and tables of the body, in document order.
+
+        Sections are not listed, but the paragraphs inside them are. A table of contents is listed
+        as one element of type TABLE_OF_CONTENTS, and any other index as one element of type INDEX.
+     */
+    sequence<XElement> getChildren();
+
+    /** Returns the left margin of the page, in points.
+
+        This and the other page getters read the page style that the body starts with, as Apps
+        Script has one page size and one set of margins for the whole document.
+
+        @gas Body.getMarginLeft
+     */
+    double getMarginLeft();
+
+    /** Returns the top margin of the page, in points.
+
+        @gas Body.getMarginTop
+     */
+    double getMarginTop();
+
+    /** Returns the height of the page, in points.
+
+        @gas Body.getPageHeight
+     */
+    double getPageHeight();
+
+    /** Returns the width of the page, in points.
+
+        @gas Body.getPageWidth
+     */
+    double getPageWidth();
+
+    // The images anchored to pages, which GAS's Body does not offer:
+
+    /** Returns the images that are anchored to a page. */
+    sequence<XPositionedImage> getPositionedImages();
+
+    /** Removes the image with the given ID that is anchored to a page.
+
+        @returns
+            true
+        @throws RuntimeException
+            if no image with that ID is anchored to a page.
+     */
+    boolean removePositionedImage([in] string id);
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

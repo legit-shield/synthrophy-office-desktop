@@ -1,0 +1,777 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#pragma once
+
+#include <common/Common.hpp>
+#include <common/Session.hpp>
+#include <common/StateEnum.hpp>
+#include <common/ThreadPool.hpp>
+#include <common/Util.hpp>
+#include <kit/KitQueue.hpp>
+#include <kit/LogUI.hpp>
+#include <net/Socket.hpp>
+#include <wsd/TileDesc.hpp>
+
+#include <COKit/COKit.hxx>
+
+#include <Poco/Util/XMLConfiguration.h>
+
+#include <deque>
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+
+#if MOBILEAPP
+
+#include <future>
+
+#include <wsd/ClientSession.hpp>
+#include <wsd/DocumentBroker.hpp>
+
+#endif
+
+#ifdef IOS
+void runKitLoopInAThread();
+#endif
+
+struct COKit;
+
+#if MOBILEAPP
+/// Writes the engine's pending configuration changes to the user profile. The
+/// apps exit without destroying the engine, so they call this first.
+void flushKitConfiguration();
+#endif
+
+void lokit_main(
+#if !MOBILEAPP
+    const std::string& childRoot, const std::string& jailId, const std::string& configId,
+    const std::string& sysTemplate, const std::string& loTemplate, bool noCapabilities,
+    bool requireLandlock, bool noSeccomp, bool useMountNamespaces, bool queryVersionInfo,
+    bool displayVersion, bool sysTemplateIncomplete, int forKitPid,
+#else
+    int docBrokerSocket, const std::string& userInterface,
+#endif
+    std::size_t numericIdentifier);
+
+std::string getJailRoot();
+
+bool globalPreinit(const std::string& loTemplate);
+/// Wrapper around private Document::ViewCallback().
+void documentViewCallback(COKitCallbackType eType, const char* p, void* data);
+
+class Document;
+class DeltaGenerator;
+
+/// Descriptor class used to link a COKit
+/// callback to a specific view.
+struct CallbackDescriptor
+{
+    CallbackDescriptor(Document* const doc, const int viewId)
+        : _doc(doc), _viewId(viewId)
+    {
+    }
+    Document* getDoc() const { return _doc; }
+    int getViewId() const { return _viewId; }
+
+private:
+    Document* const _doc;
+    const int _viewId;
+};
+
+/// User Info container used to store user information
+/// till the end of process lifecycle - including
+/// after any child session goes away
+struct UserInfo
+{
+    UserInfo()
+        : _readOnly(false)
+        , _remoteLink(false)
+        , _connected(false)
+        , _parked(false)
+    {
+    }
+
+    UserInfo(const std::string& userId, const std::string& userName,
+             const std::string& userExtraInfo, const std::string& userPrivateInfo, bool readOnly,
+             bool remoteLink)
+        : _userId(userId)
+        , _userName(userName)
+        , _userExtraInfo(userExtraInfo)
+        , _userPrivateInfo(userPrivateInfo)
+        , _readOnly(readOnly)
+        , _remoteLink(remoteLink)
+        , _connected(true)
+        , _parked(false)
+    {
+    }
+
+    const std::string& getUserId() const { return _userId; }
+
+    const std::string& getUserName() const { return _userName; }
+
+    const std::string& getUserExtraInfo() const { return _userExtraInfo; }
+
+    const std::string& getUserPrivateInfo() const { return _userPrivateInfo; }
+
+    bool isReadOnly() const { return _readOnly; }
+
+    void setReadOnly(bool readOnly) { _readOnly = readOnly; }
+
+    bool isRemoteLink() const { return _remoteLink; }
+
+    bool isConnected() const { return _connected; }
+
+    void setDisconnected() { _connected = false; }
+
+    bool isParked() const { return _parked; }
+
+    void setParked(bool parked) { _parked = parked; }
+
+private:
+    std::string _userId;
+    std::string _userName;
+    std::string _userExtraInfo;
+    std::string _userPrivateInfo;
+    bool _readOnly;
+    /// True for the view of another document that reads this one to show and copy its slides.
+    bool _remoteLink;
+    bool _connected;
+    /// True while the view's browser is away but expected back.
+    bool _parked;
+};
+
+/// We have two types of password protected documents
+/// 1) Documents which require password to view
+/// 2) Document which require password to modify
+enum class DocumentPasswordType : std::uint8_t
+{
+    ToView,
+    ToModify
+};
+
+/// Check the ForkCounter, and if non-zero, fork more of them accordingly.
+void forkCOKit(const std::string& childRoot, const std::string& sysTemplate,
+                        const std::string& loTemplate, bool useMountNamespaces);
+
+class Document;
+
+/// The main main-loop of the Kit process
+class KitSocketPoll final : public SocketPoll
+{
+    std::chrono::steady_clock::time_point _pollEnd;
+    std::shared_ptr<Document> _document;
+
+    static KitSocketPoll* mainPoll;
+
+    KitSocketPoll();
+
+public:
+    ~KitSocketPoll();
+    void drainQueue();
+
+    static void dumpGlobalState(std::ostream& oss);
+    static std::shared_ptr<KitSocketPoll> create();
+
+    static void cleanupChildProcess();
+
+    void wakeupHook() override;
+
+    static KitSocketPoll* getMainPoll() { return mainPoll; }
+
+#if ENABLE_DEBUG
+    struct ReEntrancyGuard
+    {
+        std::atomic<int>& _count;
+        ReEntrancyGuard(std::atomic<int>& count)
+            : _count(count)
+        {
+            count++;
+        }
+        ~ReEntrancyGuard() { _count--; }
+    };
+#endif
+
+    /// Handle the poll from the unipoll callback.
+    int kitPoll(int timeoutMicroS);
+
+    /// Handle the wake up from the unipoll callback.
+    void kitWakeup();
+
+    /// Handle the 'has any input?' unipoll callback.
+    bool kitHasAnyInput(int mostUrgentPriority);
+
+    void setDocument(std::shared_ptr<Document> document) { _document = std::move(document); }
+    const std::shared_ptr<Document>& getDocument() const { return _document; }
+
+    // unusual COKit event from another thread, push into our loop to process.
+    static bool pushToMainThread(COKitCallback callback, COKitCallbackType type, const char* p,
+                                 void* data);
+
+#if DOCS_SHARE_PROCESS
+    static std::mutex KSPollsMutex;
+    static std::condition_variable KSPollsCV;
+    static std::vector<std::weak_ptr<KitSocketPoll>> KSPolls;
+
+    /// Every KitSocketPoll that has not yet started its destructor. A poll removes itself at the
+    /// start of its destructor, under KSLivePollsMutex, so each poll in the list is intact for as
+    /// long as a thread holds that mutex. The list holds no references.
+    static std::mutex KSLivePollsMutex;
+    static std::vector<KitSocketPoll*> KSLivePolls;
+
+    struct TerminationData
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool flag;
+    };
+    std::shared_ptr<TerminationData> termination;
+#endif
+};
+
+class ChildSession;
+
+/// What a forked child process was started to produce. Save writes the document back to
+/// its own file, so the parent takes the document to be unmodified while it runs. Export
+/// writes a separate copy elsewhere in the jail and leaves the document's state alone.
+enum class BackgroundForkPurpose : std::uint8_t
+{
+    Save,
+    Export
+};
+
+/// What the parent Kit does when an export that runs in a forked child ends. The parent calls
+/// one of the two, once, on its own main thread.
+struct BackgroundExportHandlers
+{
+    /// The child is done: success is true when it wrote the copy and false when it failed,
+    /// crashed or was stopped.
+    std::function<void(bool success)> finished;
+    /// The export put a question to the person, which only the parent can show, so the
+    /// parent runs the export itself.
+    std::function<void()> runInForeground;
+};
+
+/// A document container.
+/// Owns LOKitDocument instance and connections.
+/// Manages the lifetime of a document.
+/// Technically, we can host multiple documents
+/// per process. But for security reasons don't.
+/// However, we could have a coolkit instance
+/// per user or group of users (a trusted circle).
+class Document final : public std::enable_shared_from_this<Document>, private TilePrioritizer
+{
+public:
+    Document(const std::shared_ptr<COKit>& loKit, const std::string& jailId,
+             const std::string& docKey, const std::string& docId, const std::string& url,
+             const std::shared_ptr<WebSocketHandler>& websocketHandler, unsigned mobileAppDocId);
+    ~Document() final;
+
+    const std::string& getUrl() const { return _url; }
+
+    /// Post the message - in the unipoll world we're in the right thread anyway
+    bool postMessage(const std::string_view data, WSOpCode code) const;
+
+    bool createSession(const std::string& sessionId);
+
+    /// Purges dead connections and returns
+    /// the remaining number of clients.
+    /// Returns -1 on failure.
+    std::size_t purgeSessions();
+
+    void setDocumentPassword(COKitCallbackType passwordType);
+
+    void renderTiles(TileCombined& tileCombined);
+
+    bool sendTextFrame(const std::string_view message) const { return sendFrame(message); }
+
+    bool sendFrame(std::string_view data, WSOpCode opCode = WSOpCode::Text) const;
+
+    void alertNotAsync() const
+    {
+        // load unfortunately enables inputprocessing in some cases.
+        if (processInputEnabled() && !_duringLoad && !isBackgroundSaveProcess())
+            notifyAll("error: cmd=notasync kind=failure");
+    }
+
+    void alertAllUsers(const std::string& cmd, const std::string& kind) const
+    {
+        sendTextFrame("errortoall: cmd=" + cmd + " kind=" + kind);
+    }
+
+    /// Notify all views with the given message
+    bool notifyAll(const std::string& msg) const
+    {
+        // Broadcast updated viewinfo to all clients.
+        return sendTextFrame("client-all " + msg);
+    }
+
+    unsigned getMobileAppDocId() const { return _mobileAppDocId; }
+    const std::string& getDocId() const { return _docId; }
+
+    /// See if we should clear out our memory
+    void trimIfInactive();
+    void trimAfterInactivity();
+
+    // COKit callback entry points
+    static void GlobalCallback(COKitCallbackType eType, const char* p, void* data);
+    static void ViewCallback(COKitCallbackType eType, const char* p, void* data);
+
+private:
+    /// Point the process-wide COKit callback at this document.
+    void registerGlobalCallback();
+    /// Clear the process-wide COKit callback if it points at this document.
+    void unregisterGlobalCallback();
+
+    /// Helper method to broadcast callback and its payload to all clients
+    void broadcastCallbackToClients(const COKitCallbackType type, const std::string& payload)
+    {
+        _queue->putCallback(-1, type, payload);
+    }
+
+    /// Hands a vector primitives delta to every session that draws vector content, compressed
+    /// once for all of them.
+    void deliverVectorDelta(const std::string& payload);
+
+    /// Cleanup bgSave child processes.
+    static void reapZombieChildren();
+
+    /// Calculate tile rendering priority from a TileDesc
+    Priority getTilePriority(const TileDesc& desc) const override;
+    std::vector<ViewIdInactivity> getViewIdsByInactivity() const override;
+    CanonicalViewId resolveCanonicalViewId(CanonicalViewId id) const override;
+
+public:
+    /// Request loading a document, or a new view, if one exists,
+    /// and register callbacks.
+    bool onLoad(const std::string& sessionId, const std::string& uriAnonym);
+
+    /// Unload a client session, which unloads the document
+    /// if it is the last and only.
+    void onUnload(ChildSession& session);
+
+    /// Destroy the view kept alive with no session of its own, if there is one. The engine
+    /// then has no view left and disposes of the document. Answers whether a view went.
+    bool destroyKeptView();
+
+    /// Get a view ID <-> UserInfo map.
+    const std::map<int, UserInfo>& getViewInfo() const { return _sessionUserInfo; }
+
+    int getEditorId() const { return _editorId; }
+
+    bool isDocPasswordProtected() const { return _isDocPasswordProtected; }
+
+    bool haveDocPassword() const { return _haveDocPassword; }
+
+    const std::string& getDocPassword() const { return _docPassword; }
+
+    DocumentPasswordType getDocPasswordType() const { return _docPasswordType; }
+
+    /// Store a checked password to modify. It answers the next password-to-modify
+    /// request of the document, and is consumed by that answer.
+    void setDocPasswordToModify(const std::string& password);
+
+    /// Whether the loaded document carries a separate password required to modify it.
+    bool hasPasswordToModify() const { return _hasPasswordToModify; }
+
+    void updateActivityHeader() const;
+
+    /// Really important that if we drop, we re-start for the kit.
+    class ThreadDropper final {
+        Document *_doc;
+    public:
+        ThreadDropper() : _doc(nullptr) { }
+        ~ThreadDropper()
+        {
+            if (_doc) _doc->startThreads();
+        }
+        void clear()
+        {
+            _doc = nullptr;
+        }
+        bool dropThreads(Document *doc)
+        {
+            if (doc->joinThreads())
+            {
+                // only this path starts later.
+                _doc = doc;
+                return true;
+            }
+            return false;
+        }
+        void startThreads()
+        {
+            if (_doc)
+                _doc->startThreads();
+            _doc = nullptr;
+        }
+    };
+
+    bool joinThreads();
+    void startThreads();
+
+    /// exportHandlers is used for BackgroundForkPurpose::Export only.
+    bool forkToSave(const std::function<void()>& childSave, int viewId,
+                    BackgroundForkPurpose purpose,
+                    const BackgroundExportHandlers& exportHandlers = {});
+
+    void handleSaveMessage(const std::string &msg);
+
+    /// Release the document and close the socket to the parent, in a forked child.
+    void finishBackgroundForkProcess();
+
+    /// Notify all views of viewId and their associated usernames
+    void notifyViewInfo();
+
+    /// Record whether the view's browser is away but expected back, and tell every view.
+    void setViewParked(int viewId, bool parked);
+
+    /// Record whether the view is read-only, and tell every view.
+    void setViewReadOnly(int viewId, bool readOnly);
+
+    /// Tell the other views which part the given view switched to.
+    void notifyViewPart(int viewId, const std::string& partId);
+
+    std::shared_ptr<ChildSession> findSessionByViewId(int viewId);
+
+    /// Keeps the copy the server staged at path for the linked file with the given id, as the
+    /// file the engine reads, and removes the copy of that file it kept before.
+    void keepLinkedFileCopy(const std::string& id, const std::string& path);
+
+    /// Answers the file pick with the given request id, from the view that was asked. An empty
+    /// url means the user cancelled. An answer from any other view is ignored.
+    void completeFilePick(unsigned id, int viewId, const std::string& url);
+
+    /// Answers the link pick with the given request id, from the view that was asked, with the
+    /// path of the picked file relative to the document and the URL of its copy to read. Empty
+    /// strings mean the user cancelled, or that there is no copy. Returns whether the pick was
+    /// open and took the answer.
+    bool completeLinkPick(unsigned id, int viewId, const std::string& relativePath,
+                          const std::string& readUrl);
+
+    /// Lets the engine ask for a file to link to: the server gives the picked file from the
+    /// storage of the document.
+    void enableLinkPicks();
+
+    void invalidateCanonicalId(const std::string& sessionId);
+
+    /// Tells the session its canonical view id and view render state.
+    static void sendCanonicalIdChange(const std::shared_ptr<ChildSession>& session);
+
+    static std::string getViewProps(const std::shared_ptr<ChildSession>& session);
+
+    void updateEditorSpeeds(int id, int speed);
+
+private:
+    // Get the color value for all author names from the core
+    std::map<std::string, int> getViewColors();
+
+    static std::string getDefaultTheme(const std::shared_ptr<ChildSession>& session);
+
+    static std::string getDefaultBackgroundTheme(const std::shared_ptr<ChildSession>& session);
+
+    std::shared_ptr<COKitDocument> load(const std::shared_ptr<ChildSession>& session);
+
+    bool forwardToChild(std::string_view prefix, const std::vector<char>& payload);
+
+    static std::string makeRenderParams(const std::string& userName,
+                                        const std::string& spellOnline,
+                                        const std::string& formattingMarks, const std::string& theme,
+                                        const std::string& backgroundTheme,
+                                        const std::string& focusRingColor,
+                                        const std::string& userPrivateInfo);
+
+    /// Returns true iff at least one session is loaded.
+    bool haveLoadedSessions() const;
+
+public:
+    bool processInputEnabled() const;
+
+    /// A new message from wsd for the queue
+    void queueMessage(const std::string &msg) { _queue->put(msg); }
+    /// Do we have incoming messages from wsd ?
+    bool hasQueueItems() const { return _queue && !_queue->isEmpty(); }
+    bool canRenderTiles() const {
+        return processInputEnabled() && !isLoadOngoing() &&
+            !isBackgroundSaveProcess() && _queue &&
+            !_queue->isTileQueueEmpty();
+    }
+    bool hasCallbacks() const { return _queue && _queue->callbackSize() > 0; }
+
+    /// Should we get through the SocketPoll fast to process queues ?
+    bool needsQuickPoll() const
+    {
+        if (hasCallbacks())
+            return true;
+        // not processing input messages or tile renders
+        if (!processInputEnabled())
+            return false;
+        if (hasQueueItems() || canRenderTiles())
+            return true;
+        return false;
+    }
+
+    void drainQueue();
+    void drainCallbacks();
+
+    void dumpState(std::ostream& oss);
+
+    /// Returns true iff we have a LOKit Document instance.
+    bool isLoaded() const { return !!_loKitDocument; }
+
+    /// Return access to the engine instance.
+    std::shared_ptr<COKit> getLOKit() const { return _loKit; }
+
+    /// Return access to the engine document instance.
+    std::shared_ptr<COKitDocument> getLOKitDocument();
+
+    const std::string& getObfuscatedFileId() const { return _obfuscatedFileId; }
+
+    bool isBackgroundSaveProcess() const { return _isBgSaveProcess; }
+
+    static void shutdownBackgroundWatchdog();
+
+    /// Save is async, so we need to set 'unmodified' while we are saving
+    /// but this can transition back to modified if save fails.
+    STATE_ENUM(ModifiedState, Modified, UnModifiedButSaving, UnModified);
+
+    ModifiedState getModified() const { return _modified; }
+
+    /// Lets us get notified whether a doc is modified during bgsave.
+    void forceDocUnmodifiedForBgSave(int viewId);
+
+    /// Restore the Document's 'modified' state if necessary
+    void updateModifiedOnFailedBgSave();
+
+    /// Let WSD know our true modified state after bg save success.
+    void notifySyntheticUnmodifiedState();
+
+    /// Snoop document modified, and return true if filtering notification
+    bool trackDocModifiedState(const std::string &stateChanged);
+
+    /// Permanently disable background save for this process
+    void disableBgSave(const std::string &reason);
+
+    void bgSaveStarted() { _bgSavesOngoing++; }
+    void bgSaveEnded();
+
+    /// Writes the given pages of the document out for session and sends them to it, in a forked
+    /// child where one can be had. One slide export runs in a child at a time, and the others
+    /// wait for it in the order they came.
+    void queueSlideExport(const std::shared_ptr<ChildSession>& session, const std::string& pages);
+
+    /// Are we currently performing a load ?
+    bool isLoadOngoing() const { return _duringLoad > 0; }
+
+    /// The loaded, connected, non-closing sessions that can carry =PY() requests to coolwsd.
+    std::vector<std::shared_ptr<ChildSession>> findLivePythonComputeSessions() const;
+
+    LogUiCmd& getLogUiCmd() { return logUiCmd; }
+
+    /// Get a thread-pool to perform an operation in
+    /// all operations must complete by the time we
+    /// return to the poll
+#if MOBILEAPP
+    // One tile-compression pool shared by every document in the single
+    // process. The app exits via std::_Exit, so the dtor isn't called. Its
+    // worker threads are reclaimed by the OS rather than joined.
+    ThreadPool& getSyncPool()
+    {
+        static ThreadPool sharedPool;
+        return sharedPool;
+    }
+#else
+    ThreadPool& getSyncPool() { return _deltaPool; }
+#endif
+
+    int getViewsCount() const;
+
+    /// Whether any session of the document holds the vector part.
+    bool isVectorPartHeld(const std::string& partId) const;
+
+    /// Takes each of partIds that the session holds out of the parts it holds. The engine then
+    /// forgets each of them that no session of the document holds, through a command built from
+    /// the id, in the view of the session.
+    void releaseVectorParts(ChildSession& session, const std::set<std::string>& partIds);
+
+private:
+    void postForceModifiedCommand(bool modified);
+
+#if !defined(MACOSAPP) && !defined(QTAPP) && !defined(_WIN32) && !defined(IOS)
+    /// Sends a filepicker: request, with the title and the file type filters, to the browser
+    /// of the view that is current, and keeps the completion until that browser answers. With
+    /// no session for the view, completes the pick at once as cancelled.
+    static void pickFile(const char* title, const COKitFilePickerFilter* filters, size_t count,
+                         void (*picked)(void* context, const char* url), void* context);
+
+    /// Sends a linkpicker: request to the browser of the view that is current, which asks the
+    /// integrator for a file in the storage, and keeps the completion until the answer is there.
+    static void pickLinkTarget(const char* title, const COKitFilePickerFilter* filters,
+                               size_t count,
+                               void (*picked)(void* context, const char* linkUrl,
+                                              const char* readUrl),
+                               void* context);
+#endif
+
+    /// Answers every open file pick of the given view as cancelled.
+    void cancelFilePicks(int viewId);
+
+    /// Stops theads, flushes buffers, and exits the process.
+    void flushAndExit(int code);
+
+private:
+    std::shared_ptr<COKit> _loKit;
+    const std::string _jailId;
+    /// URL-based key. May be repeated during the lifetime of WSD.
+    const std::string _docKey;
+    /// Short numerical ID. Unique during the lifetime of WSD.
+    const std::string _docId;
+    const std::string _url;
+    const std::string _obfuscatedFileId;
+    std::string _jailedUrl;
+
+    std::shared_ptr<COKitDocument> _loKitDocument;
+    std::unique_ptr<KitQueue> _queue;
+
+    // Connection to the coolwsd process
+    std::shared_ptr<WebSocketHandler> _websocketHandler;
+
+    // Connection a child background save process has to its parent: a precious thing.
+    std::weak_ptr<WebSocketHandler> _saveProcessParent;
+    ModifiedState _modified;
+    bool _isBgSaveProcess;
+    bool _isBgSaveDisabled;
+    bool _trimIfInactivePostponed;
+
+    // Document password provided
+    std::string _docPassword;
+    // Whether password was provided or not
+    bool _haveDocPassword;
+    // Whether document is password protected
+    bool _isDocPasswordProtected;
+    // Whether password is required to view the document, or modify it
+    DocumentPasswordType _docPasswordType;
+
+    // Whether the loaded document carries a separate password required to modify it
+    bool _hasPasswordToModify;
+
+    // A checked password to modify, waiting to answer the document's next
+    // password-to-modify request
+    std::string _docPasswordToModify;
+    // Whether a password to modify is stored
+    bool _haveDocPasswordToModify;
+
+    /// The view kept alive after the session that owned it left, so the document keeps at
+    /// least one view. -1 when there is no such view, which is the usual state.
+    int _keptViewId;
+
+    /// One file pick the engine asked for and the browser has not answered yet: the completion
+    /// to call with the picked URL, and the view whose browser was asked.
+    struct PendingFilePick
+    {
+        void (*picked)(void* context, const char* url);
+        void* context;
+        int viewId;
+        /// The completion of a pick of a file to link to, instead of picked.
+        void (*pickedLink)(void* context, const char* linkUrl, const char* readUrl) = nullptr;
+    };
+
+    /// Open file picks by request id. The engine asks and the browser's answer arrives on the
+    /// one thread that drives the document, so the map needs no lock.
+    std::map<unsigned, PendingFilePick> _pendingFilePicks;
+    unsigned _nextFilePickId;
+
+    /// The copy the server staged of each linked file the engine reads, by the id of the file.
+    std::map<std::string, std::string> _linkedFileCopies;
+
+    std::atomic<bool> _stop;
+
+#if !MOBILEAPP
+    // Per-document pool for the multi-process build; the single process shares one.
+    ThreadPool _deltaPool;
+#endif
+    std::unique_ptr<DeltaGenerator> _deltaGen;
+
+    int _editorId;
+    bool _editorChangeWarning;
+    std::map<int, std::unique_ptr<CallbackDescriptor>> _viewIdToCallbackDescr;
+    SessionMap<ChildSession> _sessions;
+
+    /// Canonical view ids a session has left, mapped onto the one it holds now.
+    /// WSD keeps stamping tile requests with the old id until it is told of the
+    /// change, so those requests arrive here needing translation.
+    std::map<CanonicalViewId, CanonicalViewId> _retiredCanonicalIds;
+
+    bool _legacyUnoApiSeen = false;
+
+    /// The timestamp of the last memory trimming.
+    std::chrono::steady_clock::time_point _lastMemTrimTime;
+
+    std::map<int, std::chrono::steady_clock::time_point> _lastUpdatedAt;
+    std::map<int, int> _speedCount;
+    /// For showing disconnected user info in the doc repair dialog.
+    std::map<int, UserInfo> _sessionUserInfo;
+
+    const unsigned _mobileAppDocId;
+    int _duringLoad;
+    int _bgSavesOngoing;
+
+    /// A slide export that waits for its turn: the session it answers, and the pages it writes.
+    struct WaitingSlideExport
+    {
+        std::weak_ptr<ChildSession> _session;
+        std::string _pages;
+    };
+
+    /// Starts the waiting slide exports in order, until one of them runs in a forked child.
+    void startWaitingSlideExports();
+
+    /// The slide exports that wait for the one in a forked child to end.
+    std::deque<WaitingSlideExport> _waitingSlideExports;
+    /// Whether a slide export runs in a forked child now.
+    bool _slideExportInChild;
+
+    LogUiCmd logUiCmd;
+};
+
+/// main function of the forkit process or thread
+int forkit_main(int argc, char** argv);
+
+/// Anonymize the basename of filenames, preserving the path and extension.
+std::string anonymizeUrl(const std::string& url);
+
+/// Anonymize usernames.
+std::string anonymizeUsername(const std::string& username);
+
+/// Ensure there is no fatal system setup problem
+void consistencyCheckJail();
+
+/// check how many theads we have currently
+int getCurrentThreadCount();
+
+/// Fetch the latest monotonically incrementing wire-id
+TileWireId getCurrentWireId(bool increment = false);
+
+extern COKit* loKitPtr;
+
+/// Check if URP is enabled
+bool isURPEnabled();
+
+extern Util::LoadTimings KitLoadTimings;
+
+/// Start a URP connection, checking if URP is enabled and there is not already an active URP session
+bool startURP(const std::shared_ptr<COKit>& LOKit, void** ppURPContext);
+
+/// Ensure all recorded traces hit the disk
+void flushTraceEventRecordings();
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

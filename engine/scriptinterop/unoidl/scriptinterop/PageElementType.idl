@@ -1,0 +1,45 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** The kind of a page element.
+
+    @gas SlidesApp.PageElementType
+ */
+enum PageElementType
+{
+    /** An element that this API cannot classify, such as an embedded object, a chart, a frame or a
+        form control.
+     */
+    UNSUPPORTED,
+    /** A shape with no more specific kind, including text boxes and custom shapes. */
+    SHAPE,
+    IMAGE,
+    /** A media object. */
+    VIDEO,
+    TABLE,
+    GROUP,
+    /** A straight line or a connector. */
+    LINE,
+    /** Word art: a custom shape whose text follows a path. */
+    WORD_ART,
+    /** A chart linked from a spreadsheet. No element reports this kind; charts report
+        UNSUPPORTED.
+     */
+    SHEETS_CHART,
+    /** A speaker spotlight. No element reports this kind. */
+    SPEAKER_SPOTLIGHT
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

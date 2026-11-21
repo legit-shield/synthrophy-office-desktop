@@ -1,0 +1,804 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * JSDialog.IconView - icon view widget
+ *
+ * Example JSON:
+ * {
+ *     id: 'id',
+ *     type: 'iconview',
+ *     singleclickactivate: true,
+ *     entries: [
+ *         { text: 'some text', tooltip: 'some tooltip', image: 'encoded png', selected: false }
+ *     ]
+ * }
+ */
+
+declare var JSDialog: any;
+declare var UNOKey: any;
+
+/// Falls back to the engine's render when this build ships no icon for it.
+function _createEntryImageFromCommand(
+	parent: HTMLElement,
+	builder: JSBuilder,
+	entryData: IconViewEntry,
+	command: string,
+	hasText: boolean,
+) {
+	const img = window.L.DomUtil.create(
+		'img',
+		builder.options.cssClass,
+		parent,
+	) as HTMLImageElement;
+
+	img.alt = hasText ? '' : entryData.text || entryData.tooltip || '';
+	_setEntryTooltip(img, builder, entryData);
+	setupSize(entryData, img);
+
+	img.addEventListener(
+		'error',
+		function () {
+			window.L.DomUtil.remove(img);
+			const placeholder = window.L.DomUtil.create(
+				'span',
+				builder.options.cssClass,
+				parent,
+			);
+			setupSize(entryData, placeholder);
+			placeholder.innerText = entryData.text ? entryData.text : '';
+			(parent.parentNode as any).requestRenders(entryData, placeholder, parent);
+		},
+		{ once: true },
+	);
+
+	app.LOUtil.setImage(
+		img,
+		app.LOUtil.getIconNameOfCommand(command),
+		builder.map,
+	);
+}
+
+/// What the pointer shows on an entry. The placeholder carries it while the
+/// image is on its way, and the image has to keep it once it arrives.
+function _setEntryTooltip(
+	element: HTMLElement,
+	builder: JSBuilder,
+	entryData: IconViewEntry,
+) {
+	const text = entryData.tooltip || entryData.text;
+	if (!text) return;
+
+	element.setAttribute('data-cooltip', text);
+	window.L.control.attachTooltipEventListener(element, builder.map);
+}
+
+function _createEntryImage(
+	parent: HTMLElement | undefined,
+	builder: JSBuilder,
+	entryData: IconViewEntry,
+	image: string,
+	hasText: boolean = false,
+): HTMLImageElement {
+	const img = window.L.DomUtil.create(
+		'img',
+		builder.options.cssClass,
+		parent,
+	) as HTMLImageElement;
+	if (image) img.src = image;
+
+	if (hasText) {
+		img.alt = '';
+	} else if (entryData.text) {
+		img.alt = entryData.text;
+	} else if (entryData.tooltip) {
+		img.alt = entryData.tooltip;
+	} else {
+		img.alt = '';
+	}
+
+	_setEntryTooltip(img, builder, entryData);
+
+	setupSize(entryData, img);
+	return img;
+}
+
+function _createEntryText(parent: HTMLElement, entryData: IconViewEntry) {
+	// Add text below Icon
+	window.L.DomUtil.addClass(parent, 'icon-view-item-container');
+	const placeholder = window.L.DomUtil.create(
+		'span',
+		'ui-iconview-entry-title',
+		parent,
+	);
+	placeholder.innerText = entryData.text ? entryData.text : '';
+}
+
+function setupSize(entry: IconViewEntry, placeholder: HTMLElement) {
+	// Ensure the placeholder is the same size as the image to avoid the dialog changing size
+	if (entry.width && entry.height) {
+		placeholder.style.width = entry.width + 'px';
+		placeholder.style.height = entry.height + 'px';
+		placeholder.style.overflow = 'hidden';
+		placeholder.style.display = 'block';
+	}
+}
+
+/// Shows the text of an entry whose image the engine draws on request, in the size of
+/// that image when the entry gives one.
+function _createEntryPlaceholder(
+	parent: HTMLElement,
+	builder: JSBuilder,
+	entry: IconViewEntry,
+): HTMLElement {
+	const placeholder = window.L.DomUtil.create(
+		'span',
+		builder.options.cssClass,
+		parent,
+	) as HTMLElement;
+	setupSize(entry, placeholder);
+	placeholder.innerText = entry.text ? entry.text : '';
+	_setEntryTooltip(placeholder, builder, entry);
+	return placeholder;
+}
+
+// The image each entry is about to show while the browser decodes it. A newer image
+// for the same entry takes its place, and the older swap then does nothing.
+const pendingEntryImages = new WeakMap<HTMLElement, string>();
+
+/// Puts the image the engine drew for an entry in place of what the entry holds, with
+/// the title below it when the view shows text. With keepUntilDecoded the entry keeps
+/// its placeholder until the image can be painted, so it never shows an empty box.
+function _showRenderedEntry(
+	entryContainer: HTMLElement,
+	parentData: IconViewJSON,
+	entry: IconViewEntry,
+	image: string,
+	builder: JSBuilder,
+	keepUntilDecoded: boolean,
+) {
+	const hasText = !!(entry.text && parentData.textWithIconEnabled);
+
+	let content: HTMLElement;
+	let img: HTMLImageElement;
+	if (hasText) {
+		content = window.L.DomUtil.create('div', builder.options.cssClass);
+		img = _createEntryImage(content, builder, entry, image, hasText);
+		_createEntryText(content, entry);
+	} else {
+		img = _createEntryImage(undefined, builder, entry, image, hasText);
+		content = img;
+	}
+
+	const swap = () => {
+		if (pendingEntryImages.get(entryContainer) !== image) return;
+		pendingEntryImages.delete(entryContainer);
+		entryContainer.replaceChildren(content);
+	};
+
+	pendingEntryImages.set(entryContainer, image);
+	if (keepUntilDecoded && typeof img.decode === 'function')
+		img.decode().then(swap, swap);
+	else swap();
+}
+
+function _iconViewEntry(
+	parentContainer: IconViewElement,
+	parentData: IconViewJSON,
+	entry: IconViewEntry,
+	builder: JSBuilder,
+) {
+	const disabled = parentData.enabled === false;
+	const hasText = !!(entry.text && parentData.textWithIconEnabled);
+	const isMultiSelect = parentData.selectionmode === 'multiple';
+	const ariaStateAttr = isMultiSelect ? 'aria-selected' : 'aria-checked';
+
+	if (entry.separator && entry.separator === true) {
+		if (entry.text) {
+			const label = window.L.DomUtil.create(
+				'div',
+				builder.options.cssClass + ' ui-iconview-separator label',
+				parentContainer,
+			);
+			label.innerText = entry.text;
+		} else {
+			window.L.DomUtil.create(
+				'hr',
+				builder.options.cssClass + ' ui-iconview-separator',
+				parentContainer,
+			);
+		}
+		return;
+	}
+
+	const entryContainer = window.L.DomUtil.create(
+		'div',
+		builder.options.cssClass + ' ui-iconview-entry',
+		parentContainer,
+	);
+
+	//id is needed to find the element to regain focus after widget is updated. see updateWidget in Control.JSDialogBuilder.js
+	entryContainer.id = parentData.id + '_' + entry.row;
+
+	entryContainer.setAttribute('role', isMultiSelect ? 'option' : 'radio');
+	// By default aria-selected/aria-checked should be false
+	entryContainer.setAttribute(ariaStateAttr, 'false');
+
+	if (entry.selected && entry.selected === true) {
+		entryContainer.classList.add('selected');
+		entryContainer.setAttribute(ariaStateAttr, 'true');
+		entryContainer.setAttribute('tabindex', '0');
+	} else {
+		entryContainer.setAttribute('tabindex', '-1');
+	}
+
+	// Holds the place of an image that the engine draws on request.
+	let placeholder: HTMLElement | null = null;
+
+	if (entry.command) {
+		_createEntryImageFromCommand(
+			entryContainer,
+			builder,
+			entry,
+			entry.command,
+			hasText,
+		);
+	} else if (entry.ondemand) {
+		placeholder = _createEntryPlaceholder(entryContainer, builder, entry);
+	} else {
+		_createEntryImage(entryContainer, builder, entry, entry.image, hasText);
+	}
+
+	if (hasText) _createEntryText(entryContainer, entry);
+
+	// The image is asked for once the entry is complete. One that is already in the
+	// cache replaces the placeholder and the title right away, the way an image from
+	// the engine replaces them when it arrives.
+	if (placeholder)
+		parentContainer.requestRenders(entry, placeholder, entryContainer);
+
+	if (!disabled) {
+		const singleClick = parentData.singleclickactivate === true;
+		entryContainer.addEventListener('click', function () {
+			parentContainer
+				.querySelectorAll('.ui-iconview-entry[tabindex="0"]')
+				.forEach(function (el) {
+					el.setAttribute('tabindex', '-1');
+				});
+
+			parentContainer
+				.querySelectorAll('.ui-iconview-entry.selected')
+				.forEach(function (el) {
+					el.classList.remove('selected');
+					el.setAttribute(ariaStateAttr, 'false');
+				});
+
+			entryContainer.setAttribute('tabindex', '0');
+			entryContainer.focus();
+			//avoid re-selecting already selected entry
+			if (entryContainer.classList.contains('selected')) return;
+
+			parentContainer.builderCallback('iconview', 'select', entry.row, builder);
+			entryContainer.classList.add('selected');
+			entryContainer.setAttribute(ariaStateAttr, 'true');
+
+			if (singleClick) {
+				parentContainer.builderCallback(
+					'iconview',
+					'activate',
+					entry.row,
+					builder,
+				);
+				JSDialog.focusMapUnlessInDialog(builder);
+			}
+		});
+
+		entryContainer.addEventListener('contextmenu', function (e: Event) {
+			parentContainer
+				.querySelectorAll('.ui-iconview-entry')
+				.forEach(function (el) {
+					el.classList.remove('selected');
+					el.setAttribute(ariaStateAttr, 'false');
+				});
+
+			parentContainer.builderCallback('iconview', 'select', entry.row, builder);
+			entryContainer.classList.add('selected');
+			entryContainer.setAttribute(ariaStateAttr, 'true');
+
+			const contextMenuData: IconViewContextMenuData = {
+				row: entry.row,
+				clientX: (e as MouseEvent).clientX,
+				clientY: (e as MouseEvent).clientY,
+			};
+			parentContainer.builderCallback(
+				'iconview',
+				'contextmenu',
+				contextMenuData,
+				builder,
+			);
+			e.preventDefault();
+		});
+
+		if (!singleClick) {
+			entryContainer.addEventListener('dblclick', function () {
+				parentContainer.builderCallback(
+					'iconview',
+					'activate',
+					entry.row,
+					builder,
+				);
+				JSDialog.focusMapUnlessInDialog(builder);
+			});
+		}
+		builder._preventDocumentLosingFocusOnClick(entryContainer);
+
+		const isInNotebookbar = builder.options.cssClass === 'notebookbar';
+		entryContainer.addEventListener('keydown', function (e: KeyboardEvent) {
+			const isSpace = e.key === ' ' || e.code === 'Space';
+			const isEnter = e.key === 'Enter';
+			if (isSpace || isEnter) {
+				parentContainer.builderCallback(
+					'iconview',
+					'select',
+					entry.row,
+					builder,
+				);
+				parentContainer.builderCallback(
+					'iconview',
+					'keypress',
+					isSpace ? UNOKey.SPACE : UNOKey.RETURN,
+					builder,
+				);
+				if (isEnter) JSDialog.focusMapUnlessInDialog(builder);
+				e.preventDefault();
+			} else if (
+				isInNotebookbar &&
+				['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)
+			) {
+				e.preventDefault();
+				// In a notebookbar, arrows navigate the toolbar — don't send to core.
+			} else {
+				parentContainer.builderCallback(
+					'iconview',
+					'keypress',
+					JSDialog.getUNOKeyCodeWithModifiers(e, builder.map),
+					builder,
+				);
+			}
+		});
+
+		entryContainer.addEventListener('keyup', function (e: KeyboardEvent) {
+			parentContainer.builderCallback(
+				'iconview',
+				'keyrelease',
+				JSDialog.getUNOKeyCodeWithModifiers(e, builder.map),
+				builder,
+			);
+		});
+	}
+}
+
+JSDialog.UpdateIconViewIndexes = function (iconview: HTMLElement) {
+	if (!iconview) return;
+
+	const entries = Array.from(
+		iconview.querySelectorAll('.ui-iconview-entry'),
+	) as HTMLElement[];
+	if (!entries.length) return;
+
+	const positionIn = (offsets: number[]) => {
+		const distinct = Array.from(new Set(offsets)).sort((a, b) => a - b);
+		return (offset: number) => distinct.indexOf(offset);
+	};
+
+	const rowOf = positionIn(entries.map((entry) => entry.offsetTop));
+	const columnOf = positionIn(entries.map((entry) => entry.offsetLeft));
+
+	entries.forEach((entry) => {
+		entry.setAttribute(
+			'index',
+			rowOf(entry.offsetTop) + ':' + columnOf(entry.offsetLeft),
+		);
+	});
+};
+
+/// The last entry of the row that is at the top of the view, counting a row as there
+/// once more than half of it shows.
+function _lastEntryOfTopRow(iconview: HTMLElement): HTMLElement | null {
+	const entries = iconview.querySelectorAll(
+		'.ui-iconview-entry',
+	) as NodeListOf<HTMLElement>;
+	if (!entries.length) return null;
+
+	const viewTop = iconview.getBoundingClientRect().top;
+	const isBelowTop = (entry: HTMLElement) => {
+		const rect = entry.getBoundingClientRect();
+		return rect.top + rect.height / 2 > viewTop;
+	};
+
+	// The entries go down the view in order, so the first one below the top is found
+	// by halving.
+	let low = 0;
+	let high = entries.length - 1;
+	if (!isBelowTop(entries[high])) return null;
+	while (low < high) {
+		const middle = (low + high) >> 1;
+		if (isBelowTop(entries[middle])) high = middle;
+		else low = middle + 1;
+	}
+
+	const rowTop = entries[low].offsetTop;
+	let last = low;
+	while (last + 1 < entries.length && entries[last + 1].offsetTop === rowTop)
+		last++;
+	return entries[last];
+}
+
+/// Tells the engine which row the user has scrolled to the top, so the dialog can follow
+/// it. A scroll that the view does itself to show a selection is not reported: there the
+/// dialog already follows the selected entry.
+function _setupTopRowScrolledReport(
+	iconview: IconViewElement,
+	data: IconViewJSON,
+	builder: JSBuilder,
+) {
+	let scrolledByUser = false;
+	const userScrolls = () => {
+		scrolledByUser = true;
+	};
+	iconview.addEventListener('wheel', userScrolls, { passive: true });
+	iconview.addEventListener('touchstart', userScrolls, { passive: true });
+	// A press on the view itself rather than on an entry is one on its scrollbar.
+	iconview.addEventListener('pointerdown', (e: PointerEvent) => {
+		if (e.target === iconview) userScrolls();
+	});
+	iconview.addEventListener('keydown', (e: KeyboardEvent) => {
+		if (e.target === iconview) userScrolls();
+	});
+
+	let reportedRow: string | null = null;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+
+	// The dialog follows a selection too, so the row reported last may no longer be what
+	// it shows: report the next row even when it is the same one.
+	iconview.scrolledBySelection = () => {
+		scrolledByUser = false;
+		reportedRow = null;
+		if (timer) clearTimeout(timer);
+		timer = null;
+	};
+	const report = () => {
+		timer = null;
+		const entry = _lastEntryOfTopRow(iconview);
+		if (!entry) return;
+
+		const row = entry.id.substring(data.id.length + 1);
+		if (row === reportedRow) return;
+
+		reportedRow = row;
+		iconview.builderCallback('iconview', 'toprowscrolled', row, builder);
+	};
+
+	iconview.addEventListener(
+		'scroll',
+		() => {
+			if (!scrolledByUser) return;
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(report, 100);
+		},
+		{ passive: true },
+	);
+}
+
+JSDialog.iconView = function (
+	parentContainer: Element,
+	data: IconViewJSON,
+	builder: JSBuilder,
+) {
+	// The renders cache is keyed by visual position, so it is only valid
+	// while the entry at each position stays the same. If the entries
+	// have shifted since the last render (e.g. the Theme dialog reopens
+	// with a different document theme at position 0), every cached image
+	// would be paired with the wrong label. Drop stale images when the
+	// entry texts or tooltips change.
+	const signature = data.entries
+		? data.entries
+				.map((e: IconViewEntry) => (e.text || '') + '\t' + (e.tooltip || ''))
+				.join('|')
+		: '';
+	const cache = builder.rendersCache[data.id];
+	// The cache of a view is created on its first build, so one that exists means
+	// the view was shown before.
+	const shownBefore = !!cache;
+	if (!cache) {
+		// The first build records the signature of its entries, so a later
+		// build with the same entries finds the images of this one.
+		builder.rendersCache[data.id] = {
+			persistent: false,
+			images: [],
+			dpiScale: window.devicePixelRatio,
+			signature,
+		};
+	} else {
+		// The entry images are bitmaps converted by core at a fixed pixel
+		// density that is sent with the render request. When the display
+		// density changes (browser zoom, or moving the window to a monitor
+		// with a different scale) the cached bitmap no longer matches and the
+		// browser upscales it, which looks blurry. Drop the images so the
+		// entries are re-requested and re-rendered at the new density.
+		// Persistent caches keep their images for the lifetime of the dialog
+		// and are never re-requested, so leave them untouched here.
+		const dpiChanged =
+			!cache.persistent && cache.dpiScale !== window.devicePixelRatio;
+		if (cache.signature !== signature || dpiChanged) {
+			cache.images = [];
+			cache.signature = signature;
+			cache.dpiScale = window.devicePixelRatio;
+		}
+	}
+
+	const iconview = window.L.DomUtil.create(
+		'div',
+		builder.options.cssClass + ' ui-iconview',
+		parentContainer,
+	);
+
+	iconview.id = data.id;
+	const isMultiSelect = data.selectionmode === 'multiple';
+
+	if (isMultiSelect) {
+		iconview.setAttribute('role', 'listbox');
+		iconview.setAttribute('aria-multiselectable', 'true');
+	} else {
+		iconview.setAttribute('role', 'radiogroup');
+	}
+
+	if (data.labelledBy) {
+		const ids = Array.isArray(data.labelledBy)
+			? data.labelledBy.join(' ')
+			: data.labelledBy;
+		iconview.setAttribute('aria-labelledby', ids);
+	} else if (data.aria?.label) {
+		JSDialog.AddAriaLabel(iconview, data, builder);
+	} else {
+		// Built detached, so the group is only there to be found once the
+		// layout has run.
+		app.layoutingService.appendLayoutingTask(() => {
+			if (iconview.hasAttribute('aria-labelledby')) return;
+
+			const group = iconview.closest('.ui-overflow-group');
+			const caption = group
+				? (group.querySelector('.ui-overflow-group-label') as HTMLElement)
+				: null;
+
+			if (caption && caption.id && caption.innerText)
+				iconview.setAttribute('aria-labelledby', caption.id);
+		});
+	}
+
+	const disabled = data.enabled === false;
+	if (disabled) window.L.DomUtil.addClass(iconview, 'disabled');
+
+	// Do not animate on creation - eg. when opening sidebar with icon view it might move the app
+	const firstSelected = $(iconview).children('.selected').get(0);
+	if (firstSelected) {
+		const offsetTop = firstSelected.offsetTop;
+		iconview.scrollTop = offsetTop;
+	}
+
+	iconview.updateSelectionImpl = (
+		position: number,
+		iconViewData: IconViewJSON,
+	) => {
+		if (!iconViewData.entries) return;
+
+		for (const entry of iconViewData.entries) {
+			entry.selected = false;
+		}
+
+		if (position >= 0 && iconViewData.entries.length > position) {
+			const entry = iconViewData.entries[position];
+			if (entry) entry.selected = true;
+		}
+	};
+
+	iconview.updateSelection = (position: number) => {
+		iconview.updateSelectionImpl(position, data);
+	};
+
+	const ariaStateAttr = isMultiSelect ? 'aria-selected' : 'aria-checked';
+
+	// position can be -1
+	iconview.onSelect = (position: number) => {
+		$(iconview)
+			.children('.selected')
+			.each(function () {
+				$(this).removeClass('selected');
+				this.setAttribute(ariaStateAttr, 'false');
+			});
+
+		const entry =
+			position >= 0 && iconview.children.length > position
+				? iconview.children[position]
+				: null;
+
+		iconview.updateSelection(position);
+
+		if (entry) {
+			if (iconview.scrolledBySelection) iconview.scrolledBySelection();
+
+			window.L.DomUtil.addClass(entry, 'selected');
+			entry.setAttribute(ariaStateAttr, 'true');
+
+			if (builder.options.useScrollAnimation !== false) {
+				const blockOption = JSDialog.ScrollIntoViewBlockOption('nearest');
+				entry.scrollIntoView({
+					behavior: 'smooth',
+					block: blockOption,
+					inline: 'nearest',
+				});
+			} else {
+				const offsetTop = entry.offsetTop;
+				iconview.scrollTop = offsetTop;
+			}
+		} else if (position != -1)
+			app.console.warn(
+				'not found entry: "' + position + '" in: "' + iconview.id + '"',
+			);
+	};
+
+	iconview.requestRendersImpl = (
+		id: string,
+		entry: IconViewEntry,
+		placeholder: Element,
+		entryContainer: Element,
+	) => {
+		// The engine drew this entry for an earlier build of the view and the image
+		// is still in the cache, so it is the answer to this request. It goes in the
+		// way a fresh render does, with the same size and tooltip.
+		const cache = builder.rendersCache[id];
+		if (cache && cache.images[entry.row]) {
+			_showRenderedEntry(
+				entryContainer as HTMLElement,
+				data,
+				entry,
+				cache.images[entry.row],
+				builder,
+				false,
+			);
+			return;
+		}
+
+		JSDialog.OnDemandRenderer(
+			builder,
+			id,
+			'iconview',
+			entry.row,
+			placeholder,
+			entryContainer,
+			entry.text ? entry.text : entry.tooltip,
+			!entry.command,
+		);
+	};
+
+	iconview.requestRenders = (
+		entry: IconViewEntry,
+		placeholder: Element,
+		entryContainer: Element,
+	) => {
+		iconview.requestRendersImpl(data.id, entry, placeholder, entryContainer);
+	};
+
+	iconview.updateRendersImpl = (
+		pos: number,
+		id: string,
+		where: HTMLElement,
+	) => {
+		const dropdown = where.querySelectorAll(
+			'.ui-iconview-entry, .ui-iconview-separator',
+		);
+		if (dropdown[pos]) {
+			_showRenderedEntry(
+				dropdown[pos] as HTMLElement,
+				data,
+				data.entries[pos],
+				builder.rendersCache[id].images[pos],
+				builder,
+				true,
+			);
+		} else {
+			app.console.debug('IconView: not found entry: ' + pos);
+		}
+	};
+
+	iconview.builderCallback = (
+		objectType: string,
+		eventType: string,
+		entryData: any,
+		builder: JSBuilder,
+	) => {
+		builder.callback(objectType, eventType, data, entryData, builder);
+	};
+
+	iconview.updateRenders = (pos: number) => {
+		iconview.updateRendersImpl(pos, data.id, iconview);
+	};
+
+	// In a notebookbar (toolbar), arrow keys are handled by the toolbar's
+	// own navigation — radio group entries are navigated like any other
+	// toolbar item, without changing selection (WAI-ARIA APG radio-in-toolbar).
+	const inNotebookbar = builder.options.cssClass === 'notebookbar';
+	if (!inNotebookbar) {
+		if (isMultiSelect) JSDialog.KeyboardListNavigation(iconview);
+		else JSDialog.KeyboardRadioGroupNavigation(iconview);
+	}
+
+	if (data.notifytoprowscrolled)
+		_setupTopRowScrolledReport(iconview, data, builder);
+
+	iconview.addEventListener('focusin', function (e: FocusEvent) {
+		const target = e.target as HTMLElement;
+
+		/*
+		 * when the iconview is shown in a dropdown and is the first
+		 * child of the dropdown, it gets selected by default which
+		 * is not desirable as that shows a blue frame around the
+		 * iconview.
+		 */
+		if (target === iconview) {
+			target.setAttribute('tabindex', '-1');
+			return;
+		}
+	});
+
+	const createEntries = () => {
+		const shouldSelectFirstEntry =
+			data.entries?.length > 0
+				? !data.entries.some((entry) => entry.selected === true)
+				: false;
+		if (shouldSelectFirstEntry) {
+			const firstValid = data.entries.find((entry) => !entry.separator);
+			if (firstValid) firstValid.selected = true;
+		}
+
+		for (const i in data.entries) {
+			_iconViewEntry(iconview, data, data.entries[i], builder);
+		}
+	};
+
+	// The indexes and the scroll position come from the layout, so they are settled
+	// once the view is in the document.
+	const placeEntries = () => {
+		JSDialog.UpdateIconViewIndexes(iconview);
+
+		// Do not animate on creation - eg. when opening sidebar with icon view it might move the app
+		const firstSelected = $(iconview).children('.selected').get(0);
+		if (firstSelected) {
+			const offsetTop = firstSelected.offsetTop;
+			iconview.scrollTop = offsetTop;
+		}
+	};
+
+	// A view that was shown before is built complete, so a rebuilt notebookbar paints
+	// it in the same frame as everything else. A view shown for the first time gets
+	// its entries in a layouting task.
+	if (shownBefore) {
+		createEntries();
+		app.layoutingService.appendLayoutingTask(placeEntries);
+	} else {
+		app.layoutingService.appendLayoutingTask(() => {
+			createEntries();
+			placeEntries();
+		});
+	}
+
+	return false;
+};

@@ -1,0 +1,44 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** A block of bytes with an optional content type and name.
+
+    A blob does not change after it has been created.
+
+    @gas Blob
+ */
+interface XBlob {
+    /** Each byte is a number from -128 to 127.
+
+        @gas Blob.getBytes
+     */
+    sequence<byte> getBytes();
+
+    /** @returns
+            The MIME type, or null when the blob has none.
+
+        @gas Blob.getContentType
+     */
+    com::sun::star::beans::Optional<string> getContentType();
+
+    /** @returns
+            The file name, or null when the blob has none.
+
+        @gas Blob.getName
+     */
+    com::sun::star::beans::Optional<string> getName();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

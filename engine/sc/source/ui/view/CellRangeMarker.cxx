@@ -1,0 +1,83 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <CellRangeInventory.hxx>
+#include <CellRangeMarker.hxx>
+
+#include <tabvwsh.hxx>
+#include <viewdata.hxx>
+
+#include <COKit/COKit.hxx>
+#include <comphelper/kit.hxx>
+#include <tools/json_writer.hxx>
+
+namespace sc
+{
+
+bool CellRangeMarkerOptions::operator==(const CellRangeMarkerOptions&) const = default;
+
+void notifyCellRangeMarker(const ScViewData& rViewData, const CellRangeMarkerOptions& rOptions)
+{
+    if (!comphelper::COKit::isActive())
+        return;
+
+    ScTabViewShell* pViewShell = rViewData.GetViewShell();
+    ScTabView* pView = rViewData.GetView();
+    if (!pViewShell || !pView)
+        return;
+
+    {
+        // Avoid sending duplicated messages that are identical to what the
+        // client currently has. If the marker is not displayed it's not stored
+        // here.
+        auto& rShownMarkers = pView->GetKitCellRangeMarkers();
+        auto it = rShownMarkers.find(rOptions.aName);
+        if (rOptions.aCellRanges.empty())
+        {
+            if (it == rShownMarkers.end())
+                return;
+
+            rShownMarkers.erase(it);
+        }
+        else
+        {
+            if (it != rShownMarkers.end() && it->second == rOptions)
+                // skip the duplicate
+                return;
+
+            rShownMarkers.insert_or_assign(rOptions.aName, rOptions);
+        }
+    }
+
+    tools::JsonWriter aWriter;
+    aWriter.put("commandName", "CellRangeMarker");
+    {
+        const auto aStateNode = aWriter.startNode("state");
+        aWriter.put("name", rOptions.aName);
+        aWriter.put("part", static_cast<sal_Int32>(rOptions.nPart));
+        if (rOptions.aColor != COL_AUTO)
+            aWriter.put("color", rOptions.aColor.AsRGBHexString());
+        if (rOptions.bDashed)
+            aWriter.put("dashed", true);
+        if (rOptions.fFillOpacity > 0.0)
+            aWriter.put("fillOpacity", rOptions.fFillOpacity);
+        if (!rOptions.aHandleCommand.isEmpty())
+            aWriter.put("handleCommand", rOptions.aHandleCommand);
+        const auto aRangesArray = aWriter.startArray("cellRanges");
+        for (auto const& rCellRange : rOptions.aCellRanges)
+            putRange(aWriter, rCellRange);
+    }
+    pViewShell->viewCallback(COKitCallbackType::STATE_CHANGED, aWriter.finishAndGetAsOString());
+}
+
+} // namespace sc
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

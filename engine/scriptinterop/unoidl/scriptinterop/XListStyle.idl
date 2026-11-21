@@ -1,0 +1,69 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+interface XList;
+
+/** The list formatting of a text range.
+
+    @gas ListStyle
+ */
+interface XListStyle : XBase
+{
+    /** Puts every paragraph that overlaps the range into a list with the given glyphs.
+
+        @unimplemented
+        @gas ListStyle.applyListPreset
+     */
+    XListStyle applyListPreset([in] ListPreset listPreset);
+
+    /** Returns the bullet or number glyph shown for the text, or null when the text is not in a
+        list or spans more than one paragraph.
+
+        @unimplemented
+        @gas ListStyle.getGlyph
+     */
+    com::sun::star::beans::Optional<string> getGlyph();
+
+    /** Returns null when the text is not in a list or is in more than one.
+
+        @unimplemented
+        @gas ListStyle.getList
+     */
+    com::sun::star::beans::Optional<XList> getList();
+
+    /** Returns the 0-based nesting level, or null when the text is not in a list or the level
+        differs across it.
+
+        @unimplemented
+        @gas ListStyle.getNestingLevel
+     */
+    com::sun::star::beans::Optional<long> getNestingLevel();
+
+    /** Returns null when only part of the text is in a list.
+
+        @unimplemented
+        @gas ListStyle.isInList
+     */
+    com::sun::star::beans::Optional<boolean> isInList();
+
+    /** Takes every paragraph that overlaps the range off its list.
+
+        @unimplemented
+        @gas ListStyle.removeFromList
+     */
+    XListStyle removeFromList();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

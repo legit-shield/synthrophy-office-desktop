@@ -1,0 +1,222 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** The characters of a run of text in a paragraph, of a whole paragraph, or of a container, and
+    their formatting.
+
+    Offsets count the characters of getText(), starting at 0. The anchor of an inline image and the
+    number of a footnote reference are not counted. The getters that take an offset read the
+    formatting of the text run at that offset. They return null when the attribute is not set
+    directly on the run or on the paragraph, for example when it comes from a style.
+
+    The calls that take startOffset and endOffsetInclusive act on the characters from the one to
+    the other, both included. They throw if startOffset is negative or endOffsetInclusive is less
+    than startOffset.
+
+    An offset must point at a character of the text, or the call throws. insertText also accepts
+    the end of the text, and the getters accept offset 0 of an empty text.
+
+    The text of a container, from XContainerElement.editAsText, joins the texts of all the
+    paragraphs in it, also those in nested tables, with a line break after each but the last. A
+    line break counts as one character and has the formatting of the character before it. Here
+    appendText, deleteText, insertText, merge and setText throw as not implemented.
+
+    @gas Text
+ */
+interface XText: XElement {
+    /** @gas Text.appendText */
+    XText appendText([in] string text);
+
+    /** @gas Text.deleteText */
+    XText deleteText([in] long startOffset, [in] long endOffsetInclusive);
+
+    /** @gas Text.editAsText */
+    XText editAsText();
+
+    /** Returns the first match of a regular expression in the text, or null if there is none.
+
+        The pattern uses the syntax of ICU regular expressions. A match does not cross the end of
+        a paragraph or an inline image, and an empty match is skipped.
+
+        @throws RuntimeException
+            if searchPattern is not a valid regular expression.
+
+        @gas Text.findText
+     */
+    [overload findText] com::sun::star::beans::Optional<XRangeElement> findText(
+        [in] string searchPattern);
+
+    /** Returns the first match of a regular expression after an earlier match, or null if there
+        is none.
+
+        @param from
+            The result of an earlier findText call on this text.
+        @throws RuntimeException
+            if searchPattern is not a valid regular expression, or from is not a match in this
+            text.
+
+        @gas Text.findText
+     */
+    [overload findText] com::sun::star::beans::Optional<XRangeElement> findTextFrom(
+        [in] string searchPattern, [in] XRangeElement from);
+
+    /** @gas Text.getFontFamily */
+    com::sun::star::beans::Optional<string> getFontFamily([in] long offset);
+
+    /** Returns the color of the whole text, as "#rrggbb".
+
+        Returns null when parts of the text have different colors, or when the color is automatic
+        or not set on the text.
+
+        @gas Text.getForegroundColor
+     */
+    [overload getForegroundColor] com::sun::star::beans::Optional<string> getForegroundColor();
+
+    /** Returns the color of the text at the given offset, as "#rrggbb".
+
+        An automatic color reads as null.
+
+        @gas Text.getForegroundColor
+     */
+    [overload getForegroundColor] com::sun::star::beans::Optional<string> getForegroundColorAt(
+        [in] long offset);
+
+    /** @gas Text.getLinkUrl */
+    com::sun::star::beans::Optional<string> getLinkUrl([in] long offset);
+
+    /** @gas Text.getTextAlignment */
+    com::sun::star::beans::Optional<TextAlignment> getTextAlignment([in] long offset);
+
+    /** Returns the offsets at which a new text run starts.
+
+        The first offset is always 0. A new offset follows only where the formatting changes.
+
+        @gas Text.getTextAttributeIndices
+     */
+    sequence<long> getTextAttributeIndices();
+
+    /** @throws RuntimeException
+            if offset is negative or past the end of the text.
+
+        @gas Text.insertText
+     */
+    XText insertText([in] long offset, [in] string text);
+
+    /** @gas Text.isBold */
+    com::sun::star::beans::Optional<boolean> isBold([in] long offset);
+
+    /** Returns whether the text at the given offset is italic or oblique.
+
+        @gas Text.isItalic
+     */
+    com::sun::star::beans::Optional<boolean> isItalic([in] long offset);
+
+    /** @gas Text.isStrikethrough */
+    com::sun::star::beans::Optional<boolean> isStrikethrough([in] long offset);
+
+    /** @gas Text.isUnderline */
+    com::sun::star::beans::Optional<boolean> isUnderline([in] long offset);
+
+    /** Joins the element with the element before it, such as a paragraph with the paragraph
+        before it, and returns the text of the joined element.
+
+        @throws RuntimeException
+            if the element before it is missing or of another type.
+
+        @gas Text.merge
+     */
+    XText merge();
+
+    /** @gas Text.setBold */
+    [overload setBold] XText setBold([in] com::sun::star::beans::Optional<boolean> value);
+
+    /** @gas Text.setBold */
+    [overload setBold] XText setBoldRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<boolean> value);
+
+    /** @gas Text.setFontFamily */
+    [overload setFontFamily] XText setFontFamily(
+        [in] com::sun::star::beans::Optional<string> fontFamilyName);
+
+    /** @gas Text.setFontFamily */
+    [overload setFontFamily] XText setFontFamilyRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<string> fontFamilyName);
+
+    /** Sets the color of the whole text.
+
+        @param color
+            A color as "#rrggbb", or null to remove the color.
+        @throws RuntimeException
+            if color is neither null nor of the form "#rrggbb".
+
+        @gas Text.setForegroundColor
+     */
+    [overload setForegroundColor] XText setForegroundColor(
+        [in] com::sun::star::beans::Optional<string> color);
+
+    /** @gas Text.setForegroundColor */
+    [overload setForegroundColor] XText setForegroundColorRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<string> color);
+
+    /** @gas Text.setItalic */
+    [overload setItalic] XText setItalic([in] com::sun::star::beans::Optional<boolean> value);
+
+    /** @gas Text.setItalic */
+    [overload setItalic] XText setItalicRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<boolean> value);
+
+    /** @gas Text.setLinkUrl */
+    [overload setLinkUrl] XText setLinkUrl([in] com::sun::star::beans::Optional<string> url);
+
+    /** @gas Text.setLinkUrl */
+    [overload setLinkUrl] XText setLinkUrlRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<string> url);
+
+    /** @gas Text.setStrikethrough */
+    [overload setStrikethrough] XText setStrikethrough(
+        [in] com::sun::star::beans::Optional<boolean> value);
+
+    /** @gas Text.setStrikethrough */
+    [overload setStrikethrough] XText setStrikethroughRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<boolean> value);
+
+    /** @gas Text.setText */
+    XText setText([in] string text);
+
+    /** @gas Text.setTextAlignment */
+    [overload setTextAlignment] XText setTextAlignment(
+        [in] com::sun::star::beans::Optional<TextAlignment> textAlignment);
+
+    /** @gas Text.setTextAlignment */
+    [overload setTextAlignment] XText setTextAlignmentRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<TextAlignment> textAlignment);
+
+    /** @gas Text.setUnderline */
+    [overload setUnderline] XText setUnderline([in] com::sun::star::beans::Optional<boolean> value);
+
+    /** @gas Text.setUnderline */
+    [overload setUnderline] XText setUnderlineRange(
+        [in] long startOffset, [in] long endOffsetInclusive,
+        [in] com::sun::star::beans::Optional<boolean> value);
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

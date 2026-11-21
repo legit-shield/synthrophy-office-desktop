@@ -1,0 +1,703 @@
+// @ts-strict-ignore
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/// Static facade exposing the RenderManager API as static methods.
+class RenderManager {
+	private static _instance: RenderManagerBase;
+
+	/// The change listeners registered here, which a manager that replaces another takes over.
+	private static _vectorListeners: VectorChangeListener[] = [];
+
+	/// The kind of manager the document type draws with.
+	private static kindFor(docType?: string): RenderManagerKind {
+		if (!cool.VectorRenderingConfig.isEnabled()) return 'tiles';
+		if (docType === 'presentation' || docType === 'drawing') return 'slides';
+		// The side-by-side view of tracked changes shows the document in two redline render
+		// modes, which come as tiles only, so a text document draws from tiles while it is on.
+		// The pages are asked for by the ids the status names them by, so pages that come without
+		// ids are drawn from tiles too.
+		if (docType === 'text') {
+			const comparing =
+				app.activeDocument?.activeLayout?.type === 'ViewLayoutCompareChanges';
+			const writer = app.file?.writer;
+			const unnamed =
+				writer?.pageRectangleList?.length > 0 && !writer?.pageIds?.length;
+			return comparing || unnamed ? 'tiles' : 'text';
+		}
+		if (docType === 'spreadsheet') return 'sheet';
+		return 'tiles';
+	}
+
+	private static newManager(kind: RenderManagerKind): RenderManagerBase {
+		switch (kind) {
+			case 'slides':
+				return new ImpressVectorManager();
+			case 'text':
+				return new WriterVectorManager();
+			case 'sheet':
+				return new CalcVectorManager();
+			default:
+				return new BitmapTileManager();
+		}
+	}
+
+	/// Pick the manager for the document type, replacing the instance when
+	/// an earlier one is of the wrong kind.
+	private static makeInstance(docType?: string): RenderManagerBase {
+		const kind = RenderManager.kindFor(docType);
+		if (!RenderManager._instance || RenderManager._instance.kind() !== kind) {
+			// The replaced manager releases everything it holds, such as
+			// the font faces it registered on the document.
+			const previous = RenderManager._instance;
+			if (previous) previous.discardAllCache();
+			RenderManager._instance = RenderManager.newManager(kind);
+			// The tasks that wait for the first visuals move to the new
+			// manager. The provisional manager made before the document type
+			// is known shows no content when the document draws from vectors.
+			if (previous)
+				RenderManager._instance.adoptAfterVisualsReadyTasks(previous);
+			for (const listener of RenderManager._vectorListeners)
+				RenderManager._instance.onVectorChanged(listener);
+		}
+		return RenderManager._instance;
+	}
+
+	/// The manager of a spreadsheet drawn from vector primitives, or undefined while the
+	/// document draws otherwise.
+	static calcVectorManager(): CalcVectorManager | undefined {
+		const instance = RenderManager._instance;
+		return instance instanceof CalcVectorManager ? instance : undefined;
+	}
+
+	/// The manager of a text document drawn from vector primitives, or undefined while the
+	/// document draws otherwise.
+	static writerVectorManager(): WriterVectorManager | undefined {
+		const instance = RenderManager._instance;
+		return instance instanceof WriterVectorManager ? instance : undefined;
+	}
+
+	private static ensureInstance(): RenderManagerBase {
+		// Provisional default before the document type is known.
+		if (!RenderManager._instance)
+			RenderManager._instance = new BitmapTileManager();
+		return RenderManager._instance;
+	}
+
+	static get tileSize(): number {
+		return window.tileSize;
+	}
+
+	static initialize(docType?: string): void {
+		RenderManager.makeInstance(docType).initialize();
+	}
+
+	/// Pick the manager again, for when the vector rendering option has changed while a document
+	/// is open. A manager of the wrong kind is replaced and the new one initialized.
+	static reinitialize(docType?: string): void {
+		const previous = RenderManager._instance;
+		const instance = RenderManager.makeInstance(docType);
+		if (instance !== previous) instance.initialize();
+	}
+
+	/*
+		Pick the manager of a text document again for the view layout and the page list now in
+		place. The sections follow the manager. A view that goes to tiles tells the server, which
+		sends it tiles from then on, and a view that goes back to vector primitives asks for the
+		pages as it draws them. True when the manager was replaced.
+	*/
+	static layoutChanged(): boolean {
+		const docType = app.map._docLayer?._docType;
+		if (docType !== 'text') return false;
+		const previous = RenderManager._instance;
+		RenderManager.reinitialize(docType);
+		const instance = RenderManager._instance;
+		if (instance === previous) return false;
+
+		RenderManager.updateVectorSections();
+		if (!instance.drawsFromPrimitives())
+			app.socket.sendMessage('commandvalues command=.uno:DrawFromTiles');
+		app.sectionContainer.requestReDraw();
+		return true;
+	}
+
+	/*
+		Add and remove the sections that draw a part from primitives and answer for the mouse, so
+		that they match the manager in use, and swap the layout of a presentation for the one the
+		manager draws in.
+	*/
+	static updateVectorSections(): void {
+		// Drawing from the objects has a layout of its own, with the lawn round the page.
+		if (RenderManager.matchVectorSections())
+			ViewLayoutVector.switchTheRendering();
+	}
+
+	/*
+		Add and remove the sections that draw a part from primitives and answer for the mouse, so
+		that they match the manager in use. True when the section that draws the parts was added
+		or removed.
+	*/
+	static matchVectorSections(): boolean {
+		// A spreadsheet has a vector section of its own.
+		cool.CalcVectorContentSection.update();
+
+		// The drawing objects of a vector-drawn sheet or slide answer what lies under the mouse.
+		const objectsWanted = RenderManager.drawsFromObjects();
+		const objectsPresent = app.sectionContainer.doesSectionExist(
+			app.CSections.RenderGeometry.name,
+		);
+		if (objectsWanted && !objectsPresent)
+			app.sectionContainer.addSection(new RenderGeometrySection());
+		else if (!objectsWanted && objectsPresent)
+			app.sectionContainer.removeSection(app.CSections.RenderGeometry.name);
+		// The objects the client holds answer what lies under the mouse while they are there,
+		// so the engine is asked for the pointer only while they are not.
+		if (objectsWanted !== objectsPresent)
+			RenderGeometrySection.requestPointerFromServer(!objectsWanted);
+
+		const wanted = RenderManager.drawsFromPrimitives();
+		const present = app.sectionContainer.doesSectionExist(
+			app.CSections.VectorContent.name,
+		);
+		if (wanted === present) return false;
+
+		// The objects of slides are held here. The pages of a text document are drawn here
+		// and the server answers for the mouse.
+		const writerManager = RenderManager.writerVectorManager();
+		if (!wanted)
+			app.sectionContainer.removeSection(app.CSections.VectorContent.name);
+		else if (writerManager)
+			app.sectionContainer.addSection(
+				new cool.TextPageVectorSection(writerManager),
+			);
+		else app.sectionContainer.addSection(new cool.VectorContentSection());
+		return true;
+	}
+
+	static appendAfterVisualsReady(task: AfterVisualsReadyTask): void {
+		RenderManager.ensureInstance().appendAfterVisualsReady(task);
+	}
+
+	static markThumbnailStale(): void {
+		RenderManager.ensureInstance().markThumbnailStale();
+	}
+
+	static markVisualsReady(): void {
+		RenderManager.ensureInstance().markVisualsReady();
+	}
+
+	static updateOverlayMessages(): void {
+		RenderManager.ensureInstance().updateOverlayMessages();
+	}
+
+	static getExpiryFactor(tile: Tile): number {
+		return RenderManager.ensureInstance().getExpiryFactor(tile);
+	}
+
+	static beginTransaction(): void {
+		RenderManager.ensureInstance().beginTransaction();
+	}
+
+	static endTransaction(callback: any = null): void {
+		RenderManager.ensureInstance().endTransaction(callback);
+	}
+
+	static refreshTilesInBackground(): void {
+		RenderManager.ensureInstance().refreshTilesInBackground();
+	}
+
+	static setDebugDeltas(state: boolean): void {
+		RenderManager.ensureInstance().setDebugDeltas(state);
+	}
+
+	static onTileStateChanged(callback: () => void): void {
+		RenderManager.ensureInstance().onTileStateChanged(callback);
+	}
+
+	static offTileStateChanged(callback: () => void): void {
+		RenderManager.ensureInstance().offTileStateChanged(callback);
+	}
+
+	static get(coords: TileCoordData): Tile {
+		return RenderManager.ensureInstance().get(coords);
+	}
+
+	static getTiles(): Map<string, Tile> {
+		return RenderManager.ensureInstance().getTiles();
+	}
+
+	static overlapInvalidatedRectangleWithView(
+		part: PartNumber,
+		mode: number,
+		wireId: number,
+		invalidatedRectangle: cool.SimpleRectangle,
+		textMsg: string,
+	): void {
+		RenderManager.ensureInstance().overlapInvalidatedRectangleWithView(
+			part,
+			mode,
+			wireId,
+			invalidatedRectangle,
+			textMsg,
+		);
+	}
+
+	static resetPreFetching(resetBorder: boolean): void {
+		RenderManager.ensureInstance().resetPreFetching(resetBorder);
+	}
+
+	static clearPreFetch(): void {
+		RenderManager.ensureInstance().clearPreFetch();
+	}
+
+	static initPreFetchAdjacentTiles(): void {
+		RenderManager.ensureInstance().initPreFetchAdjacentTiles();
+	}
+
+	static sendProcessedResponse(): void {
+		RenderManager.ensureInstance().sendProcessedResponse();
+	}
+
+	static onTileMsg(textMsg: string, img: any): void {
+		RenderManager.ensureInstance().onTileMsg(textMsg, img);
+	}
+
+	static onTileGoneMsg(textMsg: string): void {
+		RenderManager.ensureInstance().onTileGoneMsg(textMsg);
+	}
+
+	static predictTilesToSlurp(): number {
+		return RenderManager.ensureInstance().predictTilesToSlurp();
+	}
+
+	static pruneTiles(): void {
+		RenderManager.ensureInstance().pruneTiles();
+	}
+
+	static reclaimGraphicsMemory(): void {
+		RenderManager.ensureInstance().reclaimGraphicsMemory();
+	}
+
+	static discardAllCache(): void {
+		RenderManager.ensureInstance().discardAllCache();
+	}
+
+	static tileCount(): number {
+		return RenderManager.ensureInstance().tileCount();
+	}
+
+	static isValidTile(coords: TileCoordData): boolean {
+		return RenderManager.ensureInstance().isValidTile(coords);
+	}
+
+	static redraw(): RenderManagerBase {
+		return RenderManager.ensureInstance().redraw();
+	}
+
+	static update(zoom: number = null): void {
+		RenderManager.ensureInstance().update(zoom);
+	}
+
+	static onWorkerEndTransaction(e: any): void {
+		RenderManager.ensureInstance().onWorkerEndTransaction(e);
+	}
+
+	static onWorkerError(e: any): void {
+		RenderManager.ensureInstance().onWorkerError(e);
+	}
+
+	static updateOnChangePart(): void {
+		RenderManager.ensureInstance().updateOnChangePart();
+	}
+
+	static expandTileRange(range: cool.Bounds): cool.Bounds {
+		return RenderManager.ensureInstance().expandTileRange(range);
+	}
+
+	static pxBoundsToTileRange(bounds: any): cool.Bounds {
+		return RenderManager.ensureInstance().pxBoundsToTileRange(bounds);
+	}
+
+	static checkRequestTiles(
+		currentCoordList: TileCoordData[],
+		sendTileCombine: boolean = true,
+	): TileCoordData[] {
+		return RenderManager.ensureInstance().checkRequestTiles(
+			currentCoordList,
+			sendTileCombine,
+		);
+	}
+
+	static requestVisibleTiles(currentCoordList: TileCoordData[]): void {
+		RenderManager.ensureInstance().requestVisibleTiles(currentCoordList);
+	}
+
+	static updateFileBasedView(
+		checkOnly: boolean = false,
+		zoomFrameBounds: any = null,
+		forZoom: any = null,
+	): TileCoordData[] {
+		return RenderManager.ensureInstance().updateFileBasedView(
+			checkOnly,
+			zoomFrameBounds,
+			forZoom,
+		);
+	}
+
+	static invalidateTile(key: string, wireId: number): void {
+		RenderManager.ensureInstance().invalidateTile(key, wireId);
+	}
+
+	static touchImage(tile: Tile): void {
+		RenderManager.ensureInstance().touchImage(tile);
+	}
+
+	// vector rendering specific
+
+	static isVectorRendering(): boolean {
+		return RenderManager.ensureInstance().isVectorRendering();
+	}
+
+	static drawsFromObjects(): boolean {
+		return RenderManager.ensureInstance().drawsFromObjects();
+	}
+
+	static kind(): RenderManagerKind {
+		return RenderManager.ensureInstance().kind();
+	}
+
+	static heldBackChanges(): HeldBackChanges {
+		return RenderManager.ensureInstance().heldBackChanges();
+	}
+
+	static toEngine(message: string): string {
+		return RenderManager.ensureInstance().toEngine(message);
+	}
+
+	static drawsFromPrimitives(): boolean {
+		return RenderManager.ensureInstance().drawsFromPrimitives();
+	}
+
+	static predictTextInsert(text: string): boolean {
+		return RenderManager.ensureInstance().predictTextInsert(text);
+	}
+
+	static predictTextDelete(before: number, after: number): boolean {
+		return RenderManager.ensureInstance().predictTextDelete(before, after);
+	}
+
+	static keepPredictedCaret(update: cool.CaretUpdate): boolean {
+		return RenderManager.ensureInstance().keepPredictedCaret(update);
+	}
+
+	static canPredictAtCaret(): boolean {
+		return RenderManager.ensureInstance().canPredictAtCaret();
+	}
+
+	static moveCaretByCharacter(step: -1 | 1, extend: boolean = false): boolean {
+		return RenderManager.ensureInstance().moveCaretByCharacter(step, extend);
+	}
+
+	static moveCaretByWord(step: -1 | 1, extend: boolean = false): boolean {
+		return RenderManager.ensureInstance().moveCaretByWord(step, extend);
+	}
+
+	static moveCaretByLine(step: -1 | 1, extend: boolean = false): boolean {
+		return RenderManager.ensureInstance().moveCaretByLine(step, extend);
+	}
+
+	static startTextDrag(
+		x: number,
+		y: number,
+		hitId: number | undefined,
+	): boolean {
+		return RenderManager.ensureInstance().startTextDrag(x, y, hitId);
+	}
+
+	static dragTextTo(x: number, y: number): void {
+		RenderManager.ensureInstance().dragTextTo(x, y);
+	}
+
+	static endTextDrag(): void {
+		RenderManager.ensureInstance().endTextDrag();
+	}
+
+	static textDragLeavesItsText(x: number, y: number): boolean {
+		return RenderManager.ensureInstance().textDragLeavesItsText(x, y);
+	}
+
+	static textFrameAt(x: number, y: number): number | undefined {
+		return RenderManager.ensureInstance().textFrameAt(x, y);
+	}
+
+	static placeCaretAt(
+		x: number,
+		y: number,
+		hitId: number | undefined,
+	): boolean {
+		return RenderManager.ensureInstance().placeCaretAt(x, y, hitId);
+	}
+
+	static labelPointerAt(
+		x: number,
+		y: number,
+		hitId: number | undefined,
+	): string | undefined {
+		return RenderManager.ensureInstance().labelPointerAt(x, y, hitId);
+	}
+
+	static selectWordAt(
+		x: number,
+		y: number,
+		hitId: number | undefined,
+	): boolean {
+		return RenderManager.ensureInstance().selectWordAt(x, y, hitId);
+	}
+
+	static selectParagraphAt(
+		x: number,
+		y: number,
+		hitId: number | undefined,
+	): boolean {
+		return RenderManager.ensureInstance().selectParagraphAt(x, y, hitId);
+	}
+
+	static requestThumbnail(
+		id: cool.PreviewId,
+		part: number,
+		mode: number,
+		maxWidth: number,
+		maxHeight: number,
+	): void {
+		RenderManager.ensureInstance().requestThumbnail(
+			id,
+			part,
+			mode,
+			maxWidth,
+			maxHeight,
+		);
+	}
+
+	static requestPart(
+		part: number,
+		mode: number,
+	): cool.VectorPrimitivesData | undefined {
+		return RenderManager.ensureInstance().requestPart(part, mode);
+	}
+
+	static partIdAt(part: number, mode: number): cool.VectorPartGuid | undefined {
+		return RenderManager.ensureInstance().partIdAt(part, mode);
+	}
+
+	static renderInto(
+		context: CanvasRenderingContext2D,
+		data: cool.VectorPrimitivesData,
+		options?: cool.VectorRenderOptions,
+	): void {
+		RenderManager.ensureInstance().renderInto(context, data, options);
+	}
+
+	static renderObjectsWith(
+		context: CanvasRenderingContext2D,
+		data: cool.VectorPrimitivesData,
+		objectIds: number[],
+		matrix: cool.Matrix2D,
+	): void {
+		RenderManager.ensureInstance().renderObjectsWith(
+			context,
+			data,
+			objectIds,
+			matrix,
+		);
+	}
+
+	/*
+		Takes an object created here into the part, on top, as the engine is to report it: it is
+		drawn, hit and selected as any other, and the engine's entry of the same id replaces it.
+		Where none comes within that many milliseconds, it goes again. Answers whether it could.
+	*/
+	static addProvisionalObject(
+		partId: cool.VectorPartGuid,
+		object: cool.SlideObject,
+		wait: number,
+	): boolean {
+		return RenderManager.ensureInstance().addProvisionalObject(
+			partId,
+			object,
+			wait,
+		);
+	}
+
+	/*
+		Takes those objects, with the members of a group among them, out of the part as deleted
+		here, until the engine reports it. Where no report confirms it within that many
+		milliseconds, the part is asked for again. Answers whether it could.
+	*/
+	static deleteLocally(
+		partId: cool.VectorPartGuid,
+		objectIds: number[],
+		wait: number,
+	): boolean {
+		return RenderManager.ensureInstance().deleteLocally(
+			partId,
+			objectIds,
+			wait,
+		);
+	}
+
+	/// The engine refused a delete made here, the one of those objects where they are named, else
+	/// the oldest one; the objects come back as it has them.
+	static deleteRefused(objectIds?: number[]): void {
+		RenderManager.ensureInstance().deleteRefused(objectIds);
+	}
+
+	static renderPrimitives(
+		context: CanvasRenderingContext2D,
+		data: cool.VectorPrimitivesData,
+		primitives: cool.Primitive[],
+	): void {
+		RenderManager.ensureInstance().renderPrimitives(context, data, primitives);
+	}
+
+	static renderObjectParagraph(
+		context: CanvasRenderingContext2D,
+		data: cool.VectorPrimitivesData,
+		objectId: number,
+		paragraph: number,
+		options?: cool.ParagraphRenderOptions,
+	): void {
+		RenderManager.ensureInstance().renderObjectParagraph(
+			context,
+			data,
+			objectId,
+			paragraph,
+			options,
+		);
+	}
+
+	static renderPlaceholderAids(
+		context: CanvasRenderingContext2D,
+		data: cool.VectorPrimitivesData,
+	): void {
+		RenderManager.ensureInstance().renderPlaceholderAids(context, data);
+	}
+
+	static textColorOf(
+		data: cool.VectorPrimitivesData,
+		primitive:
+			cool.TextSimplePortionPrimitive | cool.TextDecoratedPortionPrimitive,
+	): string {
+		return RenderManager.ensureInstance().textColorOf(data, primitive);
+	}
+
+	static drawnElsewhere(objectIds: number[]): void {
+		RenderManager.ensureInstance().drawnElsewhere(objectIds);
+	}
+
+	static drawnElsewhereVersion(): number {
+		return RenderManager.ensureInstance().drawnElsewhereVersion();
+	}
+
+	static isPartDrawable(part: number, mode: number): boolean {
+		return RenderManager.ensureInstance().isPartDrawable(part, mode);
+	}
+
+	static requestPartById(
+		partId: cool.VectorPartGuid,
+		mode: number,
+	): cool.VectorPrimitivesData | undefined {
+		return RenderManager.ensureInstance().requestPartById(partId, mode);
+	}
+
+	static isPartDrawableById(
+		partId: cool.VectorPartGuid,
+		mode: number,
+	): boolean {
+		return RenderManager.ensureInstance().isPartDrawableById(partId, mode);
+	}
+
+	static isLayerVisible(layer: number): boolean {
+		return RenderManager.ensureInstance().isLayerVisible(layer);
+	}
+
+	/// The decoded image of that checksum, or undefined while there is none.
+	static imageFor(checksum: number): HTMLImageElement | undefined {
+		return RenderManager.ensureInstance().imageFor(checksum);
+	}
+
+	static onVectorChanged(callback: VectorChangeListener): void {
+		RenderManager._vectorListeners.push(callback);
+		RenderManager.ensureInstance().onVectorChanged(callback);
+	}
+
+	static offVectorChanged(callback: () => void): void {
+		const index = RenderManager._vectorListeners.indexOf(callback);
+		if (index >= 0) RenderManager._vectorListeners.splice(index, 1);
+		RenderManager.ensureInstance().offVectorChanged(callback);
+	}
+
+	/// Says that the objects the client holds changed here rather than at the engine.
+	static changedHere(): void {
+		RenderManager.ensureInstance().changedHere();
+	}
+
+	static handleVectorPrimitivesResponse(
+		values: cool.VectorPrimitivesResponse,
+	): void {
+		RenderManager.ensureInstance().handleVectorPrimitivesResponse(values);
+	}
+
+	static handleVectorRenderingGraphicsResponse(
+		values: cool.VectorRenderingGraphicsResponse,
+	): void {
+		RenderManager.ensureInstance().handleVectorRenderingGraphicsResponse(
+			values,
+		);
+	}
+
+	static handleVectorRenderingFontResponse(
+		values: cool.VectorRenderingFontResponse,
+	): void {
+		RenderManager.ensureInstance().handleVectorRenderingFontResponse(values);
+	}
+
+	static handleVectorPrimitivesDelta(
+		values: cool.VectorPrimitivesResponse,
+	): void {
+		RenderManager.ensureInstance().handleVectorPrimitivesDelta(values);
+	}
+
+	static partListChanged(): void {
+		RenderManager.ensureInstance().partListChanged();
+	}
+
+	static revalidateCachedParts(): void {
+		RenderManager.ensureInstance().revalidateCachedParts();
+	}
+
+	static forgetRequestsInFlight(): void {
+		RenderManager.ensureInstance().forgetRequestsInFlight();
+	}
+
+	static clearCachedPart(partId: cool.VectorPartGuid): void {
+		RenderManager.ensureInstance().clearCachedPart(partId);
+	}
+
+	static clearAllParts(): void {
+		RenderManager.ensureInstance().clearAllParts();
+	}
+
+	static refreshTheme(): void {
+		RenderManager.ensureInstance().refreshTheme();
+	}
+}
+
+window.RenderManager = RenderManager;

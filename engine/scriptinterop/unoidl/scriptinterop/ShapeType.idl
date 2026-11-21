@@ -1,0 +1,200 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** The geometric kind of a shape, named after the OOXML preset shapes.
+
+    No method reads or sets a shape kind yet.
+
+    @gas SlidesApp.ShapeType
+ */
+enum ShapeType
+{
+    UNSUPPORTED,
+    TEXT_BOX,
+    RECTANGLE,
+    ROUND_RECTANGLE,
+    ELLIPSE,
+    ARC,
+    BENT_ARROW,
+    BENT_UP_ARROW,
+    /** A rectangle with bevelled edges. */
+    BEVEL,
+    /** A thick curved band. */
+    BLOCK_ARC,
+    BRACE_PAIR,
+    BRACKET_PAIR,
+    /** A cylinder. */
+    CAN,
+    CHEVRON,
+    /** A circle segment cut off by a straight line. */
+    CHORD,
+    CLOUD,
+    /** An L-shaped corner. */
+    CORNER,
+    CUBE,
+    CURVED_DOWN_ARROW,
+    CURVED_LEFT_ARROW,
+    CURVED_RIGHT_ARROW,
+    CURVED_UP_ARROW,
+    DECAGON,
+    DIAGONAL_STRIPE,
+    DIAMOND,
+    DODECAGON,
+    DONUT,
+    /** A banner with two waves. */
+    DOUBLE_WAVE,
+    DOWN_ARROW,
+    DOWN_ARROW_CALLOUT,
+    /** A rectangle with a folded corner. */
+    FOLDED_CORNER,
+    FRAME,
+    /** Two sides of a rectangular frame. */
+    HALF_FRAME,
+    HEART,
+    HEPTAGON,
+    HEXAGON,
+    /** A pentagon shaped like an arrow pointing right. */
+    HOME_PLATE,
+    HORIZONTAL_SCROLL,
+    /** An explosion shape. */
+    IRREGULAR_SEAL_1,
+    /** A second explosion shape. */
+    IRREGULAR_SEAL_2,
+    LEFT_ARROW,
+    LEFT_ARROW_CALLOUT,
+    LEFT_BRACE,
+    LEFT_BRACKET,
+    LEFT_RIGHT_ARROW,
+    LEFT_RIGHT_ARROW_CALLOUT,
+    LEFT_RIGHT_UP_ARROW,
+    LEFT_UP_ARROW,
+    LIGHTNING_BOLT,
+    MATH_DIVIDE,
+    MATH_EQUAL,
+    MATH_MINUS,
+    MATH_MULTIPLY,
+    MATH_NOT_EQUAL,
+    MATH_PLUS,
+    MOON,
+    /** A circle with a slash through it. */
+    NO_SMOKING,
+    /** A right arrow with a notch in its tail. */
+    NOTCHED_RIGHT_ARROW,
+    OCTAGON,
+    PARALLELOGRAM,
+    PENTAGON,
+    PIE,
+    /** A rectangle with concave corners. */
+    PLAQUE,
+    /** A cross. */
+    PLUS,
+    QUAD_ARROW,
+    QUAD_ARROW_CALLOUT,
+    RIBBON,
+    RIBBON_2,
+    RIGHT_ARROW,
+    RIGHT_ARROW_CALLOUT,
+    RIGHT_BRACE,
+    RIGHT_BRACKET,
+    /** A rectangle with one rounded corner. */
+    ROUND_1_RECTANGLE,
+    /** A rectangle with two diagonally opposite rounded corners. */
+    ROUND_2_DIAGONAL_RECTANGLE,
+    /** A rectangle with two rounded corners on the same side. */
+    ROUND_2_SAME_RECTANGLE,
+    RIGHT_TRIANGLE,
+    SMILEY_FACE,
+    /** A rectangle with one cut corner. */
+    SNIP_1_RECTANGLE,
+    /** A rectangle with two diagonally opposite cut corners. */
+    SNIP_2_DIAGONAL_RECTANGLE,
+    /** A rectangle with two cut corners on the same side. */
+    SNIP_2_SAME_RECTANGLE,
+    /** A rectangle with one cut and one rounded corner. */
+    SNIP_ROUND_RECTANGLE,
+    STAR_10,
+    STAR_12,
+    STAR_16,
+    STAR_24,
+    STAR_32,
+    STAR_4,
+    STAR_5,
+    STAR_6,
+    STAR_7,
+    STAR_8,
+    /** A right arrow with stripes in its tail. */
+    STRIPED_RIGHT_ARROW,
+    SUN,
+    TRAPEZOID,
+    TRIANGLE,
+    UP_ARROW,
+    UP_ARROW_CALLOUT,
+    UP_DOWN_ARROW,
+    UTURN_ARROW,
+    VERTICAL_SCROLL,
+    /** A wave banner. */
+    WAVE,
+    /** An oval callout with a pointer. */
+    WEDGE_ELLIPSE_CALLOUT,
+    /** A rectangular callout with a pointer. */
+    WEDGE_RECTANGLE_CALLOUT,
+    /** A rounded rectangular callout with a pointer. */
+    WEDGE_ROUND_RECTANGLE_CALLOUT,
+    FLOW_CHART_ALTERNATE_PROCESS,
+    FLOW_CHART_COLLATE,
+    FLOW_CHART_CONNECTOR,
+    FLOW_CHART_DECISION,
+    FLOW_CHART_DELAY,
+    FLOW_CHART_DISPLAY,
+    FLOW_CHART_DOCUMENT,
+    FLOW_CHART_EXTRACT,
+    FLOW_CHART_INPUT_OUTPUT,
+    FLOW_CHART_INTERNAL_STORAGE,
+    FLOW_CHART_MAGNETIC_DISK,
+    FLOW_CHART_MAGNETIC_DRUM,
+    FLOW_CHART_MAGNETIC_TAPE,
+    FLOW_CHART_MANUAL_INPUT,
+    FLOW_CHART_MANUAL_OPERATION,
+    FLOW_CHART_MERGE,
+    FLOW_CHART_MULTIDOCUMENT,
+    FLOW_CHART_OFFLINE_STORAGE,
+    FLOW_CHART_OFFPAGE_CONNECTOR,
+    /** Flowchart: stored data. */
+    FLOW_CHART_ONLINE_STORAGE,
+    FLOW_CHART_OR,
+    FLOW_CHART_PREDEFINED_PROCESS,
+    FLOW_CHART_PREPARATION,
+    FLOW_CHART_PROCESS,
+    FLOW_CHART_PUNCHED_CARD,
+    FLOW_CHART_PUNCHED_TAPE,
+    FLOW_CHART_SORT,
+    FLOW_CHART_SUMMING_JUNCTION,
+    FLOW_CHART_TERMINATOR,
+    ARROW_EAST,
+    ARROW_NORTH_EAST,
+    ARROW_NORTH,
+    /** A speech bubble. */
+    SPEECH,
+    STARBURST,
+    TEARDROP,
+    /** A curved ribbon banner. */
+    ELLIPSE_RIBBON,
+    ELLIPSE_RIBBON_2,
+    CLOUD_CALLOUT,
+    /** A custom shape with no preset geometry. */
+    CUSTOM
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

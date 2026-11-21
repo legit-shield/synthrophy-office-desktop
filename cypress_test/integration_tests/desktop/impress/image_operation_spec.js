@@ -1,0 +1,251 @@
+/* global describe it require cy beforeEach */
+
+var helper = require('../../common/helper');
+var desktopHelper = require('../../common/desktop_helper');
+var { triggerNewSVGForShapeInTheCenter } = require('../../common/impress_helper');
+
+describe(['tagdesktop'], 'Image Operation Tests', function() {
+
+	beforeEach(function() {
+		helper.setupAndLoadDocument('impress/image_operation.odp');
+		desktopHelper.switchUIToNotebookbar();
+		cy.viewport(1920,1080);
+
+		cy.getFrameWindow().then((win) => {
+			helper.processToIdle(win);
+			this.win = win;
+		});
+	});
+
+	it('Insert/Delete image',function() {
+		helper.processToIdle(this.win);
+		desktopHelper.insertImage();
+
+		//make sure that image is in focus
+		cy.cGet('#document-container svg g')
+			.should('exist');
+
+		desktopHelper.deleteImage();
+	});
+
+	it('Insert an image whose file name has a space', function () {
+		helper.processToIdle(this.win);
+		cy.cGet('#document-container svg g').should('not.exist');
+
+		cy.getFrameWindow().then(function (win) {
+			cy.spy(win.app.socket, 'sendMessage').as('sendMessage');
+		});
+
+		desktopHelper.selectNotebookbarTab('Insert');
+		desktopHelper.getNbItem('InsertGraphic', 'Insert').should('not.have.attr', 'disabled');
+		desktopHelper.getNbIcon('InsertGraphic', 'Insert').click();
+		cy.cGet('#insertgraphic[type=file]').attachFile({
+			filePath: 'desktop/writer/image_to_insert.png',
+			fileName: 'image to insert.png',
+			encoding: 'binary',
+		});
+
+		// The insert command is one name and one type, so the space stays inside the name.
+		cy.get('@sendMessage').should('have.been.calledWithMatch',
+			/^insertfile name=\S*image%20to%20insert\.png type=graphic$/);
+		helper.processToIdle(this.win);
+
+		cy.cGet('#document-container svg g').should('exist');
+	});
+
+	it("Insert multimedia", function () {
+		helper.processToIdle(this.win);
+		desktopHelper.insertVideo();
+
+		// The video foreignObject lives inside a nested <svg> wrapper.
+		// Verify the wrapper has explicit dimensions so it does not
+		// fall back to the SVG default 300x150 and clip the video.
+		cy.cGet('#document-container svg svg').should('have.attr', 'width');
+		cy.cGet('#document-container svg svg').should('have.attr', 'height');
+		cy.cGet('#document-container svg svg foreignObject').then(function ($fo) {
+			var foWidth = $fo.attr('width');
+			var foHeight = $fo.attr('height');
+			cy.cGet('#document-container svg svg').should('have.attr', 'width', foWidth);
+			cy.cGet('#document-container svg svg').should('have.attr', 'height', foHeight);
+		});
+
+		// The view can fetch the video it shows.
+		cy.cGet('#document-container svg svg foreignObject video source')
+			.invoke('attr', 'src')
+			.then(function (src) {
+				cy.request(src).its('status').should('eq', 200);
+			});
+	});
+
+	it('Insert an animated GIF as multimedia', function () {
+		// An image picked through Insert Local Multimedia goes into the slide
+		// as a picture, so an animated GIF shows and keeps its animation.
+		helper.processToIdle(this.win);
+
+		cy.getFrameWindow().then(function (win) {
+			cy.spy(win.app.socket, 'sendMessage').as('sendMessage');
+		});
+
+		cy.cGet('#Insert-tab-label').click();
+		cy.cGet('#Insert-container .inline.insertmultimedia').click();
+		cy.cGet('#insertmultimedia[type=file]').attachFile(
+			'/desktop/impress/animated_to_insert.gif'
+		);
+
+		cy.get('@sendMessage').should('have.been.calledWithMatch',
+			/^insertfile name=\S+ type=graphic$/);
+		helper.processToIdle(this.win);
+
+		cy.cGet('#document-container svg g').should('exist');
+		cy.cGet('#document-container svg foreignObject video').should('not.exist');
+	});
+
+	it('Animated GIF overlays stay off the master view', function () {
+		var win = this.win;
+		helper.processToIdle(win);
+
+		cy.cGet('#Insert-tab-label').click();
+		cy.cGet('#Insert-container .inline.insertmultimedia').click();
+		cy.cGet('#insertmultimedia[type=file]').attachFile(
+			'/desktop/impress/animated_to_insert.gif'
+		);
+
+		// The animated image plays as an overlay section over the slide.
+		cy.cGet('[id^="test-div-AnimatedGif-"]').should('exist');
+
+		// The master view shows the master page under the same part number,
+		// which carries no animated image of its own.
+		cy.then(function () {
+			win.app.map.sendUnoCommand('.uno:SlideMasterPage');
+		});
+		cy.cGet('[id^="test-div-AnimatedGif-"]').should('not.exist');
+
+		// Back in the normal view nothing is selected, so the image stands
+		// still until it is selected again.
+		cy.then(function () {
+			win.app.map.sendUnoCommand('.uno:CloseMasterView');
+		});
+		helper.processToIdle(win);
+		cy.cGet('[id^="test-div-AnimatedGif-"]').should('not.exist');
+		cy.then(function () {
+			win.app.map.sendUnoCommand('.uno:SelectAll');
+		});
+		cy.cGet('[id^="test-div-AnimatedGif-"]').should('exist');
+	});
+
+	it('Animated GIF plays only while it is selected', function () {
+		var win = this.win;
+		helper.processToIdle(win);
+
+		cy.cGet('#Insert-tab-label').click();
+		cy.cGet('#Insert-container .inline.insertmultimedia').click();
+		cy.cGet('#insertmultimedia[type=file]').attachFile(
+			'/desktop/impress/animated_to_insert.gif'
+		);
+
+		// The inserted image is selected, so it plays as an overlay section.
+		cy.cGet('[id^="test-div-AnimatedGif-"]').should('exist');
+
+		// Once deselected the tiles show its first frame and the overlay goes.
+		helper.typeIntoDocument('{esc}');
+		cy.cGet('[id^="test-div-AnimatedGif-"]').should('not.exist');
+
+		cy.then(function () {
+			win.app.map.sendUnoCommand('.uno:SelectAll');
+		});
+		cy.cGet('[id^="test-div-AnimatedGif-"]').should('exist');
+	});
+
+	it('Insert multimedia from WOPI URL shows progress feedback', function () {
+		// Inserting a remote video shows a busy popup while the kit
+		// downloads it, and the popup is cleared once the insert finishes.
+		helper.processToIdle(this.win);
+
+		cy.getFrameWindow().then(function (win) {
+			cy.stub(win.app.socket, 'sendMessage').as('insertMessage');
+			// Skip the getchildid round-trip so _sendURL runs synchronously.
+			win.app.map.fileInserter._childId = 'cypress-child';
+			win.app.map.insertURL('http://example.invalid/video.mp4', 'multimediaurl');
+		});
+
+		cy.get('@insertMessage').should('have.been.calledWithMatch', 'type=multimediaurl');
+
+		const BUSY_POPUP_DELAY_MS = 1500;
+		cy.cGet('#busypopup', { timeout: BUSY_POPUP_DELAY_MS }).should('exist');
+
+		// The kit reports the insert finished.
+		cy.getFrameWindow().then(function (win) {
+			win.app.socket._onMessage({
+				textMsg: 'unocommandresult: {"commandName":".uno:InsertAVMedia","success":"true"}',
+			});
+		});
+
+		cy.cGet('#busypopup').should('not.exist');
+	});
+
+	it.skip('Crop Image', function () {
+		desktopHelper.insertImage();
+		helper.assertImageSize(438, 111);
+
+		cy.cGet('#Crop').should('be.visible');
+		cy.cGet('#Crop').click();
+
+		cy.cGet('#test-div-shape-handle-3').then(($handle) => {
+			const rect = $handle[0].getBoundingClientRect();
+			const startX = rect.left + rect.width / 2;
+			const startY = rect.top + rect.height / 2;
+			const moveX = 20;
+
+			cy.cGet('body').realMouseDown({ x: startX, y: startY });
+			cy.cGet('body').realMouseMove(startX + moveX, startY);
+			cy.cGet('body').realMouseUp();
+		});
+
+		cy.cGet('#canvas-container > svg').should('exist');
+		cy.cGet('#test-div-shape-handle-3').should('exist');
+		helper.assertImageSize(418, 111);
+	});
+
+
+	it('Resize image when keep ratio option enabled and disabled', function() {
+		cy.cGet('#optionstoolboxdown .unoModifyPage button').click();	
+		cy.cGet('#sidebar-panel').should('not.be.visible');
+		
+		desktopHelper.insertImage();
+		//when Keep ratio is unchecked
+		helper.assertImageSize(438, 111);
+		cy.viewport(1000,660);
+
+		cy.cGet('#optionstoolboxdown .unoModifyPage button').click();
+		cy.cGet('#sidebar-panel').should('be.visible');
+
+		cy.cGet('#sidebar-dock-wrapper').should('be.visible');
+		helper.processToIdle(this.win);
+
+		cy.cGet('.ui-expander-label').contains('Position and Size')
+			.scrollIntoView().should('be.visible').click();
+
+		cy.cGet('#selectwidth input').type('{selectAll}{backspace}10{enter}');
+
+		cy.cGet('#selectheight input').type('{selectAll}{backspace}4{enter}');
+
+		triggerNewSVGForShapeInTheCenter();
+
+		helper.assertImageSize(322, 129);
+
+		//Keep ratio checked
+		cy.cGet('#sidebar-dock-wrapper').should('be.visible');
+		helper.processToIdle(this.win);
+
+		cy.cGet('.ui-expander-label').contains('Position and Size')
+			.scrollIntoView().should('be.visible').click();
+
+		cy.cGet('#ratio input').check();
+
+		cy.cGet('#selectheight input').type('{selectAll}{backspace}5{enter}');
+
+		triggerNewSVGForShapeInTheCenter();
+
+		helper.assertImageSize(402, 161);
+	});
+});

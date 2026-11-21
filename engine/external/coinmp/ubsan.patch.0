@@ -1,0 +1,93 @@
+--- Cbc/src/CbcHeuristic.cpp
++++ Cbc/src/CbcHeuristic.cpp
+@@ -1143,7 +1143,7 @@
+               1.0e50,
+               false);
+             model.setSolutionCount(1);
+-            maximumSolutions++;
++            if (maximumSolutions < COIN_INT_MAX) maximumSolutions++;
+             delete[] bestSolution2;
+           }
+         } else {
+--- Cbc/src/CbcModel.cpp
++++ Cbc/src/CbcModel.cpp
+@@ -7457,7 +7457,7 @@
+   // and before any changes
+   temp = virginGenerator_;
+   virginGenerator_ = new CbcCutGenerator *[numberCutGenerators_ + 1];
+-  memcpy(virginGenerator_, temp, numberCutGenerators_ * sizeof(CbcCutGenerator *));
++  if (numberCutGenerators_ != 0) memcpy(virginGenerator_, temp, numberCutGenerators_ * sizeof(CbcCutGenerator *));
+   delete[] temp;
+   virginGenerator_[numberCutGenerators_++] = new CbcCutGenerator(this, generator, howOften, name,
+     normal, atSolution, whenInfeasible, howOftenInSub,
+@@ -11869,7 +11869,7 @@
+   }
+   delete[] mark;
+   // Now append other objects
+-  memcpy(object_ + numberIntegers_, oldObject, nObjects * sizeof(OsiObject *));
++  if (nObjects != 0) memcpy(object_ + numberIntegers_, oldObject, nObjects * sizeof(OsiObject *));
+   // Delete old array (just array)
+   delete[] oldObject;
+ 
+--- Cgl/src/CglGomory/CglGomory.cpp
++++ Cgl/src/CglGomory/CglGomory.cpp
+@@ -2,6 +2,8 @@
+ // Corporation and others.  All Rights Reserved.
+ // This code is licensed under the terms of the Eclipse Public License (EPL).
+ 
++#include <algorithm>
++#include <limits>
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cmath>
+@@ -1311,7 +1313,7 @@
+ 	      for (j=0; j<number+1;j++) {
+ 		double value = fabs(packed[j]);
+ 		double dxInt = value*multiplier;
+-		xInt[j]= static_cast<int> (dxInt+0.5); 
++		xInt[j]= static_cast<int> (std::min<double>(std::max<double>(dxInt, std::numeric_limits<int>::min()), std::numeric_limits<int>::max())+0.5);
+ #if CGL_DEBUG>1
+ 		printf("%g => %g   \n",value,dxInt);
+ #endif
+--- Cgl/src/CglPreProcess/CglPreProcess.cpp
++++ Cgl/src/CglPreProcess/CglPreProcess.cpp
+@@ -6567,7 +6567,7 @@
+ {
+   CglCutGenerator **temp = generator_;
+   generator_ = new CglCutGenerator *[numberCutGenerators_ + 1];
+-  memcpy(generator_, temp, numberCutGenerators_ * sizeof(CglCutGenerator *));
++  if (numberCutGenerators_ != 0) memcpy(generator_, temp, numberCutGenerators_ * sizeof(CglCutGenerator *));
+   delete[] temp;
+   generator_[numberCutGenerators_++] = generator->clone();
+ }
+--- Clp/src/ClpParameters.hpp
++++ Clp/src/ClpParameters.hpp
+@@ -83,7 +83,7 @@
+ inline void
+ ClpDisjointCopyN(const T *array, const CoinBigIndex size, T *newArray)
+ {
+-  memcpy(reinterpret_cast< void * >(newArray), array, size * sizeof(T));
++  if (size != 0) memcpy(reinterpret_cast< void * >(newArray), array, size * sizeof(T));
+ }
+ /// And set
+ template < class T >
+--- Clp/src/ClpSimplex.cpp
++++ Clp/src/ClpSimplex.cpp
+@@ -2557,14 +2557,14 @@
+       numberTotal = 2 * (maximumInternalColumns_ + maximumInternalRows_);
+     }
+     lower_ = ClpCopyOfArray(rhs.lower_, numberTotal);
+-    rowLowerWork_ = lower_ + numberColumns_;
++    rowLowerWork_ = lower_ == nullptr ? nullptr : lower_ + numberColumns_;
+     columnLowerWork_ = lower_;
+     upper_ = ClpCopyOfArray(rhs.upper_, numberTotal);
+-    rowUpperWork_ = upper_ + numberColumns_;
++    rowUpperWork_ = upper_ == nullptr ? nullptr : upper_ + numberColumns_;
+     columnUpperWork_ = upper_;
+     cost_ = ClpCopyOfArray(rhs.cost_, numberTotal);
+     objectiveWork_ = cost_;
+-    rowObjectiveWork_ = cost_ + numberColumns_;
++    rowObjectiveWork_ = cost_ == nullptr ? nullptr : cost_ + numberColumns_;
+     dj_ = ClpCopyOfArray(rhs.dj_, numberTotal);
+     if (dj_) {
+       reducedCostWork_ = dj_;

@@ -1,0 +1,42 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+interface XTextRange;
+
+/** A paragraph of the text in a shape or table cell.
+
+    @gas Paragraph
+ */
+interface XTextParagraph : XBase
+{
+    /** Returns the index of the newline that ends the paragraph, counted from the start of the
+        whole text, or null when the paragraph has been deleted.
+
+        @unimplemented
+        @gas Paragraph.getIndex
+     */
+    com::sun::star::beans::Optional<long> getIndex();
+
+    /** The range covers the whole paragraph as it is when this is called, followed by the
+        newline of the paragraph. For an empty paragraph the range is a position in it. The
+        paragraph is found by its position among the paragraphs of the text, so the result is
+        null once the text has fewer paragraphs than that.
+
+        @gas Paragraph.getRange
+     */
+    com::sun::star::beans::Optional<XTextRange> getRange();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

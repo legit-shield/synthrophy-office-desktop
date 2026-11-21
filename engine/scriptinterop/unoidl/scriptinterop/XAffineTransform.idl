@@ -1,0 +1,51 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+interface XAffineTransformBuilder;
+
+/** A two-dimensional affine transform, a fixed set of six numbers.
+
+    The transform maps a point (x, y) to the point
+    (scaleX * x + shearX * y + translateX, shearY * x + scaleY * y + translateY). A transform
+    cannot be changed. Make a modified copy with toBuilder. Page elements do not read or apply
+    transforms yet.
+
+    @gas AffineTransform
+ */
+interface XAffineTransform : XBase
+{
+    /** @gas AffineTransform.getScaleX */
+    double getScaleX();
+
+    /** @gas AffineTransform.getScaleY */
+    double getScaleY();
+
+    /** @gas AffineTransform.getShearX */
+    double getShearX();
+
+    /** @gas AffineTransform.getShearY */
+    double getShearY();
+
+    /** @gas AffineTransform.getTranslateX */
+    double getTranslateX();
+
+    /** @gas AffineTransform.getTranslateY */
+    double getTranslateY();
+
+    /** @gas AffineTransform.toBuilder */
+    XAffineTransformBuilder toBuilder();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

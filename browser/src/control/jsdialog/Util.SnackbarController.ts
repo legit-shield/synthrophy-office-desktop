@@ -1,0 +1,312 @@
+// @ts-strict-ignore
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * Util.SnackbarController - helper for managing the snackbars queue
+ */
+
+declare var JSDialog: any;
+
+type SnackbarData = {
+	label: string;
+	action: string | undefined;
+	callback: () => void | undefined;
+	timeout: number;
+	hasProgress: boolean | undefined;
+	withDismiss: boolean | undefined;
+	infinite: boolean | undefined;
+	// True when the action button takes the keyboard focus as the snackbar appears.
+	focusAction: boolean;
+};
+
+class SnackbarController {
+	snackbarTimeout: number = 10000;
+	snackbarQueue: Array<SnackbarData>;
+	showingSnackbar: boolean = false;
+	// The label of the snackbar that shows now, or null when none shows.
+	private shownLabel: string | null = null;
+	private liveRegion: HTMLElement = null;
+	private fadeOutTimer: ReturnType<typeof setTimeout> = null;
+
+	constructor() {
+		this.snackbarQueue = new Array<SnackbarData>();
+	}
+
+	private writeLiveRegion(label: string) {
+		if (!this.liveRegion)
+			this.liveRegion = document.getElementById('snackbar-live-region');
+
+		const region = this.liveRegion;
+		if (!region) return;
+
+		app.layoutingService.appendLayoutingTask(() => {
+			region.textContent = label;
+		});
+	}
+
+	// Sends the close for the snackbar dialog. The dialog removal calls back
+	// into onSnackbarRemoved, which is where the queue state is reset.
+	private removeSnackbar() {
+		var closeMessage = {
+			id: 'snackbar',
+			jsontype: 'dialog',
+			type: 'snackbar',
+			action: 'close',
+		};
+		app.socket._onMessage({
+			textMsg: 'jsdialog: ' + JSON.stringify(closeMessage),
+		});
+	}
+
+	// The snackbar dialog is gone from the DOM
+	public onSnackbarRemoved() {
+		app.timerRegistry.clearTimeout(this.fadeOutTimer);
+		this.fadeOutTimer = null;
+
+		this.showingSnackbar = false;
+		this.shownLabel = null;
+		this.writeLiveRegion('');
+		this.scheduleSnackbar();
+	}
+
+	// Drops the snackbars that wait for the one on screen to close.
+	public clearQueue() {
+		this.snackbarQueue = [];
+	}
+
+	public closeSnackbar(byUser: boolean = false) {
+		const snackbar = document.getElementById('snackbar');
+		if (byUser || !snackbar) {
+			this.removeSnackbar();
+			return;
+		}
+
+		if (this.fadeOutTimer !== null) return;
+
+		let timer: ReturnType<typeof setTimeout> = null;
+		const onAnimationEnd = (event: AnimationEvent) => {
+			if (event.target === snackbar) finishFadeOut();
+		};
+		const finishFadeOut = () => {
+			snackbar.removeEventListener('animationend', onAnimationEnd);
+			if (this.fadeOutTimer === timer) this.removeSnackbar();
+		};
+
+		snackbar.classList.remove('fadein');
+		snackbar.classList.add('snackbar-leaving');
+		snackbar.addEventListener('animationend', onAnimationEnd);
+		timer = this.fadeOutTimer = app.timerRegistry.setTimeout(
+			'snackbar-fadeout',
+			finishFadeOut,
+			window.L.DomUtil.getDurationMs('--duration-fast') + 100,
+		);
+	}
+
+	// A snackbar with the given label shows now, or waits in the queue to show.
+	public hasSnackbar(label: string): boolean {
+		return (
+			(this.showingSnackbar && this.shownLabel === label) ||
+			this.snackbarQueue.some((data) => data.label === label)
+		);
+	}
+
+	// Close the snackbar with the given label, or take it out of the queue. A snackbar with another
+	// label stays.
+	public closeSnackbarWithLabel(label: string) {
+		this.snackbarQueue = this.snackbarQueue.filter(
+			(data) => data.label !== label,
+		);
+		if (this.showingSnackbar && this.shownLabel === label) this.closeSnackbar();
+	}
+
+	public showSnackbar(
+		label: string,
+		action: string | undefined,
+		callback: () => void | undefined,
+		timeout: number | undefined,
+		hasProgress: boolean | undefined,
+		withDismiss: boolean | undefined,
+		infinite: boolean | undefined,
+		focusAction: boolean = true,
+	) {
+		if (!app.socket) return;
+
+		this.snackbarQueue.push({
+			label: label,
+			action: action,
+			callback: callback,
+			timeout: timeout,
+			hasProgress: hasProgress,
+			withDismiss: withDismiss,
+			infinite: infinite,
+			focusAction: focusAction,
+		});
+
+		this.scheduleSnackbar();
+	}
+
+	private extractTimeout(snackbarData: SnackbarData): number {
+		return snackbarData.timeout || this.snackbarTimeout;
+	}
+
+	private scheduleSnackbar() {
+		if (this.showingSnackbar || !this.snackbarQueue.length) return;
+
+		const snackbarData = this.snackbarQueue.shift();
+		this.showSnackbarImpl(snackbarData);
+		this.showingSnackbar = true;
+		this.shownLabel = snackbarData.label;
+	}
+
+	private showSnackbarImpl(snackbarData: SnackbarData) {
+		var buttonId = 'button';
+		var labelId = 'label';
+
+		if (!snackbarData.action) this.writeLiveRegion(snackbarData.label);
+
+		const dismissButton = snackbarData.action
+			? {
+					id: 'snackbar-dismiss-button',
+					type: 'pushbutton',
+					text: '',
+					icon: 'lc_cancel.svg',
+					aria: { label: _('Dismiss') },
+				}
+			: {
+					id: 'snackbar-dismiss-button',
+					type: 'pushbutton',
+					text: _('Dismiss'),
+				};
+
+		var json = {
+			id: 'snackbar',
+			jsontype: 'dialog',
+			type: 'snackbar',
+			timeout: this.extractTimeout(snackbarData),
+			init_focus_id:
+				snackbarData.action && snackbarData.focusAction ? buttonId : undefined,
+			children: [
+				{
+					id: snackbarData.hasProgress
+						? 'snackbar-container-progress'
+						: 'snackbar-container',
+					type: 'container',
+					children: [
+						snackbarData.action
+							? {
+									id: labelId,
+									type: 'fixedtext',
+									text: snackbarData.label,
+									labelFor: buttonId,
+								}
+							: {
+									id: 'label-no-action',
+									type: 'fixedtext',
+									text: snackbarData.label,
+								},
+						snackbarData.hasProgress
+							? {
+									id: 'progress',
+									type: 'progressbar',
+									value: 0,
+									maxValue: 100,
+									infinite: snackbarData.infinite,
+								}
+							: {},
+						snackbarData.action
+							? {
+									id: buttonId,
+									type: 'pushbutton',
+									text: snackbarData.action,
+									labelledBy: labelId,
+								}
+							: {},
+						snackbarData.withDismiss ? dismissButton : {},
+					],
+				},
+			],
+		};
+
+		var builderCallback: JSDialogCallback = (
+			objectType: string,
+			eventType: string,
+			object: any,
+			data: any,
+			builder: JSBuilder,
+		) => {
+			window.app.console.debug(
+				"control: '" +
+					objectType +
+					"' id:'" +
+					object.id +
+					"' event: '" +
+					eventType +
+					"' state: '" +
+					data +
+					"'",
+			);
+
+			if (
+				object.id === buttonId &&
+				objectType === 'pushbutton' &&
+				eventType === 'click'
+			) {
+				if (typeof snackbarData.callback === 'function')
+					snackbarData.callback();
+
+				this.closeSnackbar(true);
+			} else if (
+				object.id === '__POPOVER__' &&
+				objectType === 'popover' &&
+				eventType === 'close'
+			) {
+				this.closeSnackbar(true);
+			}
+
+			if (
+				object.id === 'snackbar-dismiss-button' &&
+				objectType === 'pushbutton' &&
+				eventType === 'click'
+			) {
+				this.closeSnackbar(true);
+			}
+		};
+
+		app.socket._onMessage({
+			textMsg: 'jsdialog: ' + JSON.stringify(json),
+			callback: builderCallback,
+		});
+	}
+
+	// value should be in range 0-100
+	public setSnackbarProgress(value: number, infinite: boolean) {
+		if (!app.socket) return;
+
+		var json = {
+			id: 'snackbar',
+			jsontype: 'dialog',
+			type: 'snackbar',
+			action: 'update',
+			control: {
+				id: 'progress',
+				type: 'progressbar',
+				value: value,
+				maxValue: 100,
+				infinite: infinite,
+			},
+		};
+
+		app.socket._onMessage({ textMsg: 'jsdialog: ' + JSON.stringify(json) });
+	}
+}
+
+JSDialog.SnackbarController = new SnackbarController();

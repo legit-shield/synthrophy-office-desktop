@@ -1,0 +1,82 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following license notice:
+ *
+ *   Licensed to the Apache Software Foundation (ASF) under one or more
+ *   contributor license agreements. See the NOTICE file distributed
+ *   with this work for additional information regarding copyright
+ *   ownership. The ASF licenses this file to you under the Apache
+ *   License, Version 2.0 (the "License"); you may not use this file
+ *   except in compliance with the License. You may obtain a copy of
+ *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+ */
+
+#ifndef INCLUDED_SW_SOURCE_CORE_ACCESS_ACCSELECTIONHELPER_HXX
+#define INCLUDED_SW_SOURCE_CORE_ACCESS_ACCSELECTIONHELPER_HXX
+
+#include <vector>
+#include <sal/types.h>
+#include <cpo/uno/Reference.h>
+
+namespace com::sun::star::accessibility { class XAccessible; }
+
+class SwAccessibleContext;
+class SwFEShell;
+
+namespace sw::access { class SwAccessibleChild; }
+
+class SwAccessibleSelectionHelper
+{
+    /// the context on which this helper works
+    SwAccessibleContext& m_rContext;
+
+    /// get FE-Shell
+    SwFEShell* GetFEShell();
+
+    /// @throws css::lang::IndexOutOfBoundsException
+    void throwIndexOutOfBoundsException();
+
+    /// The accessible children of the context that stand for the selected fly frames: a fly
+    /// frame whose accessible parent is the context, or, for a fly frame anchored as
+    /// character, the paragraph that holds it where that paragraph is a child of the context.
+    /// Selected fly frames that belong to another context are left out.
+    std::vector<sw::access::SwAccessibleChild> getSelectedFlyChildren(const SwFEShell& rShell) const;
+
+public:
+    SwAccessibleSelectionHelper( SwAccessibleContext& rContext );
+
+    // XAccessibleSelection
+
+    /// @throws css::lang::IndexOutOfBoundsException
+    /// @throws cpo::uno::RuntimeException
+    void selectAccessibleChild(
+        sal_Int64 nChildIndex );
+
+    /// @throws css::lang::IndexOutOfBoundsException
+    /// @throws cpo::uno::RuntimeException
+    bool isAccessibleChildSelected(
+        sal_Int64 nChildIndex );
+    /// @throws cpo::uno::RuntimeException
+    void selectAllAccessibleChildren(  );
+    /// @throws cpo::uno::RuntimeException
+    sal_Int64 getSelectedAccessibleChildCount(  );
+    /// @throws css::lang::IndexOutOfBoundsException
+    /// @throws cpo::uno::RuntimeException
+    cpo::uno::Reference< css::accessibility::XAccessible > getSelectedAccessibleChild(
+        sal_Int64 nSelectedChildIndex );
+    // index has to be treated as global child index.
+    /// @throws css::lang::IndexOutOfBoundsException
+    /// @throws cpo::uno::RuntimeException
+    void deselectAccessibleChild(
+        sal_Int64 nChildIndex );
+};
+
+#endif
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

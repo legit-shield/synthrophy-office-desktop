@@ -1,0 +1,68 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#ifndef INCLUDED_TOOLS_HOSTFILTER_HXX
+#define INCLUDED_TOOLS_HOSTFILTER_HXX
+
+#include <rtl/ustring.hxx>
+#include <tools/toolsdllapi.h>
+
+// Helper for filtering allowed hosts for remote connections
+
+class TOOLS_DLLPUBLIC HostFilter
+{
+public:
+    /// A newline-separated list of allowed hosts. Each entry is either a
+    /// network in CIDR notation (10.0.0.0/8, fd00::/8), which allows any
+    /// host that is an IP address inside it, or a regular expression that
+    /// an allowed host name must match in full. IPv4 networks also cover
+    /// the IPv4-mapped IPv6 spelling of their addresses. A null pointer
+    /// disables the filter, and an empty list allows no hosts.
+    static void setAllowedHosts(const char* sAllowlist);
+
+    static void setAllowedHostsExemptVerifyHost(bool allowedHostExceptVerifyHost);
+
+    /// The host name of the server the document was loaded from. When an allowlist is set, this
+    /// host is allowed as well, compared without regard to ASCII case. Empty means no such host.
+    static void setDocumentHost(const OUString& rDocumentHost);
+
+    /// Return true when a host allowlist is configured and rHost is neither
+    /// matched by a regular expression nor inside an allowed network.
+    static bool isForbidden(const OUString& rHost);
+
+    static void setExemptVerifyHost(const OUString& rExemptVerifyHost);
+
+    static bool isExemptVerifyHost(const std::u16string_view rHost);
+
+    /// A colon-separated list of directory paths that file:// external
+    /// references are allowed to reach. An empty string means:
+    /// "block all file URLs"
+    ///
+    /// This is just an advisory list to prevent the user from creating links
+    /// to files in their document's jail because those files will not be there
+    /// when the document is reopened in a new jail.
+    static void setAllowedExtRefPaths(const char* sPaths);
+
+    /// Reset AllowedExtRefPaths as if it was never called, back to
+    /// default allow all state.
+    static void resetAllowedExtRefPaths();
+
+    /// Return true when rFileUrl is a file:// URL that is outside any
+    /// directory registered with setAllowedExtRefPaths. Non-file URLs
+    /// are always allowed.
+    static bool isFileUrlForbidden(const OUString& rFileUrl);
+
+    /// Return true when rUrl has an exotic protocol, is a file URL that isFileUrlForbidden, or is
+    /// any other URL whose host isForbidden.
+    static bool isUrlForbidden(const OUString& rUrl);
+};
+
+#endif
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

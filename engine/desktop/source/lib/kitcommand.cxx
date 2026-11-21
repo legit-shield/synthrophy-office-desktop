@@ -1,0 +1,105 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include "kitcommand.hxx"
+
+#include <map>
+
+#include <rtl/ustring.hxx>
+#include <sfx2/bindings.hxx>
+#include <sfx2/kit/helper.hxx>
+#include <sfx2/viewfrm.hxx>
+#include <sfx2/viewsh.hxx>
+#include <svx/VectorObjectContent.hxx>
+#include <svx/svdview.hxx>
+#include <vcl/ITiledRenderable.hxx>
+
+namespace kitcommand
+{
+bool setTextCursor(SfxViewShell& rViewShell, vcl::ITiledRenderable* pDocument,
+                   std::u16string_view aCommand)
+{
+    const std::map<OUString, OUString> aParameters = KitHelper::parseCommandParameters(aCommand);
+    const auto aObjectIterator = aParameters.find(u"object"_ustr);
+    const auto aParagraphIterator = aParameters.find(u"paragraph"_ustr);
+    const auto aIndexIterator = aParameters.find(u"index"_ustr);
+    if (aObjectIterator == aParameters.end() || aParagraphIterator == aParameters.end()
+        || aIndexIterator == aParameters.end())
+        return false;
+
+    const sal_uInt64 nObject = aObjectIterator->second.toUInt64();
+    const sal_Int32 nParagraph = aParagraphIterator->second.toInt32();
+    const sal_Int32 nIndex = aIndexIterator->second.toInt32();
+    const auto aAnchorParagraphIterator = aParameters.find(u"anchorparagraph"_ustr);
+    const auto aAnchorIndexIterator = aParameters.find(u"anchorindex"_ustr);
+    const bool bHasAnchor = aAnchorParagraphIterator != aParameters.end()
+                            && aAnchorIndexIterator != aParameters.end();
+    const sal_Int32 nAnchorParagraph
+        = bHasAnchor ? aAnchorParagraphIterator->second.toInt32() : nParagraph;
+    const sal_Int32 nAnchorIndex = bHasAnchor ? aAnchorIndexIterator->second.toInt32() : nIndex;
+
+    // An object active in place, such as a chart, runs its text edit in a view of its own.
+    SdrObjEditView* pDrawView = rViewShell.GetDrawView();
+    if (!pDrawView || !pDrawView->IsTextEdit())
+    {
+        if (SdrObjEditView* pInPlaceView = svx::vector::inPlaceTextEditOf(rViewShell))
+            pDrawView = pInPlaceView;
+    }
+
+    // The states that follow the caret, such as its font, are computed again.
+    if ((pDrawView
+         && pDrawView->SetKitTextCursor(nObject, nParagraph, nIndex, nAnchorParagraph,
+                                        nAnchorIndex))
+        || (pDocument
+            && pDocument->setKitTextCursor(rViewShell, nObject, nParagraph, nIndex,
+                                           nAnchorParagraph, nAnchorIndex)))
+    {
+        rViewShell.GetViewFrame().GetBindings().InvalidateAll(false);
+        return true;
+    }
+    return false;
+}
+
+void setCellCursor(SfxViewShell& rViewShell, std::u16string_view aCommand)
+{
+    const std::map<OUString, OUString> aParams = KitHelper::parseCommandParameters(aCommand);
+    const auto itPart = aParams.find(u"part"_ustr);
+    const auto itCol = aParams.find(u"col"_ustr);
+    const auto itRow = aParams.find(u"row"_ustr);
+    if (itPart == aParams.end() || itCol == aParams.end() || itRow == aParams.end())
+        // not all required parameters are given - bail out
+        return;
+
+    const sal_Int32 nPart = itPart->second.toInt32();
+    SfxCellPosition aCell;
+    aCell.nCol = itCol->second.toInt32();
+    aCell.nRow = itRow->second.toInt32();
+
+    // An anchor position is not given for a regular cell cursor. For a range
+    // selection, the anchor point is the start of the selection while the cell
+    // cursor is the diagonally opposed "front" of it.
+    SfxCellPosition aAnchor;
+    const SfxCellPosition* pAnchor = nullptr;
+    const auto itAnchorCol = aParams.find(u"anchorcol"_ustr);
+    const auto itAnchorRow = aParams.find(u"anchorrow"_ustr);
+    if (itAnchorCol != aParams.end() && itAnchorRow != aParams.end())
+    {
+        // This is a range selection.
+        aAnchor.nCol = itAnchorCol->second.toInt32();
+        aAnchor.nRow = itAnchorRow->second.toInt32();
+        pAnchor = &aAnchor;
+    }
+
+    rViewShell.setKitCellCursor(nPart, aCell, pAnchor);
+}
+}
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

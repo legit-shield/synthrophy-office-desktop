@@ -1,0 +1,42 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** The response to an HTTP request made with urlFetch.
+
+    @internal
+
+    @gas HTTPResponse
+ */
+struct HttpResponse {
+    /** The HTTP status code, or 0 when the request failed (and error says why) or when a
+        redirect was not followed (and error is empty).
+     */
+    long code;
+    /** The names of the response headers, in lower case, in the same order as headerValues.
+     */
+    sequence<string> headerNames;
+    /** A header that the server sent more than once comes as one value, the values joined with
+        ", ".
+     */
+    sequence<string> headerValues;
+    /** The response body, as base64.
+     */
+    string body;
+    /** The error message when the request failed, or '' when it got a response.
+     */
+    string error;
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

@@ -1,0 +1,43 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** How the text of a shape is fitted to the shape.
+
+    @gas Autofit
+ */
+interface XAutofit : XBase
+{
+    /** @unimplemented @gas Autofit.disableAutofit */
+    XAutofit disableAutofit();
+
+    /** @unimplemented @gas Autofit.getAutofitType */
+    AutofitType getAutofitType();
+
+    /** Returns the factor that the font sizes are scaled by, where 1 means no scaling.
+
+        @unimplemented
+        @gas Autofit.getFontScale
+     */
+    double getFontScale();
+
+    /** Returns how much the line spacing is reduced, where 0 means no reduction.
+
+        @unimplemented
+        @gas Autofit.getLineSpacingReduction
+     */
+    double getLineSpacingReduction();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

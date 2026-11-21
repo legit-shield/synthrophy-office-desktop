@@ -1,0 +1,353 @@
+/* global describe expect it cy before afterEach require */
+
+const helper = require('../../common/helper');
+const a11yHelper = require('../../common/a11y_helper');
+
+describe(['tagdesktop'], 'Writer content controls for the reader', { testIsolation: false }, function () {
+	let win;
+
+	before(function () {
+		helper.setupAndLoadDocument('writer/a11y_content_controls.fodt');
+
+		cy.getFrameWindow().then(function (frameWindow) {
+			win = frameWindow;
+		});
+
+		cy.then(function () {
+			win.app.map.setAccessibilityState(true);
+			return helper.processToIdle(win);
+		});
+
+		helper.typeIntoDocument('{ctrl}{home}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+	});
+
+	function delayCaretReports(delay) {
+		cy.then(function () {
+			a11yHelper.delayMessages(win, ['a11ycaretchanged:'], delay);
+		});
+	}
+
+	function waitForLateReports() {
+		cy.then(function () {
+			a11yHelper.waitForDelayedMessages(win);
+		});
+	}
+
+	afterEach(function () {
+		if (win)
+			delete win.app.map._docLayer._onMessage;
+	});
+
+	it('a checkbox is read as a checkbox, with its title', function () {
+		cy.cGet('#clipboard-area [role="checkbox"]').should(function ($checkboxes) {
+			expect($checkboxes, 'the checkboxes').to.have.length(1);
+			expect($checkboxes.attr('aria-checked'), 'the state').to.equal('false');
+			expect($checkboxes.attr('aria-label'), 'the title').to.equal('Agreement');
+			expect($checkboxes.attr('aria-description'), 'the title').to.equal('Agreement');
+			expect($checkboxes.attr('contenteditable'), 'one unit for the caret').to.equal('false');
+			expect($checkboxes.text(), 'the character drawn').to.equal('o');
+			expect($checkboxes.children('[aria-hidden="true"]').text(), 'hidden from a reader')
+				.to.equal('o');
+		});
+		// the accessibility tree follows the DOM later
+		cy.waitUntil(function () {
+			return a11yHelper.getAXNodesWithin('#clipboard-area').then(function (nodes) {
+				const checkboxes = nodes.filter(function (node) {
+					return !node.ignored && node.role === 'checkbox';
+				});
+				// the title, not the character drawn, is its name
+				return checkboxes.length === 1 && checkboxes[0].name === 'Agreement'
+					&& checkboxes[0].description === 'Agreement';
+			});
+		});
+	});
+
+	it('the other controls are read by their type and title', function () {
+		cy.cGet('#clipboard-area [role="mark"]').should(function ($marks) {
+			expect($marks, 'the marks').to.have.length(3);
+			expect($marks.toArray().map(function (mark) { return mark.textContent; }),
+				'the content').to.deep.equal(['red', 'Type a name', 'Some notes']);
+			expect($marks.toArray().map(function (mark) {
+				return mark.getAttribute('aria-roledescription');
+			}), 'the types').to.deep.equal(['Drop-down list', 'Content control', 'Content control']);
+			expect($marks.toArray().map(function (mark) {
+				return mark.getAttribute('aria-description');
+			}), 'the titles').to.deep.equal(['Colour', 'Placeholder', 'Notes']);
+		});
+	});
+
+	it('the text keeps no character marking the ends of a control', function () {
+		cy.cGet('#clipboard-area').should(function ($area) {
+			expect($area.text(), 'the paragraph text')
+				.to.contain('Agree: o, color: red, name: Type a name, notes: Some notes.');
+		});
+	});
+
+	it('Alt+Down opens the list of a drop-down list, and Enter chooses from it', function () {
+		// into the drop-down list starting the paragraph
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{downarrow}{rightarrow}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+
+		cy.realPress(['Alt', 'ArrowDown']);
+		cy.cGet('.jsdialog-window.modalpopup .ui-treeview-entry').should(function ($entries) {
+			expect($entries.toArray().map(function (entry) { return entry.textContent; }),
+				'the items').to.deep.equal(['small', 'big']);
+			expect($entries.closest('.modalpopup')[0].contains($entries[0].ownerDocument.activeElement),
+				'the focus in the list').to.equal(true);
+		});
+
+		// an arrow moves through the list without choosing
+		cy.realPress('ArrowDown');
+		cy.cGet('.jsdialog-window.modalpopup .ui-treeview-entry').should(function ($entries) {
+			expect($entries[1].ownerDocument.activeElement, 'the focus on the second item')
+				.to.equal($entries[1]);
+		});
+		cy.realPress('Enter');
+		cy.cGet('.jsdialog-window.modalpopup').should('not.exist');
+		cy.cGet('#clipboard-area').should(function ($area) {
+			expect($area.text(), 'the item chosen').to.contain('big size.');
+		});
+	});
+
+	// the list of the drop-down list starting the second paragraph, set to big by the Alt+Down test
+	function openSizeList() {
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{downarrow}{rightarrow}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+
+		cy.realPress('Space');
+		cy.cGet('.jsdialog-window.modalpopup .ui-treeview-entry').should(function ($entries) {
+			// small would replace big if chosen
+			expect($entries[0].ownerDocument.activeElement, 'the focus on small')
+				.to.equal($entries[0]);
+		});
+	}
+
+	function checkClosedWithNothingChosen() {
+		cy.cGet('.jsdialog-window.modalpopup').should('not.exist');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.cGet('#clipboard-area').should(function ($area) {
+			expect($area[0].ownerDocument.activeElement, 'the focus back in the text')
+				.to.equal($area[0]);
+			expect($area.text(), 'nothing chosen').to.contain('big size.');
+		});
+	}
+
+	it('Escape closes the list of a drop-down list opened by Space, without choosing', function () {
+		openSizeList();
+		cy.realPress('Escape');
+		checkClosedWithNothingChosen();
+	});
+
+	it('Tab closes the list of a drop-down list opened by Space, without choosing', function () {
+		openSizeList();
+		cy.realPress('Tab');
+		checkClosedWithNothingChosen();
+	});
+
+	it('Space toggles a checkbox entered after a drop-down list', function () {
+		// out of the drop-down list, into the checkbox; Ctrl stays held for the rest of a
+		// typeIntoDocument()
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{rightarrow}'.repeat(8));
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+
+		cy.realPress('Space');
+		cy.cGet('#clipboard-area [role="checkbox"]').should('have.attr', 'aria-checked', 'true');
+		cy.cGet('.jsdialog-window.modalpopup').should('not.exist');
+	});
+
+	it('a second Space toggles the checkbox back', function () {
+		// into the checkbox, which starts at 7
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{rightarrow}'.repeat(8));
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		let checked;
+		cy.cGet('#clipboard-area [role="checkbox"]').then(function ($checkbox) {
+			checked = $checkbox.attr('aria-checked') === 'true';
+		});
+
+		// a toggle leaves the caret after the checkbox
+		cy.realPress('Space');
+		cy.cGet('#clipboard-area [role="checkbox"]').should(function ($checkbox) {
+			expect($checkbox.attr('aria-checked'), 'the state after one')
+				.to.equal(String(!checked));
+		});
+		cy.waitUntil(function () {
+			return win.app.map._textInput._getSelectionEnd() === 8;
+		});
+		cy.realPress('Space');
+		cy.cGet('#clipboard-area [role="checkbox"]').should(function ($checkbox) {
+			expect($checkbox.attr('aria-checked'), 'the state after two')
+				.to.equal(String(checked));
+		});
+	});
+
+	it('over a slow connection the second Right at a checkbox goes past it', function () {
+		// before the checkbox, which starts at 7
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{rightarrow}'.repeat(7));
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.then(function () {
+			expect(win.app.map._textInput._getSelectionEnd(), 'the caret').to.equal(7);
+		});
+		delayCaretReports(2500);
+
+		// the first only enters the control, so the caret stays; the second goes over the box
+		cy.realPress('ArrowRight');
+		cy.then(function () {
+			expect(win.app.map._textInput._getSelectionEnd(), 'the caret after one').to.equal(7);
+		});
+		cy.realPress('ArrowRight');
+		cy.then(function () {
+			expect(win.app.map._textInput._getSelectionEnd(), 'the caret after two').to.equal(8);
+		});
+		waitForLateReports();
+		cy.then(function () {
+			expect(win.app.map._textInput._getSelectionEnd(), 'the caret').to.equal(8);
+		});
+	});
+
+	it('over a slow connection Left at a checkbox reached by Right moves at once', function () {
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{rightarrow}'.repeat(7));
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.then(function () {
+			expect(win.app.map._textInput._getSelectionEnd(), 'the caret').to.equal(7);
+		});
+		delayCaretReports(2500);
+
+		// the caret is before the control, not in it
+		cy.realPress('ArrowLeft');
+		cy.then(function () {
+			expect(win.app.map._textInput._getSelectionEnd(), 'the caret after Left').to.equal(6);
+		});
+		waitForLateReports();
+		cy.then(function () {
+			expect(win.app.map._textInput._getSelectionEnd(), 'the caret').to.equal(6);
+		});
+	});
+
+	it('Alt+Down opens the calendar of a date, on its date, and the keyboard chooses another', function () {
+		// into the date starting the third paragraph
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{downarrow}{downarrow}{rightarrow}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+
+		cy.realPress(['Alt', 'ArrowDown']);
+		cy.cGet('#datepicker').should('be.visible');
+		// each day by its full date
+		cy.cGet('#datepicker').should(function ($picker) {
+			const day = $picker[0].ownerDocument.activeElement;
+			expect($picker[0].contains(day), 'the focus in the calendar').to.equal(true);
+			expect(day.getAttribute('aria-label'), 'the date of the control').to.contain('March 14, 2025');
+		});
+
+		cy.realPress('ArrowRight');
+		cy.cGet('#datepicker').should(function ($picker) {
+			expect($picker[0].ownerDocument.activeElement.getAttribute('aria-label'), 'the next day')
+				.to.contain('March 15, 2025');
+		});
+
+		// a month on, then closed: opened again, the calendar is back on the date of the control
+		cy.realPress('PageDown');
+		cy.cGet('#datepicker').should(function ($picker) {
+			expect($picker[0].ownerDocument.activeElement.getAttribute('aria-label'), 'a month on')
+				.to.contain('April 15, 2025');
+		});
+		cy.realPress('Escape');
+		cy.cGet('#datepicker').should('not.be.visible');
+		cy.realPress(['Alt', 'ArrowDown']);
+		cy.cGet('#datepicker').should(function ($picker) {
+			const day = $picker[0].ownerDocument.activeElement;
+			expect(day.getAttribute('aria-label'), 'the date of the control').to.contain('March 14, 2025');
+			expect(day.getAttribute('aria-selected'), 'the date of the control').to.equal('true');
+		});
+		cy.realPress('ArrowRight');
+		cy.cGet('#datepicker').should(function ($picker) {
+			expect($picker[0].ownerDocument.activeElement.getAttribute('aria-label'), 'the next day')
+				.to.contain('March 15, 2025');
+		});
+
+		// a year on, and back
+		cy.realPress(['Shift', 'PageDown']);
+		cy.cGet('#datepicker').should(function ($picker) {
+			expect($picker[0].ownerDocument.activeElement.getAttribute('aria-label'), 'a year on')
+				.to.contain('March 15, 2026');
+		});
+		cy.realPress(['Shift', 'PageUp']);
+		cy.cGet('#datepicker').should(function ($picker) {
+			expect($picker[0].ownerDocument.activeElement.getAttribute('aria-label'), 'back')
+				.to.contain('March 15, 2025');
+		});
+
+		cy.realPress('Enter');
+		cy.cGet('#datepicker').should('not.be.visible');
+		cy.cGet('#clipboard-area').should(function ($area) {
+			expect($area.text(), 'the date chosen').to.contain('2025-03-15 day.');
+		});
+	});
+
+	it('a picture control is read as a picture, and announced with its image selected', function () {
+		// into the fourth paragraph, holding the picture control
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{downarrow}{downarrow}{downarrow}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.cGet('#clipboard-area [role="mark"]').should(function ($marks) {
+			expect($marks, 'the marks').to.have.length(1);
+			expect($marks.attr('aria-roledescription'), 'the type').to.equal('Picture');
+			expect($marks.attr('aria-description'), 'the title').to.equal('Portrait, Placeholder');
+			expect($marks.find('[role="img"]').attr('aria-label'), 'the image').to.equal('Image1');
+		});
+
+		cy.realPress(['Shift', 'F4']);
+		cy.cGet('#clipboard-area').should('have.attr', 'aria-description',
+			'Portrait, Placeholder, Image1 selected. ');
+		cy.realPress('Escape');
+	});
+
+	it('a checkbox without a title has no name rather than its character', function () {
+		// into the last paragraph, after the plain one
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{downarrow}'.repeat(5));
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.cGet('#clipboard-area').should('contain.text', 'Untitled');
+		cy.cGet('#clipboard-area [role="checkbox"]').should(function ($checkbox) {
+			expect($checkbox.attr('aria-label'), 'no title').to.equal(undefined);
+			expect($checkbox.attr('aria-description'), 'no title').to.equal(undefined);
+			expect($checkbox.attr('aria-checked'), 'the state').to.equal('false');
+		});
+		cy.waitUntil(function () {
+			return a11yHelper.getAXNodesWithin('#clipboard-area').then(function (nodes) {
+				const checkboxes = nodes.filter(function (node) {
+					return !node.ignored && node.role === 'checkbox';
+				});
+				return checkboxes.length === 1 && checkboxes[0].name === '';
+			});
+		});
+	});
+});

@@ -1,0 +1,3004 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <sdmodeltestbase.hxx>
+
+#include <test/JsonTestTools.hxx>
+#include <tools/JsonPath.hxx>
+
+#include <VectorPrimitivesJson.hxx>
+#include <tools/json_writer.hxx>
+#include <tools/color.hxx>
+#include <tools/degree.hxx>
+
+#include <SlideshowLayerRenderer.hxx>
+
+#include <com/sun/star/beans/XPropertySet.hpp>
+#include <com/sun/star/chart2/FormattedString.hpp>
+#include <com/sun/star/chart2/XTitle.hpp>
+#include <com/sun/star/chart2/XTitled.hpp>
+#include <com/sun/star/drawing/FillStyle.hpp>
+#include <com/sun/star/drawing/XDrawPages.hpp>
+#include <com/sun/star/drawing/XDrawPagesSupplier.hpp>
+#include <com/sun/star/drawing/XMasterPageTarget.hpp>
+#include <com/sun/star/drawing/XMasterPagesSupplier.hpp>
+#include <com/sun/star/embed/EmbedVerbs.hpp>
+#include <com/sun/star/frame/XModel.hpp>
+#include <com/sun/star/drawing/LineCap.hpp>
+#include <com/sun/star/drawing/LineJoint.hpp>
+#include <com/sun/star/drawing/LineStyle.hpp>
+#include <com/sun/star/presentation/ParagraphTarget.hpp>
+#include <com/sun/star/table/XTable.hpp>
+#include <com/sun/star/text/XTextRange.hpp>
+#include <com/sun/star/view/XSelectionSupplier.hpp>
+
+#include <comphelper/kit.hxx>
+#include <comphelper/processfactory.hxx>
+#include <comphelper/scopeguard.hxx>
+#include <vcl/keycodes.hxx>
+#include <vcl/bitmap.hxx>
+#include <vcl/graphicfilter.hxx>
+#include <vcl/kit.hxx>
+#include <vcl/scheduler.hxx>
+#include <vcl/metric.hxx>
+#include <vcl/virdev.hxx>
+
+#include <editeng/eeitem.hxx>
+#include <editeng/flditem.hxx>
+
+#include <svx/VectorObjectContent.hxx>
+#include <svx/svditer.hxx>
+#include <svx/svdoashp.hxx>
+#include <svx/svdobjkind.hxx>
+#include <svx/svdoole2.hxx>
+#include <svx/svdograf.hxx>
+#include <svx/svdogrp.hxx>
+#include <svx/svdoutl.hxx>
+#include <svx/svdopage.hxx>
+#include <svx/svdpage.hxx>
+#include <svx/svdopath.hxx>
+#include <svx/svdorect.hxx>
+#include <svx/svdlayer.hxx>
+#include <svx/svdotable.hxx>
+#include <svx/svdsob.hxx>
+#include <svx/svdotext.hxx>
+#include <svx/svdview.hxx>
+#include <svx/xfillit0.hxx>
+#include <svx/xflclit.hxx>
+#include <svx/xfltrit.hxx>
+#include <svx/xlineit0.hxx>
+#include <svx/xlncapit.hxx>
+#include <svx/xlnclit.hxx>
+#include <svx/xlinjoit.hxx>
+#include <svx/xlnwtit.hxx>
+
+#include <editeng/editview.hxx>
+#include <editeng/eeitem.hxx>
+#include <editeng/wghtitem.hxx>
+#include <editeng/outliner.hxx>
+#include <sfx2/ipclient.hxx>
+#include <sfx2/viewsh.hxx>
+
+#include <DrawDocShell.hxx>
+#include <ViewShell.hxx>
+#include <drawdoc.hxx>
+#include <sdpage.hxx>
+#include <unomodel.hxx>
+
+#include <comphelper/base64.hxx>
+#include <osl/file.hxx>
+#include <tools/stream.hxx>
+#include <boost/property_tree/ptree.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+using namespace css;
+using namespace ::cpo;
+
+namespace
+{
+class VectorRenderingTest : public SdModelTestBase, public JsonTestTools
+{
+public:
+    VectorRenderingTest()
+        : SdModelTestBase(u""_ustr)
+    {
+    }
+
+protected:
+    /// Load a fresh empty Impress document. Clears the first slide and
+    /// its master page of all default placeholder objects so tests
+    /// only see what they explicitly add.
+    void createBlankDoc()
+    {
+        createSdImpressDoc();
+        SdrPage* pPage = page(1);
+        pPage->ClearSdrObjList();
+        if (pPage->TRG_HasMasterPage())
+            pPage->TRG_GetMasterPage().ClearSdrObjList();
+    }
+
+    /// Page at the given 0-based index. Page 0 is the handout page,
+    /// page 1 is the first user-visible slide.
+    SdrPage* page(sal_uInt16 nIndex)
+    {
+        SdDrawDocument* pDrawDoc = getSdDocShell()->GetDoc();
+        CPPUNIT_ASSERT(pDrawDoc);
+        SdrPage* pPage = pDrawDoc->GetPage(nIndex);
+        CPPUNIT_ASSERT(pPage);
+        return pPage;
+    }
+
+    /// The master of the first slide, with a placeholder of every kind that takes an area
+    /// name in master view.
+    SdPage* createMasterPlaceholders()
+    {
+        SdPage* pMasterPage = static_cast<SdPage*>(&page(1)->TRG_GetMasterPage());
+        for (PresObjKind eKind : { PresObjKind::Title, PresObjKind::Header, PresObjKind::Footer,
+                                   PresObjKind::DateTime, PresObjKind::SlideNumber })
+        {
+            pMasterPage->CreateDefaultPresObj(eKind);
+        }
+        return pMasterPage;
+    }
+
+    /// The entry of the object with the given id, or nothing when the response has none.
+    static std::optional<tools::JsonPath> findEntryOfObject(const tools::JsonPath& rJson,
+                                                            sal_uInt64 nObjectId)
+    {
+        const size_t nCount = rJson.getSize("/objects").value_or(0);
+        for (size_t nIndex = 0; nIndex < nCount; ++nIndex)
+        {
+            const auto oEntry = rJson.at(rtl::Concat2View(
+                "/objects/" + OString::number(sal_Int32(nIndex))));
+            if (oEntry && oEntry->getInt("id").value_or(-1) == sal_Int64(nObjectId))
+                return oEntry;
+        }
+        return std::nullopt;
+    }
+
+    /// Add a filled rectangle with a border to the first slide.
+    /// rRect is in 1/100 mm.
+    void addRectangle(const tools::Rectangle& rRect, Color aFillColor, Color aStrokeColor)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrRectObj> pRect = new SdrRectObj(pPage->getSdrModelFromSdrPage(), rRect);
+
+        pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+        pRect->SetMergedItem(XFillColorItem(OUString(), aFillColor));
+        pRect->SetMergedItem(XLineStyleItem(drawing::LineStyle_SOLID));
+        pRect->SetMergedItem(XLineColorItem(OUString(), aStrokeColor));
+
+        pPage->NbcInsertObject(pRect.get());
+    }
+
+    /// Add a group holding one filled rectangle to the first slide.
+    /// Returns the rectangle inside the group.
+    SdrObject* addGroupedRectangle(const tools::Rectangle& rRect, Color aFillColor)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrRectObj> pRect = new SdrRectObj(pPage->getSdrModelFromSdrPage(), rRect);
+
+        pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+        pRect->SetMergedItem(XFillColorItem(OUString(), aFillColor));
+        pRect->SetMergedItem(XLineStyleItem(drawing::LineStyle_NONE));
+
+        rtl::Reference<SdrObjGroup> pGroup = new SdrObjGroup(pPage->getSdrModelFromSdrPage());
+        pGroup->GetSubList()->NbcInsertObject(pRect.get());
+        pPage->NbcInsertObject(pGroup.get());
+        return pRect.get();
+    }
+
+    /// Move the object and fire the object change the model sends on a real
+    /// edit. A broadcast on its own says only that something may have
+    /// happened, and the writer compares the object to find out.
+    static void moveObject(SdrObject* pObject, const Size& rDistance)
+    {
+        pObject->NbcMove(rDistance);
+        pObject->BroadcastObjectChange();
+    }
+
+    /// The first node under rNode whose type is sType, anywhere in the tree.
+    static std::optional<tools::JsonPath> findNodeOfType(const tools::JsonPath& rNode,
+                                                         const OString& rType)
+    {
+        if (rNode.getString("type").value_or(OString()) == rType)
+            return rNode;
+        for (const auto& rChild : rNode.tree())
+        {
+            auto oFound = findNodeOfType(rNode.sub(rChild.second), rType);
+            if (oFound)
+                return oFound;
+        }
+        return std::nullopt;
+    }
+
+    /// Every node under rNode of the given type, in the order the tree holds them.
+    static void collectNodesOfType(const tools::JsonPath& rNode, const OString& rType,
+                                   std::vector<tools::JsonPath>& rFound)
+    {
+        if (rNode.getString("type").value_or(OString()) == rType)
+        {
+            rFound.push_back(rNode);
+            return;
+        }
+        for (const auto& rChild : rNode.tree())
+            collectNodesOfType(rNode.sub(rChild.second), rType, rFound);
+    }
+
+    /// True when a node of the type with the given color is anywhere under rNode.
+    static bool hasNodeWithColor(const tools::JsonPath& rNode, const OString& rType,
+                                 const OString& rColor)
+    {
+        if (rNode.getString("type").value_or(OString()) == rType
+            && rNode.getString("color").value_or(OString()) == rColor)
+            return true;
+        for (const auto& rChild : rNode.tree())
+        {
+            if (hasNodeWithColor(rNode.sub(rChild.second), rType, rColor))
+                return true;
+        }
+        return false;
+    }
+
+    /// True when every positive parent id names an entry of the same response. Zero is the page
+    /// and minus one is no parent. This holds for a whole page only, since a delta carries just
+    /// the entries that changed and their parents can lie outside it.
+    static bool everyParentResolves(const tools::JsonPath& rJson)
+    {
+        const size_t nCount = rJson.getSize("/objects").value_or(0);
+        std::set<sal_Int64> aReported;
+        for (size_t nIndex = 0; nIndex < nCount; ++nIndex)
+        {
+            aReported.insert(rJson.getInt(rtl::Concat2View("/objects/"
+                                                           + OString::number(sal_Int32(nIndex))
+                                                           + "/id"))
+                                 .value_or(-1));
+        }
+
+        for (size_t nIndex = 0; nIndex < nCount; ++nIndex)
+        {
+            const sal_Int64 nParent
+                = rJson.getInt(rtl::Concat2View("/objects/" + OString::number(sal_Int32(nIndex))
+                                                + "/parent"))
+                      .value_or(0);
+            if (nParent > 0 && !aReported.contains(nParent))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// True when the order of the given response names the id.
+    static bool orderNames(const tools::JsonPath& rJson, sal_Int64 nId)
+    {
+        const size_t nCount = rJson.getSize("/order").value_or(0);
+        for (size_t nIndex = 0; nIndex < nCount; ++nIndex)
+        {
+            if (rJson.getInt(rtl::Concat2View("/order/" + OString::number(sal_Int32(nIndex))))
+                    .value_or(0)
+                == nId)
+                return true;
+        }
+        return false;
+    }
+
+    /// True when the objects array of the given response carries the id.
+    static bool carriesObject(const tools::JsonPath& rJson, sal_uInt64 nObjectId)
+    {
+        const size_t nCount = rJson.getSize("/objects").value_or(0);
+        for (size_t nIndex = 0; nIndex < nCount; ++nIndex)
+        {
+            if (rJson.getInt(rtl::Concat2View("/objects/" + OString::number(sal_Int32(nIndex))
+                                              + "/id"))
+                    .value_or(-1)
+                == sal_Int64(nObjectId))
+                return true;
+        }
+        return false;
+    }
+
+    /// Add a page-object placeholder (slide embedded in slide) to the
+    /// first slide. Its view-independent decomposition is a single
+    /// polygonHairline outline (drawn yellow by the engine), which is
+    /// exactly what the vector primitives pipeline emits.
+    void addPageObject(const tools::Rectangle& rRect)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrPageObj> pPageObj
+            = new SdrPageObj(pPage->getSdrModelFromSdrPage(), rRect);
+        pPage->NbcInsertObject(pPageObj.get());
+    }
+
+    /// Add a stroke-only rectangle (no fill) to the first slide.
+    void addStrokedRectangle(const tools::Rectangle& rRect, Color aStrokeColor)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrRectObj> pRect = new SdrRectObj(pPage->getSdrModelFromSdrPage(), rRect);
+
+        pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_NONE));
+        pRect->SetMergedItem(XLineStyleItem(drawing::LineStyle_SOLID));
+        pRect->SetMergedItem(XLineColorItem(OUString(), aStrokeColor));
+
+        pPage->NbcInsertObject(pRect.get());
+    }
+
+    /// Add a filled rectangle with a non-zero fill transparency
+    /// (0..100 percent).
+    void addTransparentRectangle(const tools::Rectangle& rRect, Color aFillColor,
+                                 sal_uInt16 nTransparencePercent)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrRectObj> pRect = new SdrRectObj(pPage->getSdrModelFromSdrPage(), rRect);
+
+        pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+        pRect->SetMergedItem(XFillColorItem(OUString(), aFillColor));
+        pRect->SetMergedItem(XFillTransparenceItem(nTransparencePercent));
+        pRect->SetMergedItem(XLineStyleItem(drawing::LineStyle_NONE));
+
+        pPage->NbcInsertObject(pRect.get());
+    }
+
+    /// Add a filled rectangle with object metadata (name, title,
+    /// description) on the first slide.
+    void addRectangleWithObjectInfo(const tools::Rectangle& rRect, Color aFillColor,
+                                    const OUString& rName, const OUString& rTitle,
+                                    const OUString& rDesc)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrRectObj> pRect = new SdrRectObj(pPage->getSdrModelFromSdrPage(), rRect);
+
+        pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+        pRect->SetMergedItem(XFillColorItem(OUString(), aFillColor));
+        pRect->SetMergedItem(XLineStyleItem(drawing::LineStyle_NONE));
+
+        pRect->SetName(rName);
+        pRect->SetTitle(rTitle);
+        pRect->SetDescription(rDesc);
+
+        pPage->NbcInsertObject(pRect.get());
+    }
+
+    /// Add a filled rectangle rotated by the given angle (in 1/100 of
+    /// a degree) around its centre.
+    void addRotatedRectangle(const tools::Rectangle& rRect, Color aFillColor, Degree100 nAngle)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrRectObj> pRect = new SdrRectObj(pPage->getSdrModelFromSdrPage(), rRect);
+
+        pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+        pRect->SetMergedItem(XFillColorItem(OUString(), aFillColor));
+        pRect->SetMergedItem(XLineStyleItem(drawing::LineStyle_NONE));
+
+        // Degree100 is 1/100 of a degree, so divide by 18000 for radians per pi.
+        const double fAngleRad = nAngle.get() * M_PI / 18000.0;
+        pRect->NbcRotate(rRect.Center(), nAngle, std::sin(fAngleRad), std::cos(fAngleRad));
+
+        pPage->NbcInsertObject(pRect.get());
+    }
+
+    /// Raw JSON written by the most recent getVectorPrimitives call.
+    OString m_aLastVectorJson;
+
+    /// Add a text box to the first slide. Newlines in rText start new paragraphs.
+    void addTextBox(const tools::Rectangle& rRect, const OUString& rText)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrRectObj> pText
+            = new SdrRectObj(pPage->getSdrModelFromSdrPage(), rRect, SdrObjKind::Text);
+        pText->SetMergedItem(XFillStyleItem(drawing::FillStyle_NONE));
+        pText->SetMergedItem(XLineStyleItem(drawing::LineStyle_NONE));
+        pText->SetText(rText);
+        pPage->NbcInsertObject(pText.get());
+    }
+
+    /// A custom shape of the given geometry type, such as "rect" or "ellipse".
+    void addCustomShape(const tools::Rectangle& rRect, const OUString& rType)
+    {
+        SdrPage* pPage = page(1);
+        rtl::Reference<SdrObjCustomShape> pShape
+            = new SdrObjCustomShape(pPage->getSdrModelFromSdrPage());
+        pShape->MergeDefaultAttributes(&rType);
+        pShape->NbcSetSnapRect(rRect);
+        pPage->NbcInsertObject(pShape.get());
+    }
+
+    /// The first text portion in the last vector JSON whose text contains
+    /// rText, or std::nullopt when none does.
+    std::optional<tools::JsonPath> findTextPortion(const OString& rText) const
+    {
+        auto oJson = tools::JsonPath::parse(
+            std::string_view(m_aLastVectorJson.getStr(), m_aLastVectorJson.getLength()));
+        if (!oJson)
+            return std::nullopt;
+        return findTextPortionUnder(*oJson, rText);
+    }
+
+    /// True when the environment resolves a real bold cut. Without one the
+    /// drawing makes the weight up instead.
+    static bool familyHasBoldCut()
+    {
+        ScopedVclPtrInstance<VirtualDevice> pProbeDevice;
+        vcl::Font aProbeFont(u"Liberation Sans"_ustr, Size(0, 2000));
+        aProbeFont.SetWeight(WEIGHT_BOLD);
+        pProbeDevice->SetFont(aProbeFont);
+        return !pProbeDevice->GetCurrentFontRawData().isEmpty()
+               && pProbeDevice->GetFontMetric().GetWeight() >= WEIGHT_SEMIBOLD;
+    }
+
+    /// The raw answer of the document to a .uno:VectorPrimitives command.
+    OString requestVectorPrimitivesRaw(const OString& rCommand)
+    {
+        SdXImpressDocument* pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+        CPPUNIT_ASSERT(pDocument);
+        tools::JsonWriter aJsonWriter;
+        pDocument->getCommandValues(aJsonWriter,
+                                    std::string_view(rCommand.getStr(), rCommand.getLength()));
+        return aJsonWriter.finishAndGetAsOString();
+    }
+
+    /// The answer of the document to a .uno:VectorPrimitives command, parsed. Nothing when the
+    /// answer is no JSON document.
+    std::optional<tools::JsonPath> requestVectorPrimitives(const OString& rCommand)
+    {
+        const OString aResult = requestVectorPrimitivesRaw(rCommand);
+        return tools::JsonPath::parse(std::string_view(aResult.getStr(), aResult.getLength()));
+    }
+
+    /// The delta the document pushes for the first slide, parsed. Nothing when nothing changed
+    /// since the last push.
+    std::optional<tools::JsonPath> pushVectorPrimitivesDelta()
+    {
+        SdXImpressDocument* pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+        CPPUNIT_ASSERT(pDocument);
+        const OString aPartId = firstPartId();
+        tools::JsonWriter aJsonWriter;
+        pDocument->pushVectorPrimitivesDelta(
+            aJsonWriter, std::string_view(aPartId.getStr(), aPartId.getLength()), 0);
+        const OString aResult = aJsonWriter.finishAndGetAsOString();
+        return tools::JsonPath::parse(std::string_view(aResult.getStr(), aResult.getLength()));
+    }
+
+    /// The id of the first page of the list the mode names: 1 the master pages, 2 the notes
+    /// pages, and the slides for any other mode.
+    OString firstPartId(sal_Int32 nMode = 0)
+    {
+        SdDrawDocument* pDrawDoc = getSdDocShell()->GetDoc();
+        CPPUNIT_ASSERT(pDrawDoc);
+        SdPage* pPage = nullptr;
+        if (nMode == 1)
+            pPage = pDrawDoc->GetMasterSdPage(0, PageKind::Standard);
+        else if (nMode == 2)
+            pPage = pDrawDoc->GetSdPage(0, PageKind::Notes);
+        else
+            pPage = pDrawDoc->GetSdPage(0, PageKind::Standard);
+        CPPUNIT_ASSERT(pPage);
+        return pPage->GetGuid().getString();
+    }
+
+    /// Request for part 0 of the page list nMode names. The raw JSON is
+    /// written as a reference. A non-negative nSince asks for a delta against
+    /// that version of the document's epoch instead of the full page.
+    tools::JsonPath getVectorPrimitives(std::u16string_view sName, sal_Int64 nSince = -1,
+                                        sal_Int32 nMode = 0)
+    {
+        SdXImpressDocument* pDoc = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+        CPPUNIT_ASSERT(pDoc);
+
+        tools::JsonWriter aJsonWriter;
+        // The first page of the mode's list.
+        OString aCommand = ".uno:VectorPrimitives?partid=" + firstPartId(nMode)
+                           + "&mode=" + OString::number(nMode);
+        if (nSince >= 0)
+            aCommand = aCommand + "&since=" + OString::number(nSince)
+                       + "&epoch=" + OString::number(pDoc->getVectorEpoch());
+        pDoc->getCommandValues(aJsonWriter,
+                               std::string_view(aCommand.getStr(), aCommand.getLength()));
+        OString aResult = aJsonWriter.finishAndGetAsOString();
+        CPPUNIT_ASSERT(!aResult.isEmpty());
+        m_aLastVectorJson = aResult;
+
+        // Write the wire-format JSON to workdir.
+        static constexpr OUString sFolder = u"/VectorRenderingReference/"_ustr;
+        osl::Directory::createPath(m_directories.getURLFromWorkdir(sFolder));
+        OUString aPath = m_directories.getPathFromWorkdir(sFolder) + sName + u".json";
+        std::ofstream aOut(OUStringToOString(aPath, RTL_TEXTENCODING_UTF8).getStr());
+        CPPUNIT_ASSERT_MESSAGE("cannot open reference file for writing", aOut.is_open());
+        aOut.write(aResult.getStr(), aResult.getLength());
+        CPPUNIT_ASSERT_MESSAGE("write to reference file failed", aOut.good());
+
+        auto oJson
+            = tools::JsonPath::parse(std::string_view(aResult.getStr(), aResult.getLength()));
+        CPPUNIT_ASSERT_MESSAGE("JSON parse error", oJson.has_value());
+
+        return *oJson;
+    }
+
+    /// A pull that names the version the client holds is answered with the header alone when
+    /// nothing changed since: a delta still at that version, with no object.
+    void assertNothingMoved(const tools::JsonPath& rJson, sal_Int64 nVersion)
+    {
+        assertJsonPath(rJson, "/type", "vectorprimitivesdelta");
+        assertJsonPath(rJson, "/version", nVersion);
+        CPPUNIT_ASSERT(!rJson.has("/order"));
+        CPPUNIT_ASSERT_EQUAL(size_t(0), rJson.getSize("/objects").value_or(SIZE_MAX));
+    }
+};
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testSingleRectangle)
+{
+    // A single blue filled rectangle with a black border. The primitive
+    // tree should contain a polyPolygonColor for the fill and a
+    // polygonStroke for the border, under exactly one slide object.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)), Color(0x4472c4), COL_BLACK);
+
+    auto aJson = getVectorPrimitives(u"testSingleRectangle");
+
+    assertJsonPath(aJson, "/type", "vectorprimitives");
+    assertJsonPath(aJson, "/partId", firstPartId());
+
+    // The page comes first. Its master page has been cleared and the slide carries no
+    // background of its own, so the only thing behind the rectangle is the document background.
+    // That is a setting of the view, so the one background primitive names no color.
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+    assertJsonPath(aJson, "/objects/0/kind", "page");
+    // The page is entry zero, the id an object never has.
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(0), aJson.getInt("/objects/0/id").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(size_t(1), aJson.getSize("/objects/0/primitives").value_or(0));
+    assertJsonPath(aJson, "/objects/0/primitives/0/type", "backgroundcolor");
+    CPPUNIT_ASSERT(!aJson.has("/objects/0/primitives/0/color"));
+
+    // Then the one slide object, our rectangle.
+    assertJsonPath(aJson, "/objects/1/primitives/0/type", "svx:9");
+    assertJsonPath(aJson, "/objects/1/primitives/0/children/0/type", "group");
+
+    // Fill primitive.
+    auto oFill = aJson.at("/objects/1/primitives/0/children/0/children/0");
+    CPPUNIT_ASSERT(oFill.has_value());
+    assertJsonPath(*oFill, "type", "polyPolygonColor");
+    assertJsonPath(*oFill, "color", "#4472c4");
+    assertJsonPathExists(*oFill, "path");
+
+    // Stroke primitive.
+    auto oStroke = aJson.at("/objects/1/primitives/0/children/0/children/1");
+    CPPUNIT_ASSERT(oStroke.has_value());
+    assertJsonPath(*oStroke, "type", "polygonStroke");
+    assertJsonPath(*oStroke, "line/color", "#000000");
+    assertJsonPathExists(*oStroke, "path");
+}
+
+/// The paths of the primitives of the given type in a subtree, in paint order.
+void collectPaths(const boost::property_tree::ptree& rTree, std::string_view sType,
+                  std::vector<std::string>& rPaths)
+{
+    if (rTree.get<std::string>("type", "") == sType)
+        rPaths.push_back(rTree.get<std::string>("path", ""));
+    for (const auto& rChild : rTree)
+        collectPaths(rChild.second, sType, rPaths);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testStrokeNoLineJoin)
+{
+    // Thick strokes with no line join and round caps: an open zigzag, a closed triangle and a
+    // rectangle. Each edge is filled as an area of its own, and only the two ends of the open
+    // zigzag have a round cap, so only its first and its last area have curves. The outline of a
+    // rectangle starts in the middle of its bottom edge, so it has five edges.
+    createBlankDoc();
+    SdrPage* pPage = page(1);
+    SdrModel& rModel = pPage->getSdrModelFromSdrPage();
+    const auto addStroked = [pPage](SdrObject* pObject) {
+        pObject->SetMergedItem(XFillStyleItem(drawing::FillStyle_NONE));
+        pObject->SetMergedItem(XLineStyleItem(drawing::LineStyle_SOLID));
+        pObject->SetMergedItem(XLineColorItem(OUString(), Color(0x1f4e79)));
+        pObject->SetMergedItem(XLineWidthItem(500));
+        pObject->SetMergedItem(XLineJointItem(drawing::LineJoint_NONE));
+        pObject->SetMergedItem(XLineCapItem(drawing::LineCap_ROUND));
+        pPage->NbcInsertObject(pObject);
+    };
+
+    basegfx::B2DPolygon aZigzag;
+    aZigzag.append(basegfx::B2DPoint(1500, 6300));
+    aZigzag.append(basegfx::B2DPoint(3000, 3800));
+    aZigzag.append(basegfx::B2DPoint(4500, 6300));
+    aZigzag.append(basegfx::B2DPoint(6000, 3800));
+    aZigzag.append(basegfx::B2DPoint(7500, 6300));
+    rtl::Reference<SdrPathObj> pZigzag
+        = new SdrPathObj(rModel, SdrObjKind::PolyLine, basegfx::B2DPolyPolygon(aZigzag));
+    addStroked(pZigzag.get());
+
+    basegfx::B2DPolygon aTriangle;
+    aTriangle.append(basegfx::B2DPoint(11000, 6300));
+    aTriangle.append(basegfx::B2DPoint(12750, 3800));
+    aTriangle.append(basegfx::B2DPoint(14500, 6300));
+    aTriangle.setClosed(true);
+    rtl::Reference<SdrPathObj> pTriangle
+        = new SdrPathObj(rModel, SdrObjKind::Polygon, basegfx::B2DPolyPolygon(aTriangle));
+    addStroked(pTriangle.get());
+
+    rtl::Reference<SdrRectObj> pRectangle
+        = new SdrRectObj(rModel, tools::Rectangle(Point(18500, 3800), Size(4000, 2500)));
+    addStroked(pRectangle.get());
+
+    auto aJson = getVectorPrimitives(u"testStrokeNoLineJoin");
+
+    CPPUNIT_ASSERT_EQUAL(size_t(4), aJson.getSize("/objects").value_or(0));
+    const std::vector<std::vector<bool>> aCurvedEdges = { { true, false, false, true },
+                                                          { false, false, false },
+                                                          { false, false, false, false, false } };
+    for (size_t nObject = 0; nObject < aCurvedEdges.size(); ++nObject)
+    {
+        const auto oObject
+            = aJson.at(rtl::Concat2View("/objects/" + OString::number(sal_Int32(nObject + 1))));
+        CPPUNIT_ASSERT(oObject.has_value());
+        std::vector<std::string> aStrokes;
+        collectPaths(oObject->tree(), "polygonStroke", aStrokes);
+        CPPUNIT_ASSERT(aStrokes.empty());
+
+        std::vector<std::string> aAreas;
+        collectPaths(oObject->tree(), "polyPolygonColor", aAreas);
+        CPPUNIT_ASSERT_EQUAL(aCurvedEdges[nObject].size(), aAreas.size());
+        for (size_t nEdge = 0; nEdge < aAreas.size(); ++nEdge)
+        {
+            const bool bCurved = aAreas[nEdge].find_first_of("csqt") != std::string::npos;
+            CPPUNIT_ASSERT_EQUAL(bool(aCurvedEdges[nObject][nEdge]), bCurved);
+        }
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPartVersionRisesOnObjectChange)
+{
+    // Changing an object on a slide must raise that slide's reported
+    // content version.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)), Color(0x4472c4), COL_BLACK);
+
+    const sal_Int64 nBefore
+        = getVectorPrimitives(u"testPartVersion").getInt("/version").value_or(-1);
+
+    // A broadcast on its own says only that something may have happened, and
+    // the comparison then finds nothing, so move the rectangle for real.
+    moveObject(page(1)->GetObj(0), Size(500, 0));
+
+    const sal_Int64 nAfter
+        = getVectorPrimitives(u"testPartVersion").getInt("/version").value_or(-1);
+
+    CPPUNIT_ASSERT_EQUAL(nBefore + 1, nAfter);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEachModelNamesItsOwnEpoch)
+{
+    // Every model counts its versions up from the same start, so two documents loaded one after
+    // the other report different epochs.
+    createBlankDoc();
+    const sal_Int64 nFirst = getVectorPrimitives(u"testEpochFirst").getInt("/epoch").value_or(-1);
+    CPPUNIT_ASSERT_GREATER(sal_Int64(0), nFirst);
+
+    createBlankDoc();
+    const sal_Int64 nSecond = getVectorPrimitives(u"testEpochSecond").getInt("/epoch").value_or(-1);
+    CPPUNIT_ASSERT_GREATER(sal_Int64(0), nSecond);
+    CPPUNIT_ASSERT(nFirst != nSecond);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testSlideNamesItsMaster)
+{
+    // A slide draws under itself the master it names rather than carrying a
+    // copy of it. The master's own content travels once, as the master part,
+    // and each master object there says how it behaves behind a slide. The
+    // objects that differ per slide are objects of the slide, rendered for it,
+    // and a placeholder the slide has turned off is not among them.
+    createBlankDoc();
+    SdPage* pMasterPage = createMasterPlaceholders();
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        pMasterPage->getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    pRect->SetMergedItem(XFillColorItem(OUString(), Color(0xc00000)));
+    pMasterPage->NbcInsertObject(pRect.get());
+    SdrObject* pTitle = pMasterPage->GetPresObj(PresObjKind::Title);
+    SdrObject* pFooter = pMasterPage->GetPresObj(PresObjKind::Footer);
+    SdrObject* pNumber = pMasterPage->GetPresObj(PresObjKind::SlideNumber);
+    CPPUNIT_ASSERT(pTitle);
+    CPPUNIT_ASSERT(pFooter);
+    CPPUNIT_ASSERT(pNumber);
+
+    auto aSlide = getVectorPrimitives(u"testSlideMasterReference");
+    const auto oPage = aSlide.at("/objects/0");
+    CPPUNIT_ASSERT(oPage.has_value());
+    assertJsonPath(*oPage, "kind", "page");
+    // The master is named by its part id, so the reference holds however the master list moves.
+    assertJsonPath(*oPage, "masterPartId", pMasterPage->GetGuid().getString());
+    // The rectangle is the master's to carry, so the slide's own content has none of it.
+    CPPUNIT_ASSERT(!hasNodeWithColor(*oPage, "polyPolygonColor"_ostr, "#c00000"_ostr));
+
+    // The footer is shown and differs per slide, so the slide has its own copy of it, marked
+    // as the master's content and carrying what the footer reads on this slide. The slide
+    // number is turned off on a new slide, so there is no copy of it.
+    const auto oFooterCopy = findEntryOfObject(aSlide, pFooter->GetUniqueID());
+    CPPUNIT_ASSERT_MESSAGE("the slide has no copy of the footer", oFooterCopy.has_value());
+    CPPUNIT_ASSERT_EQUAL(true, oFooterCopy->getBool("masterContent").value_or(false));
+    CPPUNIT_ASSERT(oFooterCopy->has("primitives"));
+    CPPUNIT_ASSERT(oFooterCopy->has("transform"));
+    // The aids that mark out a placeholder belong to the page it lives on, the master, so the
+    // copy brings none of them onto the slide.
+    CPPUNIT_ASSERT_MESSAGE("the copy carries the placeholder aids", !oFooterCopy->has("aids"));
+    CPPUNIT_ASSERT(!findEntryOfObject(aSlide, pNumber->GetUniqueID()).has_value());
+
+    // Putting an object on the slide moves its object set, so the delta that follows carries the
+    // whole order. The copy is part of it, since it is an object of the slide like any other.
+    const sal_Int64 nVersion = aSlide.getInt("/version").value_or(-1);
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(2000, 1000)), Color(0x4472c4),
+                 COL_BLACK);
+
+    auto aDelta = getVectorPrimitives(u"testSlideMasterReferenceDelta", nVersion);
+    bool bOrdered = false;
+    const size_t nOrderCount = aDelta.getSize("/order").value_or(0);
+    for (size_t nIndex = 0; nIndex < nOrderCount; ++nIndex)
+    {
+        if (aDelta.getInt(rtl::Concat2View("/order/" + OString::number(sal_Int32(nIndex))))
+                .value_or(0)
+            == sal_Int64(pFooter->GetUniqueID()))
+            bOrdered = true;
+    }
+    CPPUNIT_ASSERT_MESSAGE("the order does not name the copy", bOrdered);
+
+    // The master part carries the rectangle and says how each object behaves behind a slide.
+    auto aMaster = getVectorPrimitives(u"testSlideMasterReferenceMaster", -1, 1);
+    const auto oRect = findEntryOfObject(aMaster, pRect->GetUniqueID());
+    CPPUNIT_ASSERT(oRect.has_value());
+    CPPUNIT_ASSERT(hasNodeWithColor(*oRect, "polyPolygonColor"_ostr, "#c00000"_ostr));
+    CPPUNIT_ASSERT(!oRect->has("hiddenBehindSlide"));
+    CPPUNIT_ASSERT(!oRect->has("slideDependent"));
+    const auto oTitle = findEntryOfObject(aMaster, pTitle->GetUniqueID());
+    CPPUNIT_ASSERT(oTitle.has_value());
+    CPPUNIT_ASSERT_EQUAL(true, oTitle->getBool("hiddenBehindSlide").value_or(false));
+    const auto oFooter = findEntryOfObject(aMaster, pFooter->GetUniqueID());
+    CPPUNIT_ASSERT(oFooter.has_value());
+    CPPUNIT_ASSERT_EQUAL(true, oFooter->getBool("slideDependent").value_or(false));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testMasterTextPlaceholderIsHiddenBehindSlide)
+{
+    // A text placeholder of the master, such as the subtitle of a layout imported from PPTX,
+    // holds its prompt text. The prompt is for editing the master, so a slide does not show it.
+    // The footer is shown behind the slide as before.
+    createBlankDoc();
+    SdPage* pMasterPage = createMasterPlaceholders();
+    SdrObject* pSubtitle = pMasterPage->CreatePresObj(
+        PresObjKind::Text, false, tools::Rectangle(Point(1000, 5000), Size(8000, 2000)));
+    CPPUNIT_ASSERT(pSubtitle);
+    static_cast<SdrTextObj*>(pSubtitle)->SetText(u"Click to edit Master subtitle style"_ustr);
+    pSubtitle->SetEmptyPresObj(false);
+    SdrObject* pFooter = pMasterPage->GetPresObj(PresObjKind::Footer);
+    CPPUNIT_ASSERT(pFooter);
+
+    auto aMaster = getVectorPrimitives(u"testMasterTextPlaceholder", -1, 1);
+    const auto oSubtitle = findEntryOfObject(aMaster, pSubtitle->GetUniqueID());
+    CPPUNIT_ASSERT(oSubtitle.has_value());
+    // Without the accompanying fix in place, this test would have failed, as the placeholder
+    // holds text and so was drawn behind every slide.
+    CPPUNIT_ASSERT_EQUAL(true, oSubtitle->getBool("hiddenBehindSlide").value_or(false));
+    const auto oFooter = findEntryOfObject(aMaster, pFooter->GetUniqueID());
+    CPPUNIT_ASSERT(oFooter.has_value());
+    CPPUNIT_ASSERT(!oFooter->has("hiddenBehindSlide"));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testMasterViewCarriesTheMasterObjects)
+{
+    // In master view the master page is the page being shown, so its own
+    // objects come back as the page objects rather than as master content
+    // behind a slide.
+    createBlankDoc();
+    CPPUNIT_ASSERT(page(1)->TRG_HasMasterPage());
+
+    SdrPage& rMasterPage = page(1)->TRG_GetMasterPage();
+    const size_t nPlaceholderCount = rMasterPage.GetObjCount();
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        rMasterPage.getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    rMasterPage.NbcInsertObject(pRect.get());
+
+    auto aMaster = getVectorPrimitives(u"testMasterView", -1, 1);
+    assertJsonPath(aMaster, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(1), aMaster.getInt("/mode").value_or(-1));
+    // The page entry, then the placeholders and the new rectangle.
+    CPPUNIT_ASSERT_EQUAL(nPlaceholderCount + 2, aMaster.getSize("/objects").value_or(0));
+    assertJsonPath(aMaster, "/objects/0/kind", "page");
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pRect->GetUniqueID()),
+                         aMaster
+                             .getInt(rtl::Concat2View(
+                                 "/objects/" + OString::number(sal_Int32(nPlaceholderCount + 1))
+                                 + "/id"))
+                             .value_or(-1));
+
+    // The slide itself is still blank, and says so in the slide mode: only
+    // the page entry.
+    auto aSlide = getVectorPrimitives(u"testMasterViewSlide");
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(0), aSlide.getInt("/mode").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(size_t(1), aSlide.getSize("/objects").value_or(0));
+    assertJsonPath(aSlide, "/objects/0/kind", "page");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testMasterEditReachesTheSlideThroughTheMaster)
+{
+    // A slide draws its master from the master part, so an edit on a master object shows in
+    // master view and, through that part, on every slide that uses the master. The slide's own
+    // part does not move for it, and a delta for the slide has nothing to say.
+    createBlankDoc();
+    CPPUNIT_ASSERT(page(1)->TRG_HasMasterPage());
+
+    SdrPage& rMasterPage = page(1)->TRG_GetMasterPage();
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        rMasterPage.getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    rMasterPage.NbcInsertObject(pRect.get());
+    pRect->BroadcastObjectChange();
+
+    const sal_Int64 nMasterBefore
+        = getVectorPrimitives(u"testMasterPartVersion", -1, 1).getInt("/version").value_or(-1);
+    const sal_Int64 nSlideBefore
+        = getVectorPrimitives(u"testMasterPartVersionSlide").getInt("/version").value_or(-1);
+
+    moveObject(pRect.get(), Size(500, 500));
+
+    auto aMasterDelta = getVectorPrimitives(u"testMasterPartVersionDelta", nMasterBefore, 1);
+    assertJsonPath(aMasterDelta, "/type", "vectorprimitivesdelta");
+    CPPUNIT_ASSERT(carriesObject(aMasterDelta, pRect->GetUniqueID()));
+
+    // The slide neither carries the rectangle nor moved its version for it.
+    CPPUNIT_ASSERT_EQUAL(
+        nSlideBefore,
+        getVectorPrimitives(u"testMasterPartVersionSlide").getInt("/version").value_or(-1));
+    auto aSlideDelta = getVectorPrimitives(u"testMasterPartVersionSlideDelta", nSlideBefore);
+    assertNothingMoved(aSlideDelta, nSlideBefore);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testNotesEditRaisesTheNotesVersion)
+{
+    // An edit on a notes page raises the notes part and leaves the slide's
+    // part alone.
+    createBlankDoc();
+    const sal_Int64 nNotesBefore
+        = getVectorPrimitives(u"testNotesVersion", -1, 2).getInt("/version").value_or(-1);
+    const sal_Int64 nSlideBefore
+        = getVectorPrimitives(u"testNotesVersionSlide").getInt("/version").value_or(-1);
+
+    SdrPage* pNotesPage = page(2);
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        pNotesPage->getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    pNotesPage->NbcInsertObject(pRect.get());
+    pRect->BroadcastObjectChange();
+
+    CPPUNIT_ASSERT_GREATER(
+        nNotesBefore,
+        getVectorPrimitives(u"testNotesVersion", -1, 2).getInt("/version").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(
+        nSlideBefore,
+        getVectorPrimitives(u"testNotesVersionSlide").getInt("/version").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testNotesMasterEditRaisesTheNotesVersion)
+{
+    // The notes master shows on every notes page that uses it, so an edit on
+    // it raises the notes part and leaves the slide's part alone.
+    createBlankDoc();
+    SdrPage* pNotesPage = page(2);
+    CPPUNIT_ASSERT(pNotesPage->TRG_HasMasterPage());
+
+    const sal_Int64 nNotesBefore
+        = getVectorPrimitives(u"testNotesMasterVersion", -1, 2).getInt("/version").value_or(-1);
+    const sal_Int64 nSlideBefore
+        = getVectorPrimitives(u"testNotesMasterVersionSlide").getInt("/version").value_or(-1);
+
+    SdrPage& rNotesMaster = pNotesPage->TRG_GetMasterPage();
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        rNotesMaster.getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    rNotesMaster.NbcInsertObject(pRect.get());
+    pRect->BroadcastObjectChange();
+
+    CPPUNIT_ASSERT_GREATER(
+        nNotesBefore,
+        getVectorPrimitives(u"testNotesMasterVersion", -1, 2).getInt("/version").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(
+        nSlideBefore,
+        getVectorPrimitives(u"testNotesMasterVersionSlide").getInt("/version").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testMasterViewDeltaCarriesChangedObject)
+{
+    // A delta in master view behaves as it does for a slide: the order lists
+    // every object, only the changed one carries content.
+    createBlankDoc();
+    SdrPage& rMasterPage = page(1)->TRG_GetMasterPage();
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        rMasterPage.getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    rMasterPage.NbcInsertObject(pRect.get());
+    pRect->BroadcastObjectChange();
+
+    auto aFull = getVectorPrimitives(u"testMasterDeltaFull", -1, 1);
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+    const size_t nObjectCount = aFull.getSize("/objects").value_or(0);
+
+    moveObject(pRect.get(), Size(500, 0));
+
+    auto aDelta = getVectorPrimitives(u"testMasterDeltaSince", nVersion, 1);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    CPPUNIT_ASSERT(carriesObject(aDelta, pRect->GetUniqueID()));
+    CPPUNIT_ASSERT_EQUAL(nObjectCount, aFull.getSize("/objects").value_or(0));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testTextEditEntryNamesItsView)
+{
+    // A view runs at most one text edit and several views can be editing at
+    // once, even the same object, so an entry is named by the view whose edit
+    // it carries rather than by what that edit is running on.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), u"Named"_ustr);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(pObject);
+
+    auto aJson = getVectorPrimitives(u"testTextEditEntryView");
+    const auto oEntry = findEntryOfKind(aJson, "texteditoverlay");
+
+    const SfxViewShell* pViewShell = SfxViewShell::Current();
+    CPPUNIT_ASSERT(pViewShell);
+    const sal_Int32 nViewId = sal_Int32(pViewShell->GetViewShellId().get());
+
+    pView->SdrEndTextEdit();
+
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(nViewId), oEntry->getInt("viewId").value_or(-1));
+    // Below zero, where no object and no page can reach.
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(-2 - nViewId), oEntry->getInt("id").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pObject->GetUniqueID()), oEntry->getInt("parent").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testVerticalTextListsUprightCharacters)
+{
+    // In vertical text the CJK characters stand upright, while Latin letters and the corner
+    // brackets lie on their side along the turned baseline. A browser cannot tell the two apart,
+    // so a portion of vertical text lists the characters that stand upright.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), u"日本ABC"_ustr);
+    addTextBox(tools::Rectangle(Point(1000, 5000), Size(3000, 9000)),
+               u"日本ABC\u300c語\u300d"_ustr);
+    SdrObject* pAcross = page(1)->GetObj(0);
+    auto* pDown = DynCastSdrTextObj(page(1)->GetObj(1));
+    CPPUNIT_ASSERT(pDown);
+    pDown->SetVerticalWriting(true);
+
+    auto aJson = getVectorPrimitives(u"testVerticalTextUpright");
+
+    // The characters of the object that a portion lists as upright, and the others, each sorted,
+    // whichever portions the text is cut into.
+    auto aStandingOf = [&aJson](const SdrObject& rObject) {
+        const auto oEntry = findEntryOfObject(aJson, rObject.GetUniqueID());
+        CPPUNIT_ASSERT(oEntry);
+        std::vector<tools::JsonPath> aPortions;
+        collectNodesOfType(*oEntry, "textSimplePortion"_ostr, aPortions);
+        collectNodesOfType(*oEntry, "textDecoratedPortion"_ostr, aPortions);
+        std::u16string aUpright;
+        std::u16string aOthers;
+        for (const tools::JsonPath& rPortion : aPortions)
+        {
+            const OUString aText = OStringToOUString(
+                rPortion.getString("text").value_or(OString()), RTL_TEXTENCODING_UTF8);
+            const sal_Int32 nPosition = rPortion.getInt("textPosition").value_or(0);
+            const sal_Int32 nLength
+                = rPortion.getInt("textLength").value_or(aText.getLength() - nPosition);
+            const OUString aVisible = aText.copy(nPosition, nLength);
+            std::vector<bool> aStands(aVisible.getLength(), false);
+            if (const auto oUpright = rPortion.at("upright"))
+            {
+                for (const auto& rRange : oUpright->tree())
+                {
+                    std::vector<sal_Int64> aEnds;
+                    for (const auto& rEnd : rRange.second)
+                        aEnds.push_back(rEnd.second.get_value<sal_Int64>());
+                    CPPUNIT_ASSERT_EQUAL(size_t(2), aEnds.size());
+                    const sal_Int64 nFrom = aEnds[0];
+                    const sal_Int64 nTo = aEnds[1];
+                    CPPUNIT_ASSERT(0 <= nFrom);
+                    CPPUNIT_ASSERT(nFrom < nTo);
+                    CPPUNIT_ASSERT(nTo <= aVisible.getLength());
+                    std::fill(aStands.begin() + nFrom, aStands.begin() + nTo, true);
+                }
+            }
+            for (sal_Int32 nIndex = 0; nIndex < aVisible.getLength(); ++nIndex)
+                (aStands[nIndex] ? aUpright : aOthers).push_back(aVisible[nIndex]);
+        }
+        std::sort(aUpright.begin(), aUpright.end());
+        std::sort(aOthers.begin(), aOthers.end());
+        return std::make_pair(OUString(aUpright), OUString(aOthers));
+    };
+
+    // Across, no portion lists a character.
+    const auto [aAcrossUpright, aAcrossOthers] = aStandingOf(*pAcross);
+    CPPUNIT_ASSERT_EQUAL(OUString(), aAcrossUpright);
+    CPPUNIT_ASSERT_EQUAL(u"ABC日本"_ustr, aAcrossOthers);
+    // Down, the ideographs stand upright, and the letters and the brackets lie on their side.
+    const auto [aDownUpright, aDownSideways] = aStandingOf(*pDown);
+    CPPUNIT_ASSERT_EQUAL(u"日本語"_ustr, aDownUpright);
+    CPPUNIT_ASSERT_EQUAL(u"ABC\u300c\u300d"_ustr, aDownSideways);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testMasterTextEditIsServedInMasterView)
+{
+    // A master page is a part of master view, so an edit on one of its objects
+    // travels there: the entry that carries the edit comes with the page, and
+    // a keystroke moves the version of that part. The slide that uses the
+    // master carries no such entry.
+    createBlankDoc();
+    SdPage* pMasterPage = createMasterPlaceholders();
+    SdrObject* pTitle = pMasterPage->GetPresObj(PresObjKind::Title);
+    CPPUNIT_ASSERT(pTitle);
+
+    // The first pull is what marks the model as drawn from.
+    const sal_Int64 nBefore
+        = getVectorPrimitives(u"testMasterTextEditBase", -1, 1).getInt("/version").value_or(-1);
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    CPPUNIT_ASSERT(pView->SdrBeginTextEdit(pTitle));
+
+    auto aMaster = getVectorPrimitives(u"testMasterTextEdit", -1, 1);
+    const auto oEntry = findEntryOfKind(aMaster, "texteditoverlay");
+    const sal_Int64 nAtBegin = aMaster.getInt("/version").value_or(-1);
+
+    pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"X"_ustr);
+    const sal_Int64 nAfterKey
+        = getVectorPrimitives(u"testMasterTextEditKey", -1, 1).getInt("/version").value_or(-1);
+
+    auto aSlide = getVectorPrimitives(u"testMasterTextEditSlide");
+    const bool bSlideCarriesEdit = findEntryOfKind(aSlide, "texteditoverlay").has_value();
+
+    pView->SdrEndTextEdit();
+
+    CPPUNIT_ASSERT_MESSAGE("master view carries no entry for the edit", oEntry.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pTitle->GetUniqueID()), oEntry->getInt("parent").value_or(-1));
+    CPPUNIT_ASSERT_GREATER(nBefore, nAtBegin);
+    CPPUNIT_ASSERT_GREATER(nAtBegin, nAfterKey);
+    CPPUNIT_ASSERT(!bSlideCarriesEdit);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEmptyTextEditKeepsItsEntry)
+{
+    // The order names the entry of a running edit for as long as the edit
+    // runs, so the entry is written even when the edit holds no text. A client
+    // that has the text from before a deletion then replaces it with nothing,
+    // rather than keeping it or dropping the part because the order names an
+    // entry it never got.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), u"Gone"_ustr);
+
+    // The first pull is what marks the model as drawn from.
+    const sal_Int64 nBase
+        = getVectorPrimitives(u"testEmptyEditBase").getInt("/version").value_or(-1);
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    CPPUNIT_ASSERT(pView->SdrBeginTextEdit(page(1)->GetObj(0)));
+    const sal_Int64 nAtBegin
+        = getVectorPrimitives(u"testEmptyEditBegin").getInt("/version").value_or(-1);
+
+    EditView& rEditView = pView->GetTextEditOutlinerView()->GetEditView();
+    rEditView.SetSelection(ESelection::All());
+    rEditView.DeleteSelected();
+
+    auto aDelta = getVectorPrimitives(u"testEmptyEditDelta", nAtBegin);
+    // Since before the edit began, so the order the edit added its entry to travels.
+    auto aFull = getVectorPrimitives(u"testEmptyEditSinceBase", nBase);
+    const sal_Int64 nEntryId = -2 - sal_Int64(SfxViewShell::Current()->GetViewShellId().get());
+
+    pView->SdrEndTextEdit();
+
+    const auto oDeltaEntry = findEntryOfKind(aDelta, "texteditoverlay");
+    CPPUNIT_ASSERT_MESSAGE("the delta carries no entry for the emptied edit",
+                           oDeltaEntry.has_value());
+    // What is left of the text is an empty portion, or nothing at all.
+    const auto oPortion = findNodeOfType(*oDeltaEntry, "textSimplePortion"_ostr);
+    CPPUNIT_ASSERT_EQUAL(OString(),
+                         oPortion ? oPortion->getString("text").value_or(OString()) : OString());
+
+    const auto oFullEntry = findEntryOfKind(aFull, "texteditoverlay");
+    CPPUNIT_ASSERT_MESSAGE("the delta since before the edit carries no entry for it",
+                           oFullEntry.has_value());
+    CPPUNIT_ASSERT_MESSAGE("the order does not name the entry", orderNames(aFull, nEntryId));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testTypingMovesThePartVersionAtOnce)
+{
+    // The model change the shapes follow waits for a pause in the typing, which
+    // is far too slow for the text being typed. A keystroke moves the part's
+    // version, so the entry that carries the edit travels at once and a client
+    // does not drop the delta as one it already holds.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), u"Typed"_ustr);
+
+    // The first pull is what marks the model as drawn from.
+    getVectorPrimitives(u"testTypingBase");
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(page(1)->GetObj(0));
+
+    const sal_Int64 nBefore
+        = getVectorPrimitives(u"testTypingBeforeKey").getInt("/version").value_or(-1);
+
+    pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"X"_ustr);
+
+    const sal_Int64 nAfter
+        = getVectorPrimitives(u"testTypingAfterKey").getInt("/version").value_or(-1);
+
+    // A model change follows a pause in the typing, and by then the text has
+    // already traveled, so it adds nothing.
+    auto aSettled = getVectorPrimitives(u"testTypingSettled", nAfter);
+    assertNothingMoved(aSettled, nAfter);
+
+    pView->SdrEndTextEdit();
+
+    CPPUNIT_ASSERT_GREATER(nBefore, nAfter);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testChartTitleEditIsServedOnTheSlide)
+{
+    // A chart active in place edits its title in a view of its own.
+    createBlankDoc();
+    // In a kit session the chart becomes active in place without menus of its own.
+    comphelper::COKit::setActive(true);
+    comphelper::ScopeGuard aInactive([] { comphelper::COKit::setActive(false); });
+    dispatchCommand(mxComponent, u".uno:InsertObjectChart"_ustr, {});
+    Scheduler::ProcessEventsToIdle();
+    SdrOle2Obj* pChart = dynamic_cast<SdrOle2Obj*>(page(1)->GetObj(0));
+    CPPUNIT_ASSERT(pChart);
+    getSdDocShell()->GetViewShell()->ActivateObject(pChart, embed::EmbedVerbs::MS_OLEVERB_PRIMARY);
+    Scheduler::ProcessEventsToIdle();
+    SfxViewShell* pViewShell = SfxViewShell::Current();
+    CPPUNIT_ASSERT(pViewShell);
+    SfxInPlaceClient* pClient = pViewShell->GetIPClient();
+    CPPUNIT_ASSERT_MESSAGE("the inserted chart is not active in place", pClient);
+
+    uno::Reference<frame::XModel> xChartModel(pChart->getXModel());
+    uno::Reference<uno::XComponentContext> xContext(comphelper::getProcessComponentContext());
+    uno::Reference<chart2::XTitle> xTitle(xContext->getServiceManager()->createInstanceWithContext(
+                                              u"com.sun.star.chart2.Title"_ustr, xContext),
+                                          uno::UNO_QUERY_THROW);
+    uno::Reference<chart2::XFormattedString> xString(chart2::FormattedString::create(xContext));
+    xString->setString(u"Sales"_ustr);
+    xTitle->setText({ xString });
+    uno::Reference<chart2::XTitled>(xChartModel, uno::UNO_QUERY_THROW)->setTitleObject(xTitle);
+
+    // The first pull is what hands the parts of the chart out.
+    const sal_Int64 nBase
+        = getVectorPrimitives(u"testChartTitleEditBase").getInt("/version").value_or(-1);
+
+    const SdrObjList* pParts = svx::vector::membersOf(*pChart);
+    CPPUNIT_ASSERT(pParts);
+    SdrTextObj* pTitle = nullptr;
+    SdrObjListIter aIterator(pParts, SdrIterMode::DeepNoGroups);
+    while (aIterator.IsMore() && !pTitle)
+    {
+        SdrObject* pObject = aIterator.Next();
+        if (svx::vector::chartPartNameAround(*pObject).indexOf("Title=") >= 0)
+            pTitle = DynCastSdrTextObj(pObject);
+    }
+    CPPUNIT_ASSERT_MESSAGE("the chart has no title part", pTitle);
+    // The slide names the title by this id while the chart is active.
+    const sal_uInt64 nTitleId = svx::vector::idOf(*pTitle);
+
+    auto* pTextEdit
+        = dynamic_cast<svx::vector::InPlaceTextEdit*>(xChartModel->getCurrentController().get());
+    CPPUNIT_ASSERT(pTextEdit);
+    SdrObjEditView* pChartView = pTextEdit->getInPlaceTextEditView();
+    CPPUNIT_ASSERT(pChartView);
+
+    // The title is selected in the chart and F2 starts its edit:
+    uno::Reference<view::XSelectionSupplier> xSelection(xChartModel->getCurrentController(),
+                                                        uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT(xSelection->select(uno::Any(pTitle->GetName())));
+    auto* pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pDocument);
+    pDocument->postKeyEvent(COKitKeyEventType::DOWN, 0, KEY_F2);
+    pDocument->postKeyEvent(COKitKeyEventType::UP, 0, KEY_F2);
+    Scheduler::ProcessEventsToIdle();
+    CPPUNIT_ASSERT_MESSAGE("the edit of the title does not start", pChartView->IsTextEdit());
+    CPPUNIT_ASSERT_EQUAL(pTitle, pChartView->GetTextEditObject());
+    const bool bFound = svx::vector::inPlaceTextEditOf(*pViewShell) == pChartView;
+
+    // Since before the edit began, so the order the edit added its entry to travels.
+    auto aBegin = getVectorPrimitives(u"testChartTitleEditBegin", nBase);
+    const auto oEntry = findEntryOfKind(aBegin, "texteditoverlay");
+    const sal_Int64 nAtBegin = aBegin.getInt("/version").value_or(-1);
+    const sal_Int64 nEntryId = -2 - sal_Int64(pViewShell->GetViewShellId().get());
+
+    // A key is typed in the title:
+    pChartView->GetTextEditOutlinerView()->GetEditView().InsertText(u"X"_ustr);
+    auto aTyped = getVectorPrimitives(u"testChartTitleEditTyped", nAtBegin);
+    const auto oTypedEntry = findEntryOfKind(aTyped, "texteditoverlay");
+
+    // The client places the caret in the title by the id the slide names it by:
+    const bool bCaretPlaced = pChartView->SetKitTextCursor(nTitleId, 0, 1, 0, 1);
+
+    // A new selection in the chart ends the edit.
+    xSelection->select(uno::Any());
+    pClient->DeactivateObject();
+    Scheduler::ProcessEventsToIdle();
+
+    // The slide carries the edit of the chart with the title as its parent, also after a
+    // keystroke, and the caret lands in the title:
+    CPPUNIT_ASSERT_MESSAGE("the edit view of the chart is not found", bFound);
+    CPPUNIT_ASSERT_MESSAGE("the slide carries no entry for the edit", oEntry.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(nTitleId), oEntry->getInt("parent").value_or(-1));
+    CPPUNIT_ASSERT(orderNames(aBegin, nEntryId));
+    CPPUNIT_ASSERT_MESSAGE("a keystroke does not carry the entry", oTypedEntry.has_value());
+    CPPUNIT_ASSERT(findTextPortionUnder(*oTypedEntry, "X"_ostr).has_value());
+    CPPUNIT_ASSERT_MESSAGE("the caret is not placed in the title", bCaretPlaced);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testObjectUnderTextEditSaysSo)
+{
+    // The object a text edit runs on hides its own text and says the edit is
+    // running. An edit that ends having changed no text says nothing else, so
+    // the object has to come again or it keeps the look it had while hidden.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), u"Framed"_ustr);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    CPPUNIT_ASSERT(!getVectorPrimitives(u"testTextEditFlagBefore")
+                        .getBool("/objects/1/textEdit")
+                        .has_value());
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(pObject);
+
+    CPPUNIT_ASSERT_EQUAL(true, getVectorPrimitives(u"testTextEditFlagDuring")
+                                   .getBool("/objects/1/textEdit")
+                                   .value_or(false));
+
+    // Nothing was typed, so ending the edit changes no text. The object still
+    // has to come back with the text it had.
+    pView->SdrEndTextEdit();
+
+    auto aAfter = getVectorPrimitives(u"testTextEditFlagAfter");
+    CPPUNIT_ASSERT(!aAfter.getBool("/objects/1/textEdit").has_value());
+
+    const auto oObject = aAfter.at("/objects/1");
+    CPPUNIT_ASSERT(oObject.has_value());
+    CPPUNIT_ASSERT_MESSAGE("the object came back without its text",
+                           findTextPortionUnder(*oObject, "Framed"_ostr).has_value());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEditViewOnlyContentTravels)
+{
+    // The prompt of an empty placeholder sits inside a wrapper the drawing
+    // layer empties unless the output says it is an editing view. The payload
+    // serves one, so the wrapper arrives full and a thumbnail leaves it shut.
+    createSdImpressDoc();
+
+    auto aJson = getVectorPrimitives(u"testEditViewOnlyContent");
+
+    const auto oWrapper = findNodeOfType(aJson, "exclusiveEditView"_ostr);
+    CPPUNIT_ASSERT_MESSAGE("no edit-view-only content in the payload", oWrapper.has_value());
+    CPPUNIT_ASSERT_MESSAGE("the edit-view-only content arrived empty",
+                           oWrapper->getSize("children").value_or(0) > 0);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testNotesPageShowsTheSlide)
+{
+    // The page object on a notes page shows the slide, so its entry carries the
+    // slide's content rather than the outline the drawing layer stands in with,
+    // and a change on the slide reaches the notes page as a delta carrying it.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    SdPage* pNotesPage = static_cast<SdPage*>(page(2));
+    SdrObject* pPreview = pNotesPage->GetPresObj(PresObjKind::Page);
+    CPPUNIT_ASSERT(pPreview);
+
+    auto aNotes = getVectorPrimitives(u"testNotesPreview", -1, 2);
+    const sal_Int64 nVersion = aNotes.getInt("/version").value_or(-1);
+    const auto oEntry = findEntryOfObject(aNotes, pPreview->GetUniqueID());
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT_MESSAGE("the preview does not show the slide's rectangle",
+                           hasNodeWithColor(*oEntry, "polyPolygonColor"_ostr, "#4472c4"_ostr));
+
+    moveObject(page(1)->GetObj(0), Size(500, 0));
+
+    auto aDelta = getVectorPrimitives(u"testNotesPreviewDelta", nVersion, 2);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    CPPUNIT_ASSERT_MESSAGE("the notes delta does not carry the preview",
+                           findEntryOfObject(aDelta, pPreview->GetUniqueID()).has_value());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testNotesPreviewIsFramed)
+{
+    // The office draws a gray frame around a page object, and the preview carries one too.
+    createBlankDoc();
+    SdPage* pNotesPage = static_cast<SdPage*>(page(2));
+    const SdrObject* pPreview = pNotesPage->GetPresObj(PresObjKind::Page);
+    CPPUNIT_ASSERT(pPreview);
+
+    auto aNotes = getVectorPrimitives(u"testNotesPreviewFrame", -1, 2);
+    const auto oEntry = findEntryOfObject(aNotes, pPreview->GetUniqueID());
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT(findNodeOfType(*oEntry, "polygonHairline"_ostr).has_value());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testNotesPreviewReadsFieldsFromTheSlide)
+{
+    // The footer inside the slide preview of a notes page reads what the slide's own settings
+    // say, not what the notes page's do, the way the office draws the preview.
+    createBlankDoc();
+    createMasterPlaceholders();
+    SdPage* pSlide = static_cast<SdPage*>(page(1));
+    SdPage* pNotesPage = static_cast<SdPage*>(page(2));
+    CPPUNIT_ASSERT(pSlide);
+    CPPUNIT_ASSERT(pNotesPage);
+
+    sd::HeaderFooterSettings aSlideSettings = pSlide->getHeaderFooterSettings();
+    aSlideSettings.mbFooterVisible = true;
+    aSlideSettings.maFooterText = u"SlideFooter"_ustr;
+    pSlide->setHeaderFooterSettings(aSlideSettings);
+
+    sd::HeaderFooterSettings aNotesSettings = pNotesPage->getHeaderFooterSettings();
+    aNotesSettings.mbFooterVisible = true;
+    aNotesSettings.maFooterText = u"NotesFooter"_ustr;
+    pNotesPage->setHeaderFooterSettings(aNotesSettings);
+
+    auto aNotes = getVectorPrimitives(u"testNotesPreviewFields", -1, 2);
+    const SdrObject* pPreview = pNotesPage->GetPresObj(PresObjKind::Page);
+    CPPUNIT_ASSERT(pPreview);
+    const auto oEntry = findEntryOfObject(aNotes, pPreview->GetUniqueID());
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT(findTextPortionUnder(*oEntry, "SlideFooter"_ostr).has_value());
+    CPPUNIT_ASSERT(!findTextPortionUnder(*oEntry, "NotesFooter"_ostr).has_value());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEveryParentNamesAReportedObject)
+{
+    // A member names the group it sits in, and a client resolves that name
+    // against the same response, so every name has to be in it.
+    createBlankDoc();
+    SdrObject* pMember = addGroupedRectangle(
+        tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4));
+    CPPUNIT_ASSERT(pMember);
+    addRectangle(tools::Rectangle(Point(6000, 1000), Size(3000, 2000)), Color(0xc00000), COL_BLACK);
+
+    CPPUNIT_ASSERT(everyParentResolves(getVectorPrimitives(u"testParentsResolve")));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testNotesPageIsServedInItsOwnMode)
+{
+    // The notes pages are the third page list, so a view that shows them asks
+    // in mode 2 and is served the notes page at that index rather than the
+    // slide.
+    createBlankDoc();
+
+    auto aNotes = getVectorPrimitives(u"testNotesPage", -1, 2);
+    assertJsonPath(aNotes, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(2), aNotes.getInt("/mode").value_or(-1));
+
+    // The page comes first here as it does in the other modes, and the notes
+    // page keeps the placeholders a blank slide has none of.
+    assertJsonPath(aNotes, "/objects/0/kind", "page");
+    CPPUNIT_ASSERT(aNotes.getSize("/objects").value_or(0) > 1);
+    CPPUNIT_ASSERT(everyParentResolves(aNotes));
+
+    // The slide at the same index is blank apart from its page entry, so the
+    // two modes really are different pages.
+    auto aSlide = getVectorPrimitives(u"testNotesPageSlide");
+    CPPUNIT_ASSERT_EQUAL(size_t(1), aSlide.getSize("/objects").value_or(0));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testMasterPlaceholderCarriesItsAreaName)
+{
+    // Master view marks out each placeholder with a dashed boundary and the
+    // name of the area. The aids travel apart from the page content, so a
+    // target that draws the page without them can leave them out while it
+    // still draws the prompt text of an empty placeholder.
+    createBlankDoc();
+    SdPage* pMasterPage = createMasterPlaceholders();
+    SdrObject* pFooter = pMasterPage->GetPresObj(PresObjKind::Footer);
+    CPPUNIT_ASSERT(pFooter);
+
+    auto aMaster = getVectorPrimitives(u"testMasterAreaName", -1, 1);
+    const auto oEntry = findEntryOfObject(aMaster, pFooter->GetUniqueID());
+    CPPUNIT_ASSERT_MESSAGE("the footer placeholder has no entry", oEntry.has_value());
+
+    const auto oAids = oEntry->at("aids");
+    CPPUNIT_ASSERT_MESSAGE("the placeholder carries no aids", oAids.has_value());
+    CPPUNIT_ASSERT_MESSAGE("the placeholder got no dashed boundary",
+                           findNodeOfType(*oAids, "polygonStroke"_ostr).has_value());
+    CPPUNIT_ASSERT_MESSAGE("the area name did not reach the aids",
+                           findNodeOfType(*oAids, "textSimplePortion"_ostr).has_value());
+
+    const auto oPrimitives = oEntry->at("primitives");
+    CPPUNIT_ASSERT(oPrimitives.has_value());
+    CPPUNIT_ASSERT_MESSAGE("the aids are drawn with the page content",
+                           !findNodeOfType(*oPrimitives, "polygonStroke"_ostr).has_value());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPartStateFollowsThePage)
+{
+    // A part is the page, wherever it sits in the list. Removing the slide in front of one leaves
+    // the page, its id and the version the client holds for it as they were, and a request that
+    // names the page by its id still finds it.
+    createBlankDoc();
+    uno::Reference<drawing::XDrawPagesSupplier> xSupplier(mxComponent, uno::UNO_QUERY_THROW);
+    uno::Reference<drawing::XDrawPages> xPages = xSupplier->getDrawPages();
+    xPages->insertNewByIndex(0);
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(2), xPages->getCount());
+
+    // The rectangle goes on the second slide, page 3 in the document's own list.
+    SdrPage* pSecondSlide = page(3);
+    rtl::Reference<SdrRectObj> pRect
+        = new SdrRectObj(pSecondSlide->getSdrModelFromSdrPage(),
+                         tools::Rectangle(Point(1000, 1000), Size(3000, 2000)));
+    pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    pRect->SetMergedItem(XFillColorItem(OUString(), Color(0x4472c4)));
+    pSecondSlide->NbcInsertObject(pRect.get());
+    const OString aPartId = pSecondSlide->GetGuid().getString();
+    const OString aRemovedPartId = page(1)->GetGuid().getString();
+
+    auto oFull = requestVectorPrimitives(".uno:VectorPrimitives?partid=" + aPartId + "&mode=0");
+    CPPUNIT_ASSERT(oFull.has_value());
+    assertJsonPath(*oFull, "/partId", aPartId);
+    CPPUNIT_ASSERT_EQUAL(size_t(2), oFull->getSize("/objects").value_or(0));
+    const sal_Int64 nVersion = oFull->getInt("/version").value_or(-1);
+    CPPUNIT_ASSERT(nVersion >= 0);
+    const sal_Int64 nEpoch = oFull->getInt("/epoch").value_or(-1);
+
+    // Removing the first slide moves the slide with the rectangle to index 0.
+    uno::Reference<drawing::XDrawPage> xFirstSlide(xPages->getDrawPageByIndex(0), uno::UNO_SET_THROW);
+    xPages->remove(xFirstSlide);
+
+    // Named by its id, the page answers with the rectangle still on it.
+    auto oById = requestVectorPrimitives(".uno:VectorPrimitives?partid=" + aPartId + "&mode=0");
+    CPPUNIT_ASSERT(oById.has_value());
+    assertJsonPath(*oById, "/partId", aPartId);
+    CPPUNIT_ASSERT_EQUAL(size_t(2), oById->getSize("/objects").value_or(0));
+
+    // Nothing on the page changed, so a delta against the version the client holds is empty.
+    auto oDelta = requestVectorPrimitives(".uno:VectorPrimitives?partid=" + aPartId
+                                          + "&mode=0&since=" + OString::number(nVersion)
+                                          + "&epoch=" + OString::number(nEpoch));
+    CPPUNIT_ASSERT(oDelta.has_value());
+    assertNothingMoved(*oDelta, nVersion);
+
+    // The id of the removed slide names no page any more.
+    auto oGone
+        = requestVectorPrimitives(".uno:VectorPrimitives?partid=" + aRemovedPartId + "&mode=0");
+    CPPUNIT_ASSERT(oGone.has_value());
+    CPPUNIT_ASSERT(!oGone->has("/objects"));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testSlideCarriesTheMembersOfAMasterGroupWithAField)
+{
+    // A group on the master that holds a field reads differently on each slide, so the slide
+    // supplies it. A group has no primitives of its own, its members draw it, so the slide
+    // carries every member as well, each naming the group as its parent.
+    createBlankDoc();
+    SdPage* pMasterPage = static_cast<SdPage*>(&page(1)->TRG_GetMasterPage());
+    CPPUNIT_ASSERT(pMasterPage);
+    SdDrawDocument* pDrawDoc = getSdDocShell()->GetDoc();
+
+    rtl::Reference<SdrRectObj> pLogo = new SdrRectObj(
+        *pDrawDoc, tools::Rectangle(Point(1000, 1000), Size(2000, 2000)));
+    pLogo->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    pLogo->SetMergedItem(XFillColorItem(OUString(), Color(0xc00000)));
+
+    rtl::Reference<SdrRectObj> pNumber = new SdrRectObj(
+        *pDrawDoc, tools::Rectangle(Point(4000, 1000), Size(4000, 2000)), SdrObjKind::Text);
+    SdrOutliner& rOutliner = pDrawDoc->GetDrawOutliner();
+    rOutliner.Clear();
+    rOutliner.QuickInsertField(SvxFieldItem(SvxPageField(), EE_FEATURE_FIELD), ESelection());
+    pNumber->SetOutlinerParaObject(rOutliner.CreateParaObject());
+
+    rtl::Reference<SdrObjGroup> pGroup = new SdrObjGroup(*pDrawDoc);
+    pGroup->GetSubList()->NbcInsertObject(pLogo.get());
+    pGroup->GetSubList()->NbcInsertObject(pNumber.get());
+    pMasterPage->NbcInsertObject(pGroup.get());
+
+    auto aMaster = getVectorPrimitives(u"testMasterGroupWithField", -1, 1);
+    const auto oMasterGroup = findEntryOfObject(aMaster, pGroup->GetUniqueID());
+    CPPUNIT_ASSERT(oMasterGroup.has_value());
+    assertJsonPathBool(*oMasterGroup, "slideDependent", true);
+
+    auto aSlide = getVectorPrimitives(u"testMasterGroupWithFieldSlide");
+    for (const SdrObject* pObject :
+         { static_cast<const SdrObject*>(pGroup.get()), static_cast<const SdrObject*>(pLogo.get()),
+           static_cast<const SdrObject*>(pNumber.get()) })
+    {
+        const auto oEntry = findEntryOfObject(aSlide, pObject->GetUniqueID());
+        CPPUNIT_ASSERT_MESSAGE("the slide carries no entry for a master group member",
+                               oEntry.has_value());
+        assertJsonPathBool(*oEntry, "masterContent", true);
+    }
+    const auto oNumber = findEntryOfObject(aSlide, pNumber->GetUniqueID());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pGroup->GetUniqueID()),
+                         oNumber->getInt("parent").value_or(-1));
+    CPPUNIT_ASSERT(oNumber->getSize("primitives").value_or(0) > 0);
+    CPPUNIT_ASSERT(everyParentResolves(aSlide));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testGivingASlideAnotherMasterMovesItsVersion)
+{
+    // A slide names the master it draws under, so giving it another master changes what its
+    // page entry says, and a delta after that carries the entry with the new master's id.
+    createBlankDoc();
+    SdDrawDocument* pDrawDoc = getSdDocShell()->GetDoc();
+    SdPage* pSlide = pDrawDoc->GetSdPage(0, PageKind::Standard);
+    CPPUNIT_ASSERT(pSlide);
+    CPPUNIT_ASSERT(pSlide->TRG_HasMasterPage());
+    const SdPage* pOldMaster = static_cast<const SdPage*>(&pSlide->TRG_GetMasterPage());
+    CPPUNIT_ASSERT(pOldMaster);
+
+    uno::Reference<drawing::XMasterPagesSupplier> xSupplier(mxComponent, uno::UNO_QUERY_THROW);
+    uno::Reference<drawing::XDrawPages> xMasters = xSupplier->getMasterPages();
+    uno::Reference<drawing::XDrawPage> xNewMaster = xMasters->insertNewByIndex(1);
+    const SdPage* pNewMaster = pDrawDoc->GetMasterSdPage(1, PageKind::Standard);
+    CPPUNIT_ASSERT(pNewMaster);
+    CPPUNIT_ASSERT(pNewMaster != pOldMaster);
+
+    auto aFull = getVectorPrimitives(u"testMasterSwapFull");
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+    assertJsonPath(aFull, "/objects/0/masterPartId", pOldMaster->GetGuid().getString());
+
+    uno::Reference<drawing::XDrawPagesSupplier> xPagesSupplier(mxComponent, uno::UNO_QUERY_THROW);
+    uno::Reference<drawing::XMasterPageTarget> xTarget(
+        xPagesSupplier->getDrawPages()->getDrawPageByIndex(0), uno::UNO_QUERY_THROW);
+    xTarget->setMasterPage(xNewMaster);
+
+    auto aDelta = getVectorPrimitives(u"testMasterSwapDelta", nVersion);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    const auto oPage = findEntryOfKind(aDelta, "page"_ostr);
+    CPPUNIT_ASSERT(oPage.has_value());
+    assertJsonPath(*oPage, "masterPartId", pNewMaster->GetGuid().getString());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testSlideNamesTheMasterLayersItHides)
+{
+    // A slide can turn its master's objects off. The document keeps that as the set of master
+    // layers the slide shows, and the page entry names the hidden ones, so a reader drawing the
+    // shared master under the slide skips them.
+    createBlankDoc();
+    SdPage* pSlide = static_cast<SdPage*>(page(1));
+    CPPUNIT_ASSERT(pSlide);
+    CPPUNIT_ASSERT(pSlide->TRG_HasMasterPage());
+    SdrPage& rMasterPage = pSlide->TRG_GetMasterPage();
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        rMasterPage.getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    rMasterPage.NbcInsertObject(pRect.get());
+    const SdrLayerID nObjectsLayer
+        = getSdDocShell()->GetDoc()->GetLayerAdmin().GetLayerID(u"backgroundobjects"_ustr);
+    pRect->NbcSetLayer(nObjectsLayer);
+
+    auto aFull = getVectorPrimitives(u"testMasterLayersFull");
+    CPPUNIT_ASSERT(!aFull.has("/objects/0/masterHiddenLayers"));
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+
+    // Turn the master objects off for this slide, the way the menu entry does.
+    SdrLayerIDSet aVisible = pSlide->TRG_GetMasterPageVisibleLayers();
+    aVisible.Set(nObjectsLayer, false);
+    pSlide->SetMasterPageVisibleLayers(aVisible);
+
+    auto aDelta = getVectorPrimitives(u"testMasterLayersDelta", nVersion);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    const auto oPage = findEntryOfKind(aDelta, "page"_ostr);
+    CPPUNIT_ASSERT(oPage.has_value());
+    CPPUNIT_ASSERT_EQUAL(size_t(1), oPage->getSize("masterHiddenLayers").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(nObjectsLayer.get()),
+                         oPage->getInt("masterHiddenLayers/0").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPartVersionRisesOnBackgroundChange)
+{
+    // Changing the slide's background fill must raise the slide's
+    // reported content version.
+    createBlankDoc();
+
+    const sal_Int64 nBefore
+        = getVectorPrimitives(u"testBackgroundVersion").getInt("/version").value_or(-1);
+
+    // Set a solid background fill on the slide's page properties, the
+    // same change the page dialog applies.
+    SdrPageProperties& rPageProperties = page(1)->getSdrPageProperties();
+    rPageProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rPageProperties.PutItem(XFillColorItem(OUString(), Color(0x4472c4)));
+
+    const sal_Int64 nAfter
+        = getVectorPrimitives(u"testBackgroundVersion").getInt("/version").value_or(-1);
+
+    CPPUNIT_ASSERT_GREATER(nBefore, nAfter);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testDeltaCarriesResizedPage)
+{
+    // The page rectangle rides on the page entry, so a page that was resized
+    // reaches a client that already holds the slide as a delta carrying that
+    // entry with its new box.
+    createBlankDoc();
+    auto aFull = getVectorPrimitives(u"testResizeFull");
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+    const sal_Int64 nWidthBefore = aFull.getInt("/objects/0/width").value_or(-1);
+
+    // Through the drawing layer's page, which dispatches to the slide's own override.
+    SdrPage* pPage = page(1);
+    const Size aSize = pPage->GetSize();
+    pPage->SetSize(Size(aSize.Width() * 2, aSize.Height()));
+
+    auto aDelta = getVectorPrimitives(u"testResizeDelta", nVersion);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    // The page entry comes first whenever a response carries it.
+    assertJsonPath(aDelta, "/objects/0/kind", "page");
+    CPPUNIT_ASSERT_GREATER(nWidthBefore, aDelta.getInt("/objects/0/width").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEveryObjectKeepsItsEntry)
+{
+    // Every live object gets an entry in the objects array, even one that
+    // draws nothing, so the ids the order array carries always resolve
+    // against the object set the client holds.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    // A group with no members draws nothing on the slide.
+    rtl::Reference<SdrObjGroup> pGroup = new SdrObjGroup(page(1)->getSdrModelFromSdrPage());
+    page(1)->NbcInsertObject(pGroup.get());
+
+    auto aFull = getVectorPrimitives(u"testObjectEntryFull");
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aFull.getSize("/objects").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(static_cast<sal_Int64>(pGroup->GetUniqueID()),
+                         aFull.getInt("/objects/2/id").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testDeltaSkipsAnObjectThatOnlyBroadcast)
+{
+    // A broadcast says an object may have changed, not that it did. An object
+    // that looks the same and sits in the same place as when it was last
+    // written costs a comparison and travels no further.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    auto aFull = getVectorPrimitives(u"testUnchangedFull");
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+
+    pObject->BroadcastObjectChange();
+
+    // A pull is answered with the header alone. A push with nothing changed writes no document
+    // at all, so it sends no frame.
+    auto aDelta = getVectorPrimitives(u"testUnchangedDelta", nVersion);
+    assertNothingMoved(aDelta, nVersion);
+
+    auto oPush = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oPush.has_value());
+    CPPUNIT_ASSERT(!oPush->has("/type"));
+
+    // The version did not move either, so the next delta starts from here.
+    CPPUNIT_ASSERT_EQUAL(nVersion,
+                         getVectorPrimitives(u"testUnchangedFullAgain")
+                             .getInt("/version")
+                             .value_or(-1));
+
+    // Moving it really does change it, so then it travels.
+    moveObject(pObject, Size(500, 0));
+    auto aMoved = getVectorPrimitives(u"testUnchangedMovedDelta", nVersion);
+    CPPUNIT_ASSERT_EQUAL(size_t(1), aMoved.getSize("/objects").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pObject->GetUniqueID()),
+                         aMoved.getInt("/objects/0/id").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testTrimmedMemoryKeepsTheVersions)
+{
+    // Trimming memory drops what the model remembers of each object. The versions stay, so a
+    // client that holds the part is still answered from where it stands: nothing changed, so
+    // nothing travels, a full response carries every object again, and a change after the trim
+    // travels as one step.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    auto aFull = getVectorPrimitives(u"testTrimmedFull");
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+    const size_t nObjects = aFull.getSize("/objects").value_or(0);
+
+    vcl::kit::trimMemory(1024);
+
+    assertNothingMoved(getVectorPrimitives(u"testTrimmedDelta", nVersion), nVersion);
+
+    auto aAgain = getVectorPrimitives(u"testTrimmedFullAgain");
+    CPPUNIT_ASSERT_EQUAL(nVersion, aAgain.getInt("/version").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(nObjects, aAgain.getSize("/objects").value_or(0));
+    const auto oEntry = findEntryOfObject(aAgain, pObject->GetUniqueID());
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT_GREATER(size_t(0), oEntry->getSize("primitives").value_or(0));
+
+    moveObject(pObject, Size(500, 0));
+    auto aMoved = getVectorPrimitives(u"testTrimmedMoved", nVersion);
+    CPPUNIT_ASSERT_EQUAL(nVersion + 1, aMoved.getInt("/version").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(size_t(1), aMoved.getSize("/objects").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pObject->GetUniqueID()),
+                         aMoved.getInt("/objects/0/id").value_or(-1));
+}
+
+// Moving a shape inside a group moves the box of the group as well, so a
+// delta carries both of them and nothing else.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testDeltaCarriesGroupOnMemberChange)
+{
+    createBlankDoc();
+    SdrObject* pMember = addGroupedRectangle(
+        tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4));
+    SdrObject* pGroup = page(1)->GetObj(0);
+    addRectangle(tools::Rectangle(Point(6000, 1000), Size(3000, 2000)), Color(0xc00000), COL_BLACK);
+
+    const sal_Int64 nVersion
+        = getVectorPrimitives(u"testGroupFull").getInt("/version").value_or(-1);
+
+    // Move only the member inside the group after that version.
+    moveObject(pMember, Size(500, 0));
+
+    auto aDelta = getVectorPrimitives(u"testGroupDelta", nVersion);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aDelta.getSize("/objects").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pGroup->GetUniqueID()),
+                         aDelta.getInt("/objects/0/id").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pMember->GetUniqueID()),
+                         aDelta.getInt("/objects/1/id").value_or(-1));
+}
+
+// The first paint order recorded for a part is what the first pull writes, so
+// recording it moves nothing. A part pulled twice with nothing changed between
+// reports the same version, and the delta between them carries no object.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testFirstOrderRecordedMovesNothing)
+{
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    addRectangle(tools::Rectangle(Point(2000, 2000), Size(3000, 2000)), Color(0xc00000), COL_BLACK);
+
+    const sal_Int64 nFirst
+        = getVectorPrimitives(u"testFirstOrderFirst").getInt("/version").value_or(-1);
+    const sal_Int64 nSecond
+        = getVectorPrimitives(u"testFirstOrderSecond").getInt("/version").value_or(-1);
+    CPPUNIT_ASSERT_EQUAL(nFirst, nSecond);
+
+    auto aDelta = getVectorPrimitives(u"testFirstOrderDelta", nFirst);
+    CPPUNIT_ASSERT_EQUAL(size_t(0), aDelta.getSize("/objects").value_or(0));
+}
+
+// Removing a member of a group shrinks the box of the group, so the delta
+// carries the group entry with its new box along with the order.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testDeltaCarriesGroupOnMemberRemoval)
+{
+    createBlankDoc();
+    addGroupedRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4));
+    SdrObject* pGroup = page(1)->GetObj(0);
+    rtl::Reference<SdrRectObj> pSecond = new SdrRectObj(
+        page(1)->getSdrModelFromSdrPage(), tools::Rectangle(Point(6000, 1000), Size(3000, 2000)));
+    pSecond->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    pSecond->SetMergedItem(XFillColorItem(OUString(), Color(0xc00000)));
+    pGroup->GetSubList()->NbcInsertObject(pSecond.get());
+
+    auto aFull = getVectorPrimitives(u"testGroupRemovalFull");
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+    const auto oGroupBefore = findEntryOfObject(aFull, pGroup->GetUniqueID());
+    CPPUNIT_ASSERT(oGroupBefore.has_value());
+    const sal_Int64 nWidthBefore = oGroupBefore->getInt("width").value_or(-1);
+
+    pGroup->GetSubList()->RemoveObject(1);
+
+    auto aDelta = getVectorPrimitives(u"testGroupRemovalDelta", nVersion);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    const auto oGroupAfter = findEntryOfObject(aDelta, pGroup->GetUniqueID());
+    CPPUNIT_ASSERT_MESSAGE("the delta does not carry the group", oGroupAfter.has_value());
+    CPPUNIT_ASSERT_LESS(nWidthBefore, oGroupAfter->getInt("width").value_or(-1));
+}
+
+// A group is one entry and each member another, the members right after the
+// group in the order, each naming the group as its parent. The members draw
+// the group's content, so the group entry paints nothing itself.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testGroupMembersAreOwnEntries)
+{
+    createBlankDoc();
+    SdrObject* pMember = addGroupedRectangle(
+        tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4));
+    SdrObject* pGroup = page(1)->GetObj(0);
+
+    auto aFull = getVectorPrimitives(u"testGroupMembers");
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aFull.getSize("/objects").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pGroup->GetUniqueID()),
+                         aFull.getInt("/objects/1/id").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(0), aFull.getInt("/objects/1/parent").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(size_t(0), aFull.getSize("/objects/1/primitives").value_or(SIZE_MAX));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pMember->GetUniqueID()),
+                         aFull.getInt("/objects/2/id").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pGroup->GetUniqueID()),
+                         aFull.getInt("/objects/2/parent").value_or(-1));
+    CPPUNIT_ASSERT(aFull.getSize("/objects/2/primitives").value_or(0) > 0);
+
+    // Adding an object moves the set, so the next delta hands the client the
+    // whole order: the page first, then the group and the member, then the
+    // new object.
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+    rtl::Reference<SdrRectObj> pAdded = new SdrRectObj(
+        page(1)->getSdrModelFromSdrPage(), tools::Rectangle(Point(6000, 1000), Size(1000, 1000)));
+    // Inserting through InsertObject is what tells the model a new object is there.
+    page(1)->InsertObject(pAdded.get());
+
+    auto aDelta = getVectorPrimitives(u"testGroupMembersDelta", nVersion);
+    CPPUNIT_ASSERT_EQUAL(size_t(4), aDelta.getSize("/order").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(0), aDelta.getInt("/order/0").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pGroup->GetUniqueID()), aDelta.getInt("/order/1").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pMember->GetUniqueID()), aDelta.getInt("/order/2").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pAdded->GetUniqueID()), aDelta.getInt("/order/3").value_or(-1));
+}
+
+// Each entry names the layer the object is on, and a placeholder that holds
+// no content yet is flagged as such.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testObjectEntryCarriesLayerAndPlaceholderFlag)
+{
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    addRectangle(tools::Rectangle(Point(5000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+
+    SdrObject* pOnOtherLayer = page(1)->GetObj(0);
+    pOnOtherLayer->NbcSetLayer(SdrLayerID(3));
+    SdrObject* pPlaceholder = page(1)->GetObj(1);
+    pPlaceholder->SetEmptyPresObj(true);
+
+    auto aJson = getVectorPrimitives(u"testLayerAndPlaceholder");
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aJson.getSize("/objects").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(3), aJson.getInt("/objects/1/layer").value_or(-1));
+    CPPUNIT_ASSERT(!aJson.getBool("/objects/1/emptyPlaceholder").has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pPlaceholder->GetLayer().get()),
+                         aJson.getInt("/objects/2/layer").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(true, aJson.getBool("/objects/2/emptyPlaceholder").value_or(false));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testAnimationTargetNamesTheObjectEntryId)
+{
+    // An animation names its target by the id that the object entry carries, so a client can
+    // find the entry an effect is for.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)), Color(0x4472c4), COL_BLACK);
+
+    auto aJson = getVectorPrimitives(u"testObjectId");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+
+    SdrObject* pObject = page(1)->GetObj(0);
+    CPPUNIT_ASSERT(pObject);
+    const sal_Int64 nId = aJson.getInt("/objects/1/id").value_or(-1);
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pObject->GetUniqueID()), nId);
+    CPPUNIT_ASSERT_EQUAL(OString(OString::number(nId)),
+                         sd::getAnimationTargetName(cpo::uno::Any(pObject->getUnoShape())));
+
+    // A paragraph target names its shape by the same id, with the paragraph after it.
+    CPPUNIT_ASSERT_EQUAL(OString(OString::number(nId) + "_1"),
+                         sd::getAnimationTargetName(cpo::uno::Any(
+                             presentation::ParagraphTarget(pObject->getUnoShape(), 1))));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testObjectEntryCarriesItsShapeType)
+{
+    // A custom shape names its geometry type, so a rectangle and an ellipse can be told apart
+    // although both are custom shapes. A text box is no custom shape and names none.
+    createBlankDoc();
+    addCustomShape(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), u"rect"_ustr);
+    addCustomShape(tools::Rectangle(Point(5000, 1000), Size(3000, 2000)), u"ellipse"_ustr);
+    addTextBox(tools::Rectangle(Point(1000, 5000), Size(3000, 2000)), u"Text"_ustr);
+
+    auto aJson = getVectorPrimitives(u"testShapeType");
+    CPPUNIT_ASSERT_EQUAL(size_t(4), aJson.getSize("/objects").value_or(0));
+
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(static_cast<sal_Int32>(SdrObjKind::CustomShape)),
+                         aJson.getInt("/objects/1/objectKind").value_or(-1));
+    assertJsonPath(aJson, "/objects/1/shapeType", "rect");
+    assertJsonPath(aJson, "/objects/2/shapeType", "ellipse");
+    CPPUNIT_ASSERT(!aJson.has("/objects/3/shapeType"));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEveryParagraphCarriesItsRectangle)
+{
+    // An effect on one paragraph of a text is expressed about the center of that paragraph,
+    // so each paragraph node names the rectangle it covers, in the twips of its object.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(8000, 5000)), u"One\nTwo\nThree"_ustr);
+
+    auto aJson = getVectorPrimitives(u"testParagraphBounds");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+
+    std::vector<tools::JsonPath> aParagraphs;
+    collectNodesOfType(aJson, "textHierarchyParagraph"_ostr, aParagraphs);
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aParagraphs.size());
+
+    const double fObjectLeft = aJson.getInt("/objects/1/x").value_or(0);
+    const double fObjectTop = aJson.getInt("/objects/1/y").value_or(0);
+    const double fObjectRight = fObjectLeft + aJson.getInt("/objects/1/width").value_or(0);
+    const double fObjectBottom = fObjectTop + aJson.getInt("/objects/1/height").value_or(0);
+
+    double fPreviousTop = -1.0;
+    for (const tools::JsonPath& rParagraph : aParagraphs)
+    {
+        CPPUNIT_ASSERT_EQUAL(size_t(4), rParagraph.getSize("bounds").value_or(0));
+        const double fLeft = rParagraph.getDouble("bounds/0").value_or(0);
+        const double fTop = rParagraph.getDouble("bounds/1").value_or(0);
+        const double fRight = rParagraph.getDouble("bounds/2").value_or(0);
+        const double fBottom = rParagraph.getDouble("bounds/3").value_or(0);
+        CPPUNIT_ASSERT(fRight > fLeft);
+        CPPUNIT_ASSERT(fBottom > fTop);
+
+        // The paragraph lies inside its object, which shows that both are in the same unit.
+        CPPUNIT_ASSERT(fLeft >= fObjectLeft);
+        CPPUNIT_ASSERT(fRight <= fObjectRight);
+        CPPUNIT_ASSERT(fTop >= fObjectTop);
+        CPPUNIT_ASSERT(fBottom <= fObjectBottom);
+
+        // The paragraphs follow one another down the object, in the order of the text.
+        CPPUNIT_ASSERT(fTop > fPreviousTop);
+        fPreviousTop = fTop;
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testAutoColorFollowsPageBackground)
+{
+    // Text in the automatic color keeps the marker on a light and on a dark slide. The fill the
+    // slide shows behind it is named by the page entry.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(8000, 2000)), u"Hello"_ustr);
+
+    getVectorPrimitives(u"testAutoColorLight");
+    auto oLight = findTextPortion("Hello"_ostr);
+    CPPUNIT_ASSERT(oLight.has_value());
+    assertJsonPath(*oLight, "fontcolor", "auto");
+
+    SdrPageProperties& rProperties = page(1)->getSdrPageProperties();
+    rProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rProperties.PutItem(XFillColorItem(OUString(), COL_BLACK));
+
+    auto aDark = getVectorPrimitives(u"testAutoColorDark");
+    auto oDark = findTextPortion("Hello"_ostr);
+    CPPUNIT_ASSERT(oDark.has_value());
+    assertJsonPath(*oDark, "fontcolor", "auto");
+    assertJsonPath(aDark, "/objects/0/backdrop", "#000000");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testHiddenBackgroundLayerKeepsOwnBackdrop)
+{
+    // A page that hides the background layer of its master still paints its own fill, so the
+    // page entry goes on naming it as the surface.
+    createBlankDoc();
+    SdPage* pSlide = static_cast<SdPage*>(page(1));
+    SdrPageProperties& rProperties = pSlide->getSdrPageProperties();
+    rProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rProperties.PutItem(XFillColorItem(OUString(), COL_BLACK));
+
+    auto aShown = getVectorPrimitives(u"testHiddenBackgroundLayerShown");
+    assertJsonPath(aShown, "/objects/0/backdrop", "#000000");
+    const sal_Int64 nVersion = aShown.getInt("/version").value_or(-1);
+
+    const SdrLayerID nBackgroundLayer
+        = getSdDocShell()->GetDoc()->GetLayerAdmin().GetLayerID(u"background"_ustr);
+    SdrLayerIDSet aVisible = pSlide->TRG_GetMasterPageVisibleLayers();
+    aVisible.Set(nBackgroundLayer, false);
+    pSlide->SetMasterPageVisibleLayers(aVisible);
+
+    auto aDelta = getVectorPrimitives(u"testHiddenBackgroundLayerDelta", nVersion);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    const auto oPage = findEntryOfKind(aDelta, "page"_ostr);
+    CPPUNIT_ASSERT(oPage.has_value());
+    assertJsonPath(*oPage, "backdrop", "#000000");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testTransparentPageFillKeepsItsTransparency)
+{
+    // A page fill that lets the document background show through is mixed with that background
+    // where the view paints. The page entry names the fill and its transparency apart, so the
+    // same tree serves a dark and a light view.
+    createBlankDoc();
+    SdrPageProperties& rProperties = page(1)->getSdrPageProperties();
+    rProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rProperties.PutItem(XFillColorItem(OUString(), COL_WHITE));
+    rProperties.PutItem(XFillTransparenceItem(90));
+
+    auto aJson = getVectorPrimitives(u"testTransparentPageFillKeepsItsTransparency");
+    assertJsonPath(aJson, "/objects/0/backdrop", "#ffffff");
+    assertJsonPathDouble(aJson, "/objects/0/backdropTransparency", 0.9, 1e-9);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testTransparentShapeFillKeepsItsTransparency)
+{
+    // A shape fill that lets the page show through is mixed with the page where the view
+    // paints. The text names the fill and its transparency apart, so the automatic text color
+    // is chosen against what the view shows under it.
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), u"Hello"_ustr);
+    SdrObject* pShape = page(1)->GetObj(0);
+    pShape->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    pShape->SetMergedItem(XFillColorItem(OUString(), Color(0x203040)));
+    pShape->SetMergedItem(XFillTransparenceItem(50));
+
+    getVectorPrimitives(u"testTransparentShapeFillKeepsItsTransparency");
+    auto oText = findTextPortion("Hello"_ostr);
+    CPPUNIT_ASSERT(oText.has_value());
+    assertJsonPath(*oText, "backdrop", "#203040");
+    assertJsonPathDouble(*oText, "backdropTransparency", 0.5, 1e-9);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testSameBackgroundAgainSendsNothing)
+{
+    // A page property set to the value it already has announces a change like any other. The
+    // page entry is compared against what was written last, so a delta after such a write is
+    // empty.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+
+    SdrPageProperties& rProperties = page(1)->getSdrPageProperties();
+    rProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rProperties.PutItem(XFillColorItem(OUString(), Color(0xc00000)));
+
+    auto aFull = getVectorPrimitives(u"testSameBackgroundFull");
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+
+    rProperties.PutItem(XFillColorItem(OUString(), Color(0xc00000)));
+
+    auto aDelta = getVectorPrimitives(u"testSameBackgroundDelta", nVersion);
+    assertNothingMoved(aDelta, nVersion);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testDeltaCarriesChangedBackground)
+{
+    // The slide background is serialized with the master page content, so
+    // a delta whose baseline predates a background change must carry that
+    // content anew.
+
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    page(1)->GetObj(0)->BroadcastObjectChange();
+
+    auto aFull = getVectorPrimitives(u"testBackgroundDeltaFull");
+    const sal_Int64 nVersion = aFull.getInt("/version").value_or(-1);
+
+    // Change the slide background after that version.
+    SdrPageProperties& rPageProperties = page(1)->getSdrPageProperties();
+    rPageProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rPageProperties.PutItem(XFillColorItem(OUString(), Color(0xc00000)));
+
+    auto aDelta = getVectorPrimitives(u"testBackgroundDelta", nVersion);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    // The delta names the version it was compared against, and both payloads count their
+    // versions in the same space.
+    assertJsonPath(aDelta, "/from", nVersion);
+    assertJsonPath(aDelta, "/epoch", aFull.getInt("/epoch").value_or(-1));
+    // The slide object itself is unchanged, so the only entry is the page,
+    // with the new background.
+    CPPUNIT_ASSERT_EQUAL(size_t(1), aDelta.getSize("/objects").value_or(SIZE_MAX));
+    assertJsonPath(aDelta, "/objects/0/kind", "page");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPushAfterAnotherPullStillCarriesTheChange)
+{
+    // The mark says where the readers stand. A reader that pulled the part whole before any
+    // change holds it at version zero, and a pull by another reader that runs after a change
+    // but before the push counts the version up for itself alone. The push that follows still
+    // steps from zero, so the first reader is given the change.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+
+    // The first reader holds the part at the version the first response left it at.
+    auto aFirst = getVectorPrimitives(u"testLaterPullFirst");
+    const sal_Int64 nFirst = aFirst.getInt("/version").value_or(-1);
+    CPPUNIT_ASSERT(nFirst >= 0);
+
+    moveObject(page(1)->GetObj(0), Size(500, 500));
+
+    // A second reader pulls before the push and sees the moved object at a later version.
+    auto aSecond = getVectorPrimitives(u"testLaterPullSecond");
+    CPPUNIT_ASSERT_GREATER(nFirst, aSecond.getInt("/version").value_or(-1));
+
+    // The push steps from where the first reader stands and carries the object it has not
+    // seen.
+    auto oDelta = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oDelta.has_value());
+    assertJsonPath(*oDelta, "/type", "vectorprimitivesdelta");
+    assertJsonPath(*oDelta, "/from", nFirst);
+    CPPUNIT_ASSERT(carriesObject(*oDelta, page(1)->GetObj(0)->GetUniqueID()));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPushCarriesOnlyTheChangesSinceTheFirstServe)
+{
+    // A push carries what changed since the part was last served and names the version it
+    // starts from. The mark belongs to the part rather than to whoever asked, and the first
+    // response to serve the part sets it, since nothing holds the part before that.
+
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    addRectangle(tools::Rectangle(Point(6000, 1000), Size(3000, 2000)), Color(0xc00000), COL_BLACK);
+    page(1)->GetObj(0)->BroadcastObjectChange();
+    page(1)->GetObj(1)->BroadcastObjectChange();
+
+    // The pull gives the page and both objects, and the response carries the version it left
+    // the part at.
+    auto aFull = getVectorPrimitives(u"testPushMark");
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aFull.getSize("/objects").value_or(0));
+    const sal_Int64 nServed = aFull.getInt("/version").value_or(-1);
+    CPPUNIT_ASSERT(nServed >= 0);
+
+    // The payload says which version space its versions count in.
+    const sal_Int64 nEpoch = aFull.getInt("/epoch").value_or(-1);
+    CPPUNIT_ASSERT(nEpoch > 0);
+
+    // Nothing held the part before that response, so the mark starts where the response left
+    // the part and a push right after it has nothing to carry.
+    auto oQuiet = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oQuiet.has_value());
+    CPPUNIT_ASSERT(!oQuiet->has("/type"));
+    CPPUNIT_ASSERT(!oQuiet->has("/order"));
+    CPPUNIT_ASSERT(!oQuiet->has("/objects"));
+
+    // A later change is a step from there, and the only object that travels is the one
+    // that moved.
+    moveObject(page(1)->GetObj(0), Size(500, 500));
+    auto oDelta = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oDelta.has_value());
+    assertJsonPath(*oDelta, "/type", "vectorprimitivesdelta");
+    assertJsonPath(*oDelta, "/epoch", nEpoch);
+    assertJsonPath(*oDelta, "/from", nServed);
+    CPPUNIT_ASSERT_EQUAL(size_t(1), oDelta->getSize("/objects").value_or(0));
+
+    // The mark moved with it, so the push after it has nothing left to carry.
+    auto oAfter = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oAfter.has_value());
+    CPPUNIT_ASSERT(!oAfter->has("/type"));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPushWritesNothingForAForgottenPart)
+{
+    // A push goes to the clients that hold the part. Once the last of them let the part go, a
+    // change pushes nothing, and the next client to ask is given the whole slide as it is then.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    addRectangle(tools::Rectangle(Point(6000, 1000), Size(3000, 2000)), Color(0xc00000), COL_BLACK);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    auto aFull = getVectorPrimitives(u"testForgottenFull");
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aFull.getSize("/objects").value_or(0));
+    const sal_Int64 nHeld = aFull.getInt("/version").value_or(-1);
+    CPPUNIT_ASSERT(nHeld >= 0);
+
+    requestVectorPrimitivesRaw(".uno:VectorForgetPart?partid=" + firstPartId());
+
+    moveObject(pObject, Size(500, 500));
+    auto oUnheld = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oUnheld.has_value());
+    CPPUNIT_ASSERT(!oUnheld->has("/type"));
+    CPPUNIT_ASSERT(!oUnheld->has("/order"));
+    CPPUNIT_ASSERT(!oUnheld->has("/objects"));
+
+    // The version from before the part was forgotten names content the part no longer knows,
+    // so the answer is the whole slide, with the object where the move left it.
+    auto aAgain = getVectorPrimitives(u"testForgottenAgain", nHeld);
+    assertJsonPath(aAgain, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT(!aAgain.has("/from"));
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aAgain.getSize("/objects").value_or(0));
+    const sal_Int64 nServed = aAgain.getInt("/version").value_or(-1);
+    CPPUNIT_ASSERT_GREATER(nHeld, nServed);
+    const auto oEntry = findEntryOfObject(aAgain, pObject->GetUniqueID());
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT_GREATER(size_t(0), oEntry->getSize("primitives").value_or(0));
+
+    // The part is held again, so a push right after has nothing to carry and a later change
+    // is a step from the version that pull served.
+    auto oQuiet = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oQuiet.has_value());
+    CPPUNIT_ASSERT(!oQuiet->has("/type"));
+
+    moveObject(pObject, Size(500, 500));
+    auto oDelta = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oDelta.has_value());
+    assertJsonPath(*oDelta, "/type", "vectorprimitivesdelta");
+    assertJsonPath(*oDelta, "/from", nServed);
+    CPPUNIT_ASSERT_EQUAL(size_t(1), oDelta->getSize("/objects").value_or(0));
+    CPPUNIT_ASSERT(carriesObject(*oDelta, pObject->GetUniqueID()));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPartStartsAboveTheVersionsOfAForgottenPart)
+{
+    // A version a client still names from a part the model dropped names no content of any part
+    // served later, so every part first served after that starts above it.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    getVectorPrimitives(u"testFloorFull");
+    moveObject(pObject, Size(500, 500));
+    auto oDelta = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oDelta.has_value());
+    const sal_Int64 nHeld = oDelta->getInt("/version").value_or(-1);
+    CPPUNIT_ASSERT_GREATER(sal_Int64(0), nHeld);
+
+    requestVectorPrimitivesRaw(".uno:VectorForgetPart?partid=" + firstPartId());
+
+    // The master was never served before.
+    auto aMaster = getVectorPrimitives(u"testFloorMaster", -1, 1);
+    assertJsonPath(aMaster, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_GREATER(nHeld, aMaster.getInt("/version").value_or(-1));
+
+    // The slide itself comes back whole and above the version it was dropped at.
+    auto aAgain = getVectorPrimitives(u"testFloorAgain", nHeld);
+    assertJsonPath(aAgain, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_GREATER(nHeld, aAgain.getInt("/version").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPushWritesNothingBeforeTheFirstServe)
+{
+    // Nothing holds a part before the first response serves it, so a change before that pushes
+    // nothing and the first pull carries the whole slide.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    moveObject(page(1)->GetObj(0), Size(500, 500));
+
+    auto oUnheld = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oUnheld.has_value());
+    CPPUNIT_ASSERT(!oUnheld->has("/type"));
+    CPPUNIT_ASSERT(!oUnheld->has("/objects"));
+
+    auto aFull = getVectorPrimitives(u"testUnservedFull");
+    assertJsonPath(aFull, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aFull.getSize("/objects").value_or(0));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEditedTextAppearsInPrimitives)
+{
+    // While a text object is being edited, what has been typed so far must
+    // appear in the payload, on the entry that carries the running edit rather
+    // than on the object, which hides its own text while the edit runs.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), Color(0x4472c4), COL_BLACK);
+
+    // Enter text edit on the object and type a word.
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(page(1)->GetObj(0));
+    EditView& rEditView = pView->GetTextEditOutlinerView()->GetEditView();
+    rEditView.InsertText(u"Hello"_ustr);
+
+    // Serialize while the edit is still active.
+    SdXImpressDocument* pDoc = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pDoc);
+    tools::JsonWriter aJsonWriter;
+    const OString aCommand = ".uno:VectorPrimitives?partid=" + firstPartId();
+    pDoc->getCommandValues(aJsonWriter, std::string_view(aCommand.getStr(), aCommand.getLength()));
+    const OString aResult = aJsonWriter.finishAndGetAsOString();
+
+    pView->SdrEndTextEdit();
+
+    CPPUNIT_ASSERT_MESSAGE(aResult.getStr(), aResult.indexOf("Hello") >= 0);
+
+    auto oJson = tools::JsonPath::parse(std::string_view(aResult.getStr(), aResult.getLength()));
+    CPPUNIT_ASSERT(oJson.has_value());
+
+    // The running edit is the last entry, named by the object it runs on.
+    const size_t nCount = oJson->getSize("/objects").value_or(0);
+    assertJsonPath(*oJson,
+                   rtl::Concat2View("/objects/" + OString::number(sal_Int32(nCount - 1))
+                                    + "/kind"),
+                   "texteditoverlay");
+
+    const auto oEntry = findEntryOfKind(*oJson, "texteditoverlay");
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(page(1)->GetObj(0)->GetUniqueID()),
+                         oEntry->getInt("parent").value_or(-1));
+
+    // The object it runs on no longer carries the text, so the only "Hello"
+    // in the payload is the one on that entry.
+    const auto oEdited = oJson->at("/objects/1");
+    CPPUNIT_ASSERT(oEdited.has_value());
+    CPPUNIT_ASSERT(!findTextPortionUnder(*oEdited, "Hello"_ostr).has_value());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testDeltaIncludesEditedObject)
+{
+    // Text typed into an object appears in the delta before the edit ends,
+    // so the view follows the typing rather than waiting for the edit to be
+    // committed.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), Color(0x4472c4), COL_BLACK);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    // The first pull is what marks the model as drawn from, which is what
+    // makes an open edit broadcast its changes.
+    const sal_Int64 nVersion
+        = getVectorPrimitives(u"testEditDeltaBase").getInt("/version").value_or(-1);
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(pObject);
+    pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"Hello"_ustr);
+
+    auto aDelta = getVectorPrimitives(u"testEditDelta", nVersion);
+
+    pView->SdrEndTextEdit();
+
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    // The typed text rides on the entry for the running edit, which names the
+    // object it runs on.
+    const auto oEntry = findEntryOfKind(aDelta, "texteditoverlay");
+    CPPUNIT_ASSERT(oEntry.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pObject->GetUniqueID()), oEntry->getInt("parent").value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testDeltaIncludesGroupWithEditedObject)
+{
+    // An edit on an object inside a group changes that member the same way as
+    // one on the page: it hides its own text while the edit runs, so the delta
+    // carries the member.
+    createBlankDoc();
+    SdrObject* pInner
+        = addGroupedRectangle(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), COL_BLUE);
+
+    const sal_Int64 nVersion
+        = getVectorPrimitives(u"testGroupEditDeltaBase").getInt("/version").value_or(-1);
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(pInner);
+    pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"Hello"_ustr);
+
+    auto aDelta = getVectorPrimitives(u"testGroupEditDelta", nVersion);
+
+    pView->SdrEndTextEdit();
+
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    CPPUNIT_ASSERT(carriesObject(aDelta, pInner->GetUniqueID()));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPullMarksTheModelAsDrawnFrom)
+{
+    // Asking for the primitives is what tells the model it is drawn from.
+    createBlankDoc();
+    CPPUNIT_ASSERT(!page(1)->getSdrModelFromSdrPage().IsDrawnFromModel());
+
+    getVectorPrimitives(u"testDrawnFromModel");
+
+    CPPUNIT_ASSERT(page(1)->getSdrModelFromSdrPage().IsDrawnFromModel());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testTheLastReaderLeavingClearsTheMark)
+{
+    // The mark follows the reader, so letting the last one go clears it.
+    createBlankDoc();
+    getVectorPrimitives(u"testDrawnFromModelCleared");
+    CPPUNIT_ASSERT(page(1)->getSdrModelFromSdrPage().IsDrawnFromModel());
+
+    page(1)->getSdrModelFromSdrPage().SetDrawnFromModel(false);
+
+    CPPUNIT_ASSERT(!page(1)->getSdrModelFromSdrPage().IsDrawnFromModel());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testBoldRunNamesADifferentFace)
+{
+    // Bold and regular text of one family are different faces, so they name
+    // different files. One id for both would draw the two runs alike.
+    if (!familyHasBoldCut())
+        return;
+
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), Color(0x4472c4), COL_BLACK);
+    addRectangle(tools::Rectangle(Point(1000, 5000), Size(6000, 3000)), Color(0x4472c4), COL_BLACK);
+    page(1)->GetObj(1)->SetMergedItem(SvxWeightItem(WEIGHT_BOLD, EE_CHAR_WEIGHT));
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    for (size_t nObject = 0; nObject < 2; ++nObject)
+    {
+        pView->SdrBeginTextEdit(page(1)->GetObj(nObject));
+        pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"Hello"_ustr);
+        pView->SdrEndTextEdit();
+    }
+
+    auto aJson = getVectorPrimitives(u"testBoldRunFace");
+    const std::optional<tools::JsonPath> oPlainObject = aJson.at("/objects/1");
+    const std::optional<tools::JsonPath> oBoldObject = aJson.at("/objects/2");
+    CPPUNIT_ASSERT(oPlainObject.has_value());
+    CPPUNIT_ASSERT(oBoldObject.has_value());
+    const std::optional<tools::JsonPath> oPlain = oPlainObject->findFirst("fontId");
+    const std::optional<tools::JsonPath> oBold = oBoldObject->findFirst("fontId");
+    CPPUNIT_ASSERT(oPlain.has_value());
+    CPPUNIT_ASSERT(oBold.has_value());
+    CPPUNIT_ASSERT_MESSAGE("the bold run named the same face as the plain run",
+                           oPlain->getString() != oBold->getString());
+
+    // Which run is which, so the ids above are known to differ for the
+    // reason the test is about.
+    const std::optional<tools::JsonPath> oPlainWeight = oPlainObject->findFirst("weight");
+    const std::optional<tools::JsonPath> oBoldWeight = oBoldObject->findFirst("weight");
+    CPPUNIT_ASSERT(oPlainWeight.has_value());
+    CPPUNIT_ASSERT(oBoldWeight.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(WEIGHT_NORMAL), oPlainWeight->getInt().value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(WEIGHT_BOLD), oBoldWeight->getInt().value_or(-1));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testRealBoldFaceNeedsNoThickening)
+{
+    // Bold text resolves to the family's own bold cut. Saying the weight has
+    // to be made up would thicken a face that is already bold.
+    if (!familyHasBoldCut())
+        return;
+
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), Color(0x4472c4), COL_BLACK);
+
+    SdrObject* pObject = page(1)->GetObj(0);
+    pObject->SetMergedItem(SvxWeightItem(WEIGHT_BOLD, EE_CHAR_WEIGHT));
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(pObject);
+    pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"Hello"_ustr);
+
+    SdXImpressDocument* pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pDocument);
+    tools::JsonWriter aJsonWriter;
+    const OString aCommand = ".uno:VectorPrimitives?partid=" + firstPartId();
+    pDocument->getCommandValues(aJsonWriter,
+                                std::string_view(aCommand.getStr(), aCommand.getLength()));
+    const OString aResult = aJsonWriter.finishAndGetAsOString();
+
+    pView->SdrEndTextEdit();
+
+    auto oJson = tools::JsonPath::parse(std::string_view(aResult.getStr(), aResult.getLength()));
+    CPPUNIT_ASSERT(oJson.has_value());
+    CPPUNIT_ASSERT_MESSAGE(aResult.getStr(), oJson->findFirst("fontId").has_value());
+    CPPUNIT_ASSERT_MESSAGE("a real bold face was marked as needing thickening",
+                           !oJson->findFirst("syntheticBold").has_value());
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testAutomaticTextColorAndBackdrop)
+{
+    // Text that carries no color of its own keeps the automatic marker, and the fill under it
+    // is named next to it. Neither depends on the theme of a view, so one tree serves a dark
+    // view and a light view.
+    createBlankDoc();
+
+    // A slide with a background of its own, holding a shape with a fill of its own.
+    page(1)->getSdrPageProperties().PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    page(1)->getSdrPageProperties().PutItem(XFillColorItem(OUString(), Color(0x102030)));
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), Color(0x203040),
+                 COL_BLACK);
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    pView->SdrBeginTextEdit(page(1)->GetObj(0));
+    pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"Hello"_ustr);
+
+    auto aJson = getVectorPrimitives(u"testAutomaticTextColorAndBackdrop");
+
+    pView->SdrEndTextEdit();
+
+    // The page entry names the surface it holds behind its objects. The surface of the shape
+    // travels with its text, so the entry of the shape itself names none.
+    assertJsonPath(aJson, "/objects/0/backdrop", "#102030");
+    CPPUNIT_ASSERT(!aJson.has("/objects/1/backdrop"));
+
+    // The text being typed sits on the fill of the shape.
+    const std::optional<tools::JsonPath> oEdit = findEntryOfKind(aJson, "texteditoverlay"_ostr);
+    CPPUNIT_ASSERT(oEdit.has_value());
+    const std::optional<tools::JsonPath> oEditSurface = oEdit->findFirst("backdrop");
+    CPPUNIT_ASSERT(oEditSurface.has_value());
+    CPPUNIT_ASSERT_EQUAL("#203040"_ostr, oEditSurface->getString().value_or(""_ostr));
+
+    // The text portion carries the automatic color as a marker.
+    const std::optional<tools::JsonPath> oFontColor = oEdit->findFirst("fontcolor");
+    CPPUNIT_ASSERT(oFontColor.has_value());
+    CPPUNIT_ASSERT_EQUAL("auto"_ostr, oFontColor->getString().value_or(""_ostr));
+
+    // Once the edit ends, the text of the shape names the same surface.
+    auto aShown = getVectorPrimitives(u"testAutomaticTextColorAndBackdropShown");
+    const std::optional<tools::JsonPath> oShape = aShown.at("/objects/1");
+    CPPUNIT_ASSERT(oShape.has_value());
+    const std::optional<tools::JsonPath> oShownSurface = oShape->findFirst("backdrop");
+    CPPUNIT_ASSERT(oShownSurface.has_value());
+    CPPUNIT_ASSERT_EQUAL("#203040"_ostr, oShownSurface->getString().value_or(""_ostr));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testTableCellTextNamesCellFill)
+{
+    // Automatic text in a table cell takes contrast against the fill of the cell. The table
+    // object has no fill of its own, so the fill of the cell travels with the text.
+    createBlankDoc();
+
+    SdrPage* pPage = page(1);
+    rtl::Reference<sdr::table::SdrTableObj> pTable = new sdr::table::SdrTableObj(
+        pPage->getSdrModelFromSdrPage(), tools::Rectangle(Point(1000, 1000), Size(6000, 3000)),
+        1, 1);
+    pPage->NbcInsertObject(pTable.get());
+
+    uno::Reference<beans::XPropertySet> xCell(pTable->getTable()->getCellByPosition(0, 0),
+                                              uno::UNO_QUERY_THROW);
+    xCell->setPropertyValue(u"FillStyle"_ustr, uno::Any(drawing::FillStyle_SOLID));
+    xCell->setPropertyValue(u"FillColor"_ustr, uno::Any(sal_Int32(0x202020)));
+    uno::Reference<text::XTextRange>(xCell, uno::UNO_QUERY_THROW)->setString(u"Hello"_ustr);
+
+    auto aJson = getVectorPrimitives(u"testTableCellTextNamesCellFill");
+
+    const std::optional<tools::JsonPath> oTable = aJson.at("/objects/1");
+    CPPUNIT_ASSERT(oTable.has_value());
+    const std::optional<tools::JsonPath> oSurface = oTable->findFirst("backdrop");
+    CPPUNIT_ASSERT_MESSAGE(m_aLastVectorJson.getStr(), oSurface.has_value());
+    CPPUNIT_ASSERT_EQUAL("#202020"_ostr, oSurface->getString().value_or(""_ostr));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testBulletKeepsAutomaticColor)
+{
+    // A bullet in the automatic color keeps the marker, the same as the text after it, so a
+    // dark view and a light view both draw it with contrast to the slide.
+    createSdImpressDoc();
+    SdPage* pSlide = static_cast<SdPage*>(page(1));
+    pSlide->SetAutoLayout(AUTOLAYOUT_TITLE_CONTENT, true);
+    auto pBody = static_cast<SdrTextObj*>(pSlide->GetPresObj(PresObjKind::Outline));
+    CPPUNIT_ASSERT(pBody);
+
+    // A paragraph shows the bullet of the outline style only at an outline level, and a plain
+    // text set on the object has none, so the paragraph goes in at the first level.
+    SdrOutliner& rOutliner = getSdDocShell()->GetDoc()->GetDrawOutliner();
+    rOutliner.Init(OutlinerMode::OutlineObject);
+    rOutliner.SetStyleSheet(0, pBody->GetStyleSheet());
+    rOutliner.SetText(u"Point"_ustr, 0);
+    rOutliner.SetDepth(0, 0);
+    pBody->SetOutlinerParaObject(rOutliner.CreateParaObject());
+    rOutliner.Init(OutlinerMode::TextObject);
+    pBody->SetEmptyPresObj(false);
+
+    auto aJson = getVectorPrimitives(u"testBulletKeepsAutomaticColor");
+    const std::optional<tools::JsonPath> oBullet
+        = findNodeOfType(aJson, "textHierarchyBullet"_ostr);
+    CPPUNIT_ASSERT_MESSAGE(m_aLastVectorJson.getStr(), oBullet.has_value());
+    const std::optional<tools::JsonPath> oPortion
+        = findNodeOfType(*oBullet, "textSimplePortion"_ostr);
+    CPPUNIT_ASSERT(oPortion.has_value());
+    assertJsonPath(*oPortion, "fontcolor", "auto");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testMasterViewPaintsAndNamesTheMasterFill)
+{
+    // In master view the master page is the page shown, and it paints its own fill. The page
+    // entry names that fill as the surface its objects sit on.
+    createBlankDoc();
+    SdrPage& rMasterPage = page(1)->TRG_GetMasterPage();
+    SdrPageProperties& rProperties = rMasterPage.getSdrPageProperties();
+    CPPUNIT_ASSERT(rProperties.GetStyleSheet());
+    rProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rProperties.PutItem(XFillColorItem(OUString(), Color(0x203040)));
+
+    auto aMaster = getVectorPrimitives(u"testMasterViewPaintsAndNamesTheMasterFill", -1, 1);
+    const auto oPage = findEntryOfKind(aMaster, "page"_ostr);
+    CPPUNIT_ASSERT(oPage.has_value());
+    assertJsonPath(*oPage, "backdrop", "#203040");
+    CPPUNIT_ASSERT_MESSAGE(m_aLastVectorJson.getStr(),
+                           hasNodeWithColor(*oPage, "polyPolygonColor"_ostr, "#203040"_ostr));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testNotesPreviewNamesTheFillOfTheShownSlide)
+{
+    // The objects in the preview of a slide sit on the fill of that slide, not on the fill of
+    // the notes page that holds the preview.
+    createBlankDoc();
+    SdrPageProperties& rProperties = page(1)->getSdrPageProperties();
+    rProperties.PutItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    rProperties.PutItem(XFillColorItem(OUString(), Color(0x102030)));
+    SdPage* pNotesPage = static_cast<SdPage*>(page(2));
+    const SdrObject* pPreview = pNotesPage->GetPresObj(PresObjKind::Page);
+    CPPUNIT_ASSERT(pPreview);
+
+    auto aNotes = getVectorPrimitives(u"testNotesPreviewNamesTheFillOfTheShownSlide", -1, 2);
+    const auto oEntry = findEntryOfObject(aNotes, pPreview->GetUniqueID());
+    CPPUNIT_ASSERT(oEntry.has_value());
+    const std::optional<tools::JsonPath> oShown = findNodeOfType(*oEntry, "pagePreview"_ostr);
+    CPPUNIT_ASSERT_MESSAGE(m_aLastVectorJson.getStr(), oShown.has_value());
+    assertJsonPath(*oShown, "backdrop", "#102030");
+    CPPUNIT_ASSERT(!aNotes.has("/objects/0/backdrop"));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testHyperlinkFieldSaysWhatItIs)
+{
+    // Both forms of a hyperlink, a span of real text and the placeholder field from older
+    // versions, mark their field as a URL, so a client holding the geometry can show the hand.
+    createBlankDoc();
+    SdDrawDocument* pDrawDoc = getSdDocShell()->GetDoc();
+    SdrOutliner& rOutliner = pDrawDoc->GetDrawOutliner();
+    const SvxURLField aLink(u"https://example.org"_ustr, u"Example"_ustr, SvxURLFormat::Repr);
+
+    rtl::Reference<SdrRectObj> pSpan = new SdrRectObj(
+        *pDrawDoc, tools::Rectangle(Point(1000, 1000), Size(8000, 2000)), SdrObjKind::Text);
+    rOutliner.Clear();
+    // The span holds the shown text itself, so the text ends after its last character.
+    const ESelection aSpanEnd = rOutliner.QuickInsertUrlField(aLink, ESelection());
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(7), aSpanEnd.end.nIndex);
+    pSpan->SetOutlinerParaObject(rOutliner.CreateParaObject());
+    page(1)->NbcInsertObject(pSpan.get());
+
+    rtl::Reference<SdrRectObj> pField = new SdrRectObj(
+        *pDrawDoc, tools::Rectangle(Point(1000, 4000), Size(8000, 2000)), SdrObjKind::Text);
+    rOutliner.Clear();
+    rOutliner.QuickInsertField(SvxFieldItem(aLink, EE_FEATURE_FIELD), ESelection());
+    pField->SetOutlinerParaObject(rOutliner.CreateParaObject());
+    page(1)->NbcInsertObject(pField.get());
+
+    auto aJson = getVectorPrimitives(u"testHyperlinkField");
+    for (const rtl::Reference<SdrRectObj>& pText : { pSpan, pField })
+    {
+        const auto oEntry = findEntryOfObject(aJson, pText->GetUniqueID());
+        CPPUNIT_ASSERT(oEntry.has_value());
+        const auto oLink = findNodeOfType(*oEntry, "textHierarchyField"_ostr);
+        CPPUNIT_ASSERT(oLink.has_value());
+        assertJsonPath(*oLink, "fieldType", "url");
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testStrokedRectangle)
+{
+    // A stroke-only rectangle decomposes to a polygonStroke primitive
+    // under the slide object.
+    createBlankDoc();
+    addStrokedRectangle(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)), COL_BLACK);
+
+    auto aJson = getVectorPrimitives(u"testStrokedRectangle");
+
+    assertJsonPath(aJson, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+
+    auto oStroke = aJson.at("/objects/1/primitives/0/children/0/children/0");
+    CPPUNIT_ASSERT(oStroke.has_value());
+    assertJsonPath(*oStroke, "type", "polygonStroke");
+    assertJsonPath(*oStroke, "line/color", "#000000");
+    assertJsonPathExists(*oStroke, "path");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testRotatedRectangle)
+{
+    // A rotated rectangle decomposes through a TransformPrimitive2D
+    // wrapper that carries the rotation matrix.
+    createBlankDoc();
+    addRotatedRectangle(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)), Color(0x4472c4),
+                        Degree100(4500));
+
+    auto aJson = getVectorPrimitives(u"testRotatedRectangle");
+
+    assertJsonPath(aJson, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testObjectInfo)
+{
+    // A rectangle with a name, title and description wraps its
+    // decomposition in an ObjectInfoPrimitive2D.
+    createBlankDoc();
+    addRectangleWithObjectInfo(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)),
+                               Color(0x4472c4), u"Rectangle 1"_ustr, u"My title"_ustr,
+                               u"My description"_ustr);
+
+    auto aJson = getVectorPrimitives(u"testObjectInfo");
+
+    assertJsonPath(aJson, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+
+    // The object info wraps the SdrObject's primitive sequence, so it
+    // is the outermost node. The wrapping path is objectInfo -> svx:N
+    // -> group -> [fill].
+    auto oObjectInfo = aJson.at("/objects/1/primitives/0");
+    CPPUNIT_ASSERT(oObjectInfo.has_value());
+    assertJsonPath(*oObjectInfo, "type", "objectInfo");
+    assertJsonPath(*oObjectInfo, "name", "Rectangle 1");
+    assertJsonPath(*oObjectInfo, "title", "My title");
+    assertJsonPath(*oObjectInfo, "desc", "My description");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPolyPolygonRGBA)
+{
+    // A solid-fill rectangle with a non-zero fill transparency
+    // decomposes directly to a PolyPolygonRGBAPrimitive2D that
+    // carries both the colour and the transparency, instead of
+    // wrapping a PolyPolygonColorPrimitive2D in a transparency
+    // wrapper. The reference JSON captures that wire shape.
+    createBlankDoc();
+    // 25 percent transparency.
+    addTransparentRectangle(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)), Color(0x4472c4),
+                            25);
+
+    auto aJson = getVectorPrimitives(u"testPolyPolygonRGBA");
+
+    assertJsonPath(aJson, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+
+    // The wrapping path is svx:N -> group -> polyPolygonRGBA.
+    auto oRGBA = aJson.at("/objects/1/primitives/0/children/0/children/0");
+    CPPUNIT_ASSERT(oRGBA.has_value());
+    assertJsonPath(*oRGBA, "type", "polyPolygonRGBA");
+    assertJsonPath(*oRGBA, "color", "#4472c4");
+    assertJsonPathExists(*oRGBA, "transparency");
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPolygonHairline)
+{
+    // An SdrPageObj's view-independent decomposition is a single
+    // yellow polygonHairline outline. The vector primitives pipeline goes
+    // through that exact path, so the reference JSON for the browser
+    // mocha test gets a real polygonHairline emitted by the engine.
+    createBlankDoc();
+    addPageObject(tools::Rectangle(Point(5000, 5000), Size(5000, 3000)));
+
+    auto aJson = getVectorPrimitives(u"testPolygonHairline");
+
+    assertJsonPath(aJson, "/type", "vectorprimitives");
+    CPPUNIT_ASSERT_EQUAL(size_t(2), aJson.getSize("/objects").value_or(0));
+
+    auto oHairline = aJson.at("/objects/1/primitives/0");
+    CPPUNIT_ASSERT(oHairline.has_value());
+    assertJsonPath(*oHairline, "type", "polygonHairline");
+    assertJsonPathExists(*oHairline, "color");
+    assertJsonPathExists(*oHairline, "path");
+}
+
+// The order moves when an object changes its place in the stack, and the push that follows
+// carries the new order the way a pull does. A push after that finds nothing moved.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testPushCarriesOrderOnZOrderChange)
+{
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(3000, 2000)), Color(0x4472c4), COL_BLACK);
+    addRectangle(tools::Rectangle(Point(2000, 2000), Size(3000, 2000)), Color(0xc00000), COL_BLACK);
+    SdrObject* pLower = page(1)->GetObj(0);
+    SdrObject* pUpper = page(1)->GetObj(1);
+
+    // The first pull is what marks the model as drawn from.
+    const sal_Int64 nVersion
+        = getVectorPrimitives(u"testZOrderPushFull").getInt("/version").value_or(-1);
+
+    page(1)->SetObjectOrdNum(0, 1);
+
+    auto oDelta = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oDelta.has_value());
+    assertJsonPath(*oDelta, "/type", "vectorprimitivesdelta");
+    assertJsonPath(*oDelta, "/from", nVersion);
+    CPPUNIT_ASSERT_GREATER(nVersion, oDelta->getInt("/version").value_or(-1));
+    // The page entry first, then the two in their new order.
+    CPPUNIT_ASSERT_EQUAL(size_t(3), oDelta->getSize("/order").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pUpper->GetUniqueID()), oDelta->getInt("/order/1").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(pLower->GetUniqueID()), oDelta->getInt("/order/2").value_or(-1));
+
+    auto oAgain = pushVectorPrimitivesDelta();
+    CPPUNIT_ASSERT(oAgain.has_value());
+    CPPUNIT_ASSERT(!oAgain->has("/type"));
+}
+
+// The order names the entry of a running edit for as long as the edit runs. Ending the edit
+// takes the entry out of the order, and the object comes again with the text the edit left it.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testEndingTheEditDropsItsEntry)
+{
+    createBlankDoc();
+    addTextBox(tools::Rectangle(Point(1000, 1000), Size(6000, 3000)), u"Ended"_ustr);
+    SdrObject* pObject = page(1)->GetObj(0);
+
+    // The first pull is what marks the model as drawn from.
+    const sal_Int64 nBase
+        = getVectorPrimitives(u"testEditEndBase").getInt("/version").value_or(-1);
+
+    SdrView* pView = getSdDocShell()->GetViewShell()->GetView();
+    CPPUNIT_ASSERT(pView);
+    CPPUNIT_ASSERT(pView->SdrBeginTextEdit(pObject));
+    pView->GetTextEditOutlinerView()->GetEditView().InsertText(u"X"_ustr);
+
+    // Since before the edit began, so the order the edit added its entry to travels.
+    auto aDuring = getVectorPrimitives(u"testEditEndDuring", nBase);
+    const sal_Int64 nDuring = aDuring.getInt("/version").value_or(-1);
+    const sal_Int64 nEntryId = -2 - sal_Int64(SfxViewShell::Current()->GetViewShellId().get());
+    CPPUNIT_ASSERT_MESSAGE("the order does not name the running edit",
+                           orderNames(aDuring, nEntryId));
+
+    pView->SdrEndTextEdit();
+
+    auto aDelta = getVectorPrimitives(u"testEditEndDelta", nDuring);
+    assertJsonPath(aDelta, "/type", "vectorprimitivesdelta");
+    CPPUNIT_ASSERT_GREATER(nDuring, aDelta.getInt("/version").value_or(-1));
+    CPPUNIT_ASSERT_MESSAGE("the delta carries no order", aDelta.has("/order"));
+    CPPUNIT_ASSERT_MESSAGE("the order still names the ended edit", !orderNames(aDelta, nEntryId));
+    CPPUNIT_ASSERT(!findEntryOfKind(aDelta, "texteditoverlay").has_value());
+
+    const auto oObject = findEntryOfObject(aDelta, pObject->GetUniqueID());
+    CPPUNIT_ASSERT_MESSAGE("the object does not come again", oObject.has_value());
+    CPPUNIT_ASSERT(!oObject->getBool("textEdit").has_value());
+    CPPUNIT_ASSERT_MESSAGE("the object came back without the typed text",
+                           findTextPortionUnder(*oObject, "X"_ostr).has_value());
+}
+
+// A master is a part of its own, named by its id. Another master put in front of it and taken
+// away again changes nothing about it or about the slide that uses it, so a client that holds
+// either part is sent nothing.
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testOtherMastersComingAndGoingMoveNothing)
+{
+    createBlankDoc();
+    createMasterPlaceholders();
+    const OString aMasterId = firstPartId(1);
+    const OString aMasterRequest = ".uno:VectorPrimitives?partid=" + aMasterId + "&mode=1";
+
+    auto oMaster = requestVectorPrimitives(aMasterRequest);
+    CPPUNIT_ASSERT(oMaster.has_value());
+    const sal_Int64 nMasterVersion = oMaster->getInt("/version").value_or(-1);
+    const OString aMasterSince
+        = aMasterRequest + "&since=" + OString::number(nMasterVersion)
+          + "&epoch=" + OString::number(oMaster->getInt("/epoch").value_or(-1));
+    const sal_Int64 nSlideVersion
+        = getVectorPrimitives(u"testMastersComeAndGoSlide").getInt("/version").value_or(-1);
+
+    uno::Reference<drawing::XMasterPagesSupplier> xSupplier(mxComponent, uno::UNO_QUERY_THROW);
+    uno::Reference<drawing::XDrawPages> xMasters = xSupplier->getMasterPages();
+    uno::Reference<drawing::XDrawPage> xNewMaster = xMasters->insertNewByIndex(0);
+    // The held master keeps its id.
+    CPPUNIT_ASSERT(firstPartId(1) != aMasterId);
+
+    auto oInserted = requestVectorPrimitives(aMasterSince);
+    CPPUNIT_ASSERT(oInserted.has_value());
+    assertNothingMoved(*oInserted, nMasterVersion);
+    assertNothingMoved(getVectorPrimitives(u"testMastersComeSlide", nSlideVersion), nSlideVersion);
+
+    xMasters->remove(xNewMaster);
+    CPPUNIT_ASSERT_EQUAL(aMasterId, firstPartId(1));
+
+    auto oRemoved = requestVectorPrimitives(aMasterSince);
+    CPPUNIT_ASSERT(oRemoved.has_value());
+    assertNothingMoved(*oRemoved, nMasterVersion);
+    assertNothingMoved(getVectorPrimitives(u"testMastersGoSlide", nSlideVersion), nSlideVersion);
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testThumbnailDrawsTheMasterAndCarriesItsFonts)
+{
+    // A thumbnail carries the master inline, and its fonts cut down to the characters drawn.
+
+    // The font is read from a realized face, so the test needs at least one usable font. Pass
+    // trivially when the environment has none.
+    ScopedVclPtrInstance<VirtualDevice> pProbeDevice;
+    pProbeDevice->SetFont(vcl::Font(u"Liberation Sans"_ustr, Size(0, 2000)));
+    if (pProbeDevice->GetCurrentFontRawData().isEmpty())
+        return;
+
+    createBlankDoc();
+    SdPage* pMasterPage = static_cast<SdPage*>(&page(1)->TRG_GetMasterPage());
+    rtl::Reference<SdrRectObj> pRect = new SdrRectObj(
+        pMasterPage->getSdrModelFromSdrPage(), tools::Rectangle(Point(0, 0), Size(4000, 2000)));
+    pRect->SetMergedItem(XFillStyleItem(drawing::FillStyle_SOLID));
+    pRect->SetMergedItem(XFillColorItem(OUString(), Color(0xc00000)));
+    pMasterPage->NbcInsertObject(pRect.get());
+    addTextBox(tools::Rectangle(Point(1000, 5000), Size(8000, 2000)), u"Hello"_ustr);
+
+    auto oJson = requestVectorPrimitives(".uno:VectorThumbnail?part=0"_ostr);
+    CPPUNIT_ASSERT(oJson.has_value());
+    assertJsonPath(*oJson, "/type", "vectorthumbnail");
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(0), oJson->getInt("/part").value_or(-1));
+    assertJsonPath(*oJson, "/partId", firstPartId());
+
+    // The page entry draws the rectangle of the master itself.
+    const auto oPage = oJson->at("/objects/0");
+    CPPUNIT_ASSERT(oPage.has_value());
+    assertJsonPath(*oPage, "kind", "page");
+    CPPUNIT_ASSERT(!oPage->has("masterPartId"));
+    CPPUNIT_ASSERT(hasNodeWithColor(*oPage, "polyPolygonColor"_ostr, "#c00000"_ostr));
+
+    // The font the text names travels with the thumbnail and holds the four characters of
+    // "Hello": H, e, l and o.
+    const std::optional<tools::JsonPath> oFontId = oJson->at("/objects")->findFirst("fontId");
+    CPPUNIT_ASSERT(oFontId.has_value());
+    const OString aFontId = oFontId->getString().value_or(""_ostr);
+    CPPUNIT_ASSERT_EQUAL(size_t(1), oJson->getSize("/fonts").value_or(0));
+    assertJsonPath(*oJson, "/fonts/0/fontId", aFontId);
+    CPPUNIT_ASSERT_EQUAL(size_t(4), oJson->getSize("/fonts/0/ranges").value_or(0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64('H'), oJson->getInt("/fonts/0/ranges/0/0").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(sal_Int64('o'), oJson->getInt("/fonts/0/ranges/3/1").value_or(-1));
+
+    // The cut-down font has an id of its own, so a client can hold it next to the whole font that
+    // the slide names. It is also smaller than the whole font.
+    const OString aWholeFontId = getVectorPrimitives(u"testThumbnailCarriesItsFonts")
+                                     .at("/objects")
+                                     ->findFirst("fontId")
+                                     ->getString()
+                                     .value_or(""_ostr);
+    CPPUNIT_ASSERT(!aWholeFontId.isEmpty());
+    CPPUNIT_ASSERT(aFontId != aWholeFontId);
+    // The answer for the whole font is a line of JSON, then the font file.
+    SdXImpressDocument* pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pDocument);
+    const OString aCommand(".uno:VectorRenderingFont?id=" + aWholeFontId);
+    const std::string aWholeFont = pDocument->getVectorResource(std::string_view(aCommand));
+    const size_t nNewline = aWholeFont.find('\n');
+    CPPUNIT_ASSERT(nNewline != std::string::npos);
+    const std::optional<tools::JsonPath> oWholeFontJson
+        = tools::JsonPath::parse(std::string_view(aWholeFont).substr(0, nNewline));
+    CPPUNIT_ASSERT(oWholeFontJson.has_value());
+    assertJsonPath(*oWholeFontJson, "/fontId", aWholeFontId);
+    CPPUNIT_ASSERT(!oWholeFontJson->has("data"));
+
+    cpo::uno::Sequence<sal_Int8> aSubsetBytes;
+    const OString aSubsetData = oJson->getString("/fonts/0/data").value_or(OString());
+    comphelper::Base64::decode(aSubsetBytes, std::string_view(aSubsetData));
+    CPPUNIT_ASSERT(aSubsetBytes.hasElements());
+    CPPUNIT_ASSERT_LESS(sal_Int32(aWholeFont.size() - nNewline - 1), aSubsetBytes.getLength());
+}
+
+/// The pixel size of the one image of a thumbnail, which comes as a PNG image.
+Size thumbnailImageSize(const tools::JsonPath& rJson)
+{
+    CPPUNIT_ASSERT_EQUAL(size_t(1), rJson.getSize("/graphics").value_or(0));
+    const OString aData = rJson.getString("/graphics/0/data").value_or(OString());
+    static constexpr std::string_view aPrefix = "data:image/png;base64,";
+    CPPUNIT_ASSERT(aData.startsWith(aPrefix));
+
+    cpo::uno::Sequence<sal_Int8> aBytes;
+    comphelper::Base64::decode(aBytes, std::string_view(aData).substr(aPrefix.size()));
+    SvMemoryStream aStream(const_cast<sal_Int8*>(aBytes.getConstArray()), aBytes.getLength(),
+                           StreamMode::READ);
+    Graphic aImported;
+    CPPUNIT_ASSERT_EQUAL(ERRCODE_NONE, GraphicFilter::GetGraphicFilter().ImportGraphic(
+                                           aImported, u"", aStream));
+    return aImported.GetSizePixel();
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testThumbnailScalesAnImageDown)
+{
+    // An image of 2000 pixels on each side drawn one inch wide comes at 200 pixels to the inch,
+    // or at the resolution the request names.
+    createBlankDoc();
+    Bitmap aBitmap(Size(2000, 2000), vcl::PixelFormat::N24_BPP);
+    aBitmap.Erase(COL_LIGHTRED);
+    SdrPage* pPage = page(1);
+    rtl::Reference<SdrGrafObj> pGraphic
+        = new SdrGrafObj(pPage->getSdrModelFromSdrPage(), Graphic(aBitmap),
+                         tools::Rectangle(Point(1000, 1000), Size(2540, 2540)));
+    pPage->NbcInsertObject(pGraphic.get());
+
+    auto oJson = requestVectorPrimitives(".uno:VectorThumbnail?part=0"_ostr);
+    CPPUNIT_ASSERT(oJson.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(200), oJson->getInt("/dpi").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(Size(200, 200), thumbnailImageSize(*oJson));
+
+    auto oPreview = requestVectorPrimitives(".uno:VectorThumbnail?part=0&dpi=50"_ostr);
+    CPPUNIT_ASSERT(oPreview.has_value());
+    CPPUNIT_ASSERT_EQUAL(sal_Int64(50), oPreview->getInt("/dpi").value_or(-1));
+    CPPUNIT_ASSERT_EQUAL(Size(50, 50), thumbnailImageSize(*oPreview));
+}
+
+CPPUNIT_TEST_FIXTURE(VectorRenderingTest, testThumbnailLeavesThePartAlone)
+{
+    // A client that holds the slide sees nothing move when a thumbnail of it is written, and a
+    // slide that is not in the document gets an answer that says so.
+    createBlankDoc();
+    addRectangle(tools::Rectangle(Point(1000, 1000), Size(4000, 2000)), Color(0x4472c4),
+                 COL_BLACK);
+    const sal_Int64 nVersion
+        = getVectorPrimitives(u"testThumbnailLeavesThePartAlone").getInt("/version").value_or(-1);
+
+    CPPUNIT_ASSERT(requestVectorPrimitives(".uno:VectorThumbnail?part=0"_ostr).has_value());
+    assertNothingMoved(getVectorPrimitives(u"testThumbnailLeavesThePartAloneDelta", nVersion),
+                       nVersion);
+
+    auto oMissing = requestVectorPrimitives(".uno:VectorThumbnail?part=5"_ostr);
+    CPPUNIT_ASSERT(oMissing.has_value());
+    assertJsonPath(*oMissing, "/type", "vectorthumbnail");
+    assertJsonPath(*oMissing, "/error", "nopage");
+}
+
+} // namespace
+
+CPPUNIT_PLUGIN_IMPLEMENT();
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

@@ -1,0 +1,23 @@
+@use '../def/base';
+
+// TODO: move these to browser/css/cool.css in online, so every build has them:
+// the card shadows, which lift a card on hover and when it is selected, and
+// the dashed outline that marks a tracked change card.
+
+.cool-annotation-redline-content-wrapper {
+	outline: 1px dashed #e7c1e0;
+	outline-offset: -1px;
+}
+
+.cool-annotation-redline-content-wrapper, .cool-annotation-content-wrapper{
+	box-shadow: 0px 1px 3px var(--color-box-shadow);
+}
+
+.cool-annotation-redline-content-wrapper:hover, .cool-annotation-content-wrapper:hover{
+	box-shadow: 0px 3px 6px var(--color-box-shadow);
+}
+
+.annotation-active .cool-annotation-redline-content-wrapper, .annotation-active .cool-annotation-content-wrapper{
+	box-shadow: 0px 3px 6px var(--color-box-shadow);
+
+}

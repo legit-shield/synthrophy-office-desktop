@@ -1,0 +1,1595 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following license notice:
+ *
+ *   Licensed to the Apache Software Foundation (ASF) under one or more
+ *   contributor license agreements. See the NOTICE file distributed
+ *   with this work for additional information regarding copyright
+ *   ownership. The ASF licenses this file to you under the Apache
+ *   License, Version 2.0 (the "License"); you may not use this file
+ *   except in compliance with the License. You may obtain a copy of
+ *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+ */
+
+#include <fusel.hxx>
+#include <svx/svddrgmt.hxx>
+#include <svx/svdpagv.hxx>
+#include <svx/svdopage.hxx>
+#include <svx/svdogrp.hxx>
+#include <svx/scene3d.hxx>
+#include <vcl/imapobj.hxx>
+#include <unotools/securityoptions.hxx>
+#include <svx/svxids.hrc>
+#include <svx/xfillit0.hxx>
+#include <svx/ImageMapInfo.hxx>
+#include <sfx2/viewfrm.hxx>
+#include <svl/stritem.hxx>
+#include <svl/intitem.hxx>
+#include <sfx2/dispatch.hxx>
+#include <sfx2/docfile.hxx>
+#include <editeng/flditem.hxx>
+
+#include <svx/svdotable.hxx>
+
+#include <app.hrc>
+
+#include <sdmod.hxx>
+#include <DrawDocShell.hxx>
+#include <stlpool.hxx>
+#include <fudraw.hxx>
+#include <ViewShell.hxx>
+#include <ViewShellBase.hxx>
+#include <FrameView.hxx>
+#include <View.hxx>
+#include <Window.hxx>
+#include <drawdoc.hxx>
+#include <DrawViewShell.hxx>
+#include <PreviewEditMode.hxx>
+#include <ToolBarManager.hxx>
+#include <Client.hxx>
+#include <annotationmanager.hxx>
+
+#include <svx/svdundo.hxx>
+
+#include <svx/sdrhittesthelper.hxx>
+#include <svx/diagram/DiagramHelper_svx.hxx>
+#include <svx/annotation/ObjectAnnotationData.hxx>
+
+#include <comphelper/kit.hxx>
+#include <svl/cryptosign.hxx>
+
+using namespace ::com::sun::star;
+
+namespace sd {
+
+FuSelection::FuSelection (
+    ViewShell& rViewSh,
+    ::sd::Window* pWin,
+    ::sd::View* pView,
+    SdDrawDocument& rDoc,
+    SfxRequest& rReq)
+    : FuDraw(rViewSh, pWin, pView, rDoc, rReq),
+      bTempRotation(false),
+      bSelectionChanged(false),
+      mbPickedDiagramFrameHdl(false),
+      bSuppressChangesOfSelection(false),
+      bMirrorSide0(false),
+      nEditMode(SID_BEZIER_MOVE),
+      pWaterCanCandidate(nullptr)
+     //Add Shift+UP/DOWN/LEFT/RIGHT key to move the position of insert point,
+     //and SHIFT+ENTER key to decide the position and draw the new insert point
+    ,bBeginInsertPoint(false),
+      oldPoint(0,0)
+  ,bMovedToCenterPoint(false)
+{
+}
+
+rtl::Reference<FuPoor> FuSelection::Create( ViewShell& rViewSh, ::sd::Window* pWin, ::sd::View* pView, SdDrawDocument& rDoc, SfxRequest& rReq )
+{
+    rtl::Reference<FuPoor> xFunc( new FuSelection( rViewSh, pWin, pView, rDoc, rReq ) );
+    xFunc->DoExecute(rReq);
+    return xFunc;
+}
+
+void FuSelection::DoExecute( SfxRequest& rReq )
+{
+    FuDraw::DoExecute( rReq );
+
+    // Select object bar
+    SelectionHasChanged();
+}
+
+FuSelection::~FuSelection()
+{
+    mpView->UnmarkAllPoints();
+    mpView->ResetCreationActive();
+
+    if ( mpView->GetDragMode() != SdrDragMode::Move )
+    {
+        mpView->SetDragMode(SdrDragMode::Move);
+    }
+}
+
+namespace {
+    bool lcl_followHyperlinkAllowed(const MouseEvent& rMEvt) {
+        if (!rMEvt.IsMod1() && SvtSecurityOptions::IsOptionSet(SvtSecurityOptions::EOption::CtrlClickHyperlink))
+            return false;
+        if (rMEvt.IsMod1() && !SvtSecurityOptions::IsOptionSet(SvtSecurityOptions::EOption::CtrlClickHyperlink))
+            return false;
+        return true;
+    }
+}
+
+namespace
+{
+/** The object at the given position on the current canvas page, or null if the position
+    is not on a canvas page, or hits no object. */
+SdrObject* lcl_pickCanvasPageObject(::sd::View* pView, ::sd::ViewShell& rViewShell,
+                                    const Point& rPosition)
+{
+    if (!comphelper::COKit::isActive())
+        return nullptr;
+    SdPage* pPage = rViewShell.GetActualPage();
+    if (!pPage || !pPage->IsCanvasPage())
+        return nullptr;
+    SdrPageView* pPageView = nullptr;
+    return pView->PickObj(rPosition, pView->getHitTolLog(), pPageView,
+                          SdrSearchOptions::ALSOONMASTER);
+}
+
+/** Whether a canvas-page click at the given position lands on a page preview object. */
+bool lcl_hitsCanvasPagePreview(::sd::View* pView, ::sd::ViewShell& rViewShell, const Point& rPosition)
+{
+    SdrObject* pObject = lcl_pickCanvasPageObject(pView, rViewShell, rPosition);
+    return pObject && pObject->GetObjIdentifier() == SdrObjKind::Page;
+}
+
+/** Whether the selection holds an object that sits inside a group other than the entered one. */
+bool lcl_hasMarkedObjectInsideGroup(const ::sd::View& rView)
+{
+    const SdrPageView* pPageView = rView.GetSdrPageView();
+    const SdrObject* pEnteredGroup = pPageView ? pPageView->GetCurrentGroup() : nullptr;
+    const SdrMarkList& rMarkList = rView.GetMarkedObjectList();
+    for (size_t nMark = 0; nMark < rMarkList.GetMarkCount(); ++nMark)
+    {
+        const SdrObject* pParent
+            = rMarkList.GetMark(nMark)->GetMarkedSdrObj()->getParentSdrObjectFromSdrObject();
+        if (pParent && pParent != pEnteredGroup)
+            return true;
+    }
+    return false;
+}
+}
+
+SdrHdl* FuSelection::SetPickedHandle(SdrHdl* pHdl)
+{
+    moPickedHdlKind.reset();
+    if (pHdl)
+        moPickedHdlKind = pHdl->GetKind();
+    mbPickedDiagramFrameHdl = dynamic_cast<svx::diagram::DiagramFrameHdl*>(pHdl) != nullptr;
+    return pHdl;
+}
+
+SdrHdl* FuSelection::PickHandle(const Point& rPos)
+{
+    return SetPickedHandle(mpView->PickHandle(rPos));
+}
+
+bool FuSelection::MouseButtonDown(const MouseEvent& rMEvt)
+{
+    SdrHdl* pHdl = SetPickedHandle(nullptr);
+    bool bReturn = FuDraw::MouseButtonDown(rMEvt);
+
+    // While a preview is entered, a single click inside it picks a shape on the slide the
+    // preview shows. Every model coordinate here is slide space, matching the objects' own
+    // geometry, so the canvas view's page view is only lent to the primitive hit test the
+    // same way the preview painter lends it when painting a non-displayed page.
+    DrawViewShell* pPreviewShell = dynamic_cast<DrawViewShell*>(&mrViewShell);
+    if (comphelper::COKit::isActive() && pPreviewShell && pPreviewShell->IsInPreviewEditMode()
+        && rMEvt.IsLeft() && rMEvt.GetClicks() == 1 && !rMEvt.IsMod1() && !rMEvt.IsMod2())
+    {
+        PreviewEditMode* pMode = pPreviewShell->GetPreviewEditMode();
+        SdrPageObj* pPreview = pMode->GetEnteredPreview();
+        SdrPage* pSlide = pPreview->GetReferencedPage();
+        SdrPageView* pPageView = mpView->GetSdrPageView();
+        if (!pSlide || !pPageView)
+        {
+            // Picking needs a slide behind the preview and a page view to hit test in. With
+            // either of them gone the mode is over, and the click goes on to the normal path.
+            pPreviewShell->LeavePreviewEditMode();
+        }
+        else
+        {
+            const ::tools::Rectangle aPreviewRectangle = pPreview->GetSnapRect();
+            if (aPreviewRectangle.Contains(aMDPos))
+            {
+                const Point aSlidePoint
+                    = SdDrawDocument::ConvertCanvasPointToSlide(aMDPos, *pPreview);
+                const double fScale
+                    = aPreviewRectangle.GetWidth()
+                          ? double(pSlide->GetWidth()) / aPreviewRectangle.GetWidth()
+                          : 1.0;
+                const double fTolerance = mpView->getHitTolLog() * fScale;
+                SdrObject* pHit
+                    = SdrObjListPrimitiveHit(*pSlide, aSlidePoint, { fTolerance, fTolerance },
+                                             *pPageView, nullptr, false);
+                pMode->SetSelectedShape(pHit);
+                return true;
+            }
+            SdrObject* pOutsideObject = lcl_pickCanvasPageObject(mpView, mrViewShell, aMDPos);
+            if (pOutsideObject && pOutsideObject->GetObjIdentifier() == SdrObjKind::Page)
+            {
+                // A click on another preview moves the editing there directly, without a
+                // leave and re-enter round trip.
+                pPreviewShell->EnterPreviewEditMode(
+                    *static_cast<SdrPageObj*>(pOutsideObject));
+                return true;
+            }
+            if (!pOutsideObject)
+                pPreviewShell->LeavePreviewEditMode();
+            // An ordinary canvas shape keeps the mode and takes the normal path, so a drag into
+            // the preview can start from here.
+        }
+    }
+
+    bool bWaterCan = SdModule::get()->GetWaterCan();
+    const bool bReadOnly = mpDocSh->IsReadOnly();
+    // When the right mouse button is pressed then only select objects
+    // (and deselect others) as a preparation for showing the context
+    // menu.
+    const bool bSelectionOnly = rMEvt.IsRight();
+
+    bMBDown = true;
+    bSelectionChanged = false;
+
+    if ( mpView->IsAction() )
+    {
+        if ( rMEvt.IsRight() )
+            mpView->BckAction();
+        return true;
+    }
+
+    sal_uInt16 nDrgLog = sal_uInt16 ( mpWindow->PixelToLogic(Size(mpView->GetDragThresholdPixels(),0)).Width() );
+    sal_uInt16 nHitLog = sal_uInt16 ( mpWindow->PixelToLogic(Size(HITPIX,0)).Width() );
+
+    if (comphelper::COKit::isActive())
+    {
+        // When tiled rendering, we always work in logic units, use the non-pixel constants.
+        nDrgLog = DRGLOG;
+        nHitLog = HITLOG;
+    }
+
+    // The following code is executed for right clicks as well as for left
+    // clicks in order to modify the selection for the right button as a
+    // preparation for the context menu.  The functions BegMarkObject() and
+    // BegDragObject(), however, are not called for right clicks because a)
+    // it makes no sense and b) to have IsAction() return false when called
+    // from Command() which is a prerequisite for the context menu.
+    if ((rMEvt.IsLeft() || rMEvt.IsRight())
+        && !mpView->IsAction()
+        && (mpView->IsFrameDragSingles() || !mpView->HasMarkablePoints()))
+    {
+        /******************************************************************
+        * NO BEZIER_EDITOR
+        ******************************************************************/
+        mpWindow->CaptureMouse();
+        pHdl = PickHandle(aMDPos);
+
+        Degree100 nAngle0  = GetAngle(aMDPos - mpView->GetRef1());
+        nAngle0 -= 27000_deg100;
+        nAngle0 = NormAngle36000(nAngle0);
+        bMirrorSide0 = nAngle0 < 18000_deg100;
+
+        if (!pHdl && mpView->Is3DRotationCreationActive())
+        {
+            /******************************************************************
+            * If 3D-rotation bodies are about to be created,
+            * end creation now.
+            ******************************************************************/
+            bSuppressChangesOfSelection = true;
+            mpWindow->EnterWait();
+            mpView->End3DCreation();
+            bSuppressChangesOfSelection = false;
+            mpView->ResetCreationActive();
+            mpWindow->LeaveWait();
+        }
+
+        bool bTextEdit = false;
+        SdrViewEvent aVEvt;
+        SdrHitKind eHit = mpView->PickAnything(rMEvt, SdrMouseEventKind::BUTTONDOWN, aVEvt);
+
+        if (eHit == SdrHitKind::TextEditObj && (mrViewShell.GetFrameView()->IsQuickEdit() || dynamic_cast< sdr::table::SdrTableObj* >(aVEvt.mpObj) != nullptr))
+        {
+            bTextEdit = true;
+        }
+
+        // When clicking into a URl field, also go to text edit mode (when not following the link)
+        if (!bTextEdit && eHit == SdrHitKind::UrlField && !rMEvt.IsMod2() && !lcl_followHyperlinkAllowed(rMEvt))
+            bTextEdit = true;
+
+        // A ctrl-click adds the object to the selection or removes it, also when it lands on
+        // text, so it starts no text editing. When nothing or only the table itself is selected,
+        // a ctrl-click into a table still puts the cursor into the cell.
+        const SdrMarkList& rMarkedObjects = mpView->GetMarkedObjectList();
+        const bool bTableAloneInSelection
+            = dynamic_cast<sdr::table::SdrTableObj*>(aVEvt.mpObj) != nullptr
+              && (rMarkedObjects.GetMarkCount() == 0
+                  || (rMarkedObjects.GetMarkCount() == 1
+                      && rMarkedObjects.GetMark(0)->GetMarkedSdrObj() == aVEvt.mpObj));
+        if (rMEvt.IsMod1() && !bTableAloneInSelection)
+            bTextEdit = false;
+
+        SfxViewShell* pViewShell = mrViewShell.GetViewShell();
+        bool bPreventModify = mpDocSh->IsReadOnly()
+            || (pViewShell && pViewShell->IsKitReadOnlyView());
+        if (bPreventModify && pViewShell && pViewShell->GetSignPDFCertificate().Is()
+            && !pViewShell->IsKitReadOnlyView())
+        {
+            // If the just added signature line shape is selected, allow moving / resizing it.
+            bPreventModify = false;
+        }
+
+        if(!bTextEdit
+            && !bPreventModify
+            && ((mpView->IsMarkedHit(aMDPos, nHitLog) && !rMEvt.IsShift() && !rMEvt.IsMod2()) || pHdl != nullptr)
+            && (rMEvt.GetClicks() != 2)
+            )
+        {
+            if (!pHdl && mpView->Is3DRotationCreationActive())
+            {
+                // Switch between 3D-rotation body -> selection
+                mpView->ResetCreationActive();
+            }
+            else if (bWaterCan)
+            {
+                // Remember the selected object for proper handling in
+                // MouseButtonUp().
+                pWaterCanCandidate = pickObject (aMDPos);
+            }
+            else
+            {
+                // hit handle or marked object
+                bFirstMouseMove = true;
+                aDragTimer.Start();
+            }
+
+            if ( ! rMEvt.IsRight())
+                if (mpView->BegDragObj(aMDPos, nullptr, pHdl, nDrgLog))
+                    mpView->GetDragMethod()->SetShiftPressed( rMEvt.IsShift() );
+            bReturn = true;
+        }
+        else
+        {
+            SdrPageView* pPV = nullptr;
+            SdrObject* pObj = !rMEvt.IsMod2() ? mpView->PickObj(aMDPos, mpView->getHitTolLog(), pPV, SdrSearchOptions::PICKMACRO) : nullptr;
+            if (pObj)
+            {
+                mpView->BegMacroObj(aMDPos, nHitLog, pObj, pPV, mpWindow);
+                bReturn = true;
+            }
+            else if ( bTextEdit )
+            {
+                SdrObjKind nSdrObjKind = aVEvt.mpObj->GetObjIdentifier();
+
+                if (aVEvt.mpObj->GetObjInventor() == SdrInventor::Default &&
+                    (nSdrObjKind == SdrObjKind::Text ||
+                     nSdrObjKind == SdrObjKind::TitleText ||
+                     nSdrObjKind == SdrObjKind::OutlineText ||
+                     !aVEvt.mpObj->IsEmptyPresObj()))
+                {
+                    // Seamless Editing: branch to text input
+                    if (!rMEvt.IsShift())
+                        mpView->UnmarkAll();
+
+                    SfxUInt16Item aItem(SID_TEXTEDIT, 1);
+                    mrViewShell.GetViewFrame()->GetDispatcher()->
+                    ExecuteList(SID_TEXTEDIT,
+                            SfxCallMode::SYNCHRON,
+                            { &aItem });
+                    return bReturn; // CAUTION, due to the synchronous slot the object is deleted now
+                }
+            }
+            else if ( !rMEvt.IsMod2() && rMEvt.GetClicks() == 1 &&
+                      aVEvt.meEvent == SdrEventKind::ExecuteUrl )
+             {
+                mpWindow->ReleaseMouse();
+
+                if (!aVEvt.mpURLField)
+                    return true;
+
+                // If tiled rendering, let client handles URL execution and early returns.
+                if (comphelper::COKit::isActive())
+                {
+                    SfxViewShell& rSfxViewShell = mrViewShell.GetViewShellBase();
+                    rSfxViewShell.sendHyperlinkClicked(aVEvt.mpURLField->GetURL());
+                    return true;
+                }
+
+                if (!lcl_followHyperlinkAllowed(rMEvt))
+                    return true;
+
+                SfxStringItem aStrItem(SID_FILE_NAME, aVEvt.mpURLField->GetURL());
+                SfxStringItem aReferer(SID_REFERER, mpDocSh->GetMedium()->GetName());
+                SfxBoolItem aBrowseItem( SID_BROWSE, true );
+                SfxViewFrame* pFrame = mrViewShell.GetViewFrame();
+                mpWindow->ReleaseMouse();
+
+                if (rMEvt.IsMod1())
+                {
+                    // Open in new frame
+                    pFrame->GetDispatcher()->ExecuteList(SID_OPENDOC,
+                        SfxCallMode::ASYNCHRON,
+                        { &aStrItem, &aBrowseItem, &aReferer });
+                }
+                else
+                {
+                    // Open in current frame
+                    SfxFrameItem aFrameItem(SID_DOCFRAME, pFrame);
+                    pFrame->GetDispatcher()->ExecuteList(SID_OPENDOC,
+                        SfxCallMode::ASYNCHRON,
+                        { &aStrItem, &aFrameItem, &aBrowseItem, &aReferer });
+                }
+
+                bReturn = true;
+            }
+            else if(!rMEvt.IsMod2()
+                && dynamic_cast< const DrawViewShell *>( &mrViewShell ) !=  nullptr
+                )
+            {
+                pObj = mpView->PickObj(aMDPos, mpView->getHitTolLog(), pPV, SdrSearchOptions::ALSOONMASTER);
+                if (pObj)
+                {
+                    // Handle ImageMap click when not just selecting
+                    if (!bSelectionOnly)
+                    {
+                        if (lcl_followHyperlinkAllowed(rMEvt))
+                            bReturn = HandleImageMapClick(pObj, aMDPos);
+                    }
+
+                    if (!bReturn
+                        && (dynamic_cast<const SdrObjGroup*>(pObj) != nullptr
+                            || DynCastE3dScene(pObj)))
+                    {
+                        if (rMEvt.GetClicks() == 1)
+                        {
+                            // Look into the group
+                            pObj = mpView->PickObj(aMDPos, mpView->getHitTolLog(), pPV,
+                                                   SdrSearchOptions::ALSOONMASTER
+                                                       | SdrSearchOptions::DEEP);
+                            if (pObj && lcl_followHyperlinkAllowed(rMEvt))
+                                bReturn = HandleImageMapClick(pObj, aMDPos);
+                        }
+                        else if (!bReadOnly && rMEvt.GetClicks() == 2)
+                        {
+                            // New: double click on selected Group object
+                            // enter group
+                            if (!bSelectionOnly
+                                && pObj->getSdrPageFromSdrObject() == pPV->GetPage())
+                                bReturn = pPV->EnterGroup(pObj);
+                        }
+                    }
+                    else if (pObj->GetObjIdentifier() == SdrObjKind::Page)
+                    {
+                        if (rMEvt.GetClicks() == 2)
+                        {
+                            SdrPageObj* pPageObj = static_cast<SdrPageObj*>(pObj);
+                            DrawViewShell* pDrawViewShell = dynamic_cast<DrawViewShell*>(&mrViewShell);
+                            SdPage* pActualPage = mrViewShell.GetActualPage();
+                            // On the canvas page a ctrl-modified double click on a preview
+                            // starts editing that slide in place. A plain double click
+                            // switches the view to the slide the preview shows.
+                            if (rMEvt.IsMod1() && comphelper::COKit::isActive() && pDrawViewShell
+                                && pActualPage && pActualPage->IsCanvasPage())
+                            {
+                                pDrawViewShell->EnterPreviewEditMode(*pPageObj);
+                                bReturn = true;
+                            }
+                            else if (pDrawViewShell)
+                            {
+                                sal_uInt16 nPageNum = (pPageObj->GetReferencedPage()->GetPageNum() - 1) / 2;
+                                pDrawViewShell->SwitchPage(nPageNum);
+                            }
+                        }
+                    }
+                }
+
+                // #i71727# replaced else here with two possibilities, once the original else (!pObj)
+                // and also ignoring the found object when it's on a masterpage
+                if(!pObj || (pObj->getSdrPageFromSdrObject() && pObj->getSdrPageFromSdrObject()->IsMasterPage()))
+                {
+                    if(mpView->IsGroupEntered() && 2 == rMEvt.GetClicks())
+                    {
+                        // New: double click on empty space/on obj on MasterPage, leave group
+                        mpView->LeaveOneGroup();
+                        bReturn = true;
+                    }
+                }
+            }
+
+            if (!bReturn)
+            {
+                if (bWaterCan)
+                {
+                    if ( ! (rMEvt.IsShift() || rMEvt.IsMod2()))
+                    {
+                        // Find the object under the current mouse position
+                        // and store it for the MouseButtonUp() method to
+                        // evaluate.
+                        pWaterCanCandidate = pickObject (aMDPos);
+                    }
+                }
+                else
+                {
+                    bReturn = true;
+                    bool bDeactivateOLE = false;
+
+                    if (!rMEvt.IsShift() && !rMEvt.IsMod1() && !rMEvt.IsMod2())
+                    {
+                        OSL_ASSERT (mrViewShell.GetViewShell()!=nullptr);
+                        Client* pIPClient = static_cast<Client*>(
+                            mrViewShell.GetViewShell()->GetIPClient());
+
+                        if (pIPClient && pIPClient->IsObjectInPlaceActive())
+                        {
+                            // OLE-object gets deactivated in subsequent UnmarkAll()
+                            bDeactivateOLE = true;
+                        }
+
+                        mpView->UnmarkAll();
+                    }
+
+                    bool bMarked = false;
+
+                    if ( !rMEvt.IsMod1() && !bDeactivateOLE)
+                    {
+                        if ( rMEvt.IsMod2() )
+                        {
+                            bMarked = mpView->MarkNextObj(aMDPos, nHitLog, rMEvt.IsShift() );
+                        }
+                        else
+                        {
+                            bool bToggle = false;
+
+                            const SdrMarkList& rMarkList = mpView->GetMarkedObjectList();
+                            if (rMEvt.IsShift() && rMarkList.GetMarkCount() > 1)
+                            {
+                                // No Toggle on single selection
+                                bToggle = true;
+                            }
+
+                            bMarked = mpView->MarkObj(aMDPos, nHitLog, bToggle);
+                        }
+                    }
+
+                    if( !bDeactivateOLE )
+                    {
+                        if ( !bReadOnly &&
+                             bMarked                                                   &&
+                             (!rMEvt.IsShift() || mpView->IsMarkedHit(aMDPos, nHitLog)))
+                        {
+                            /**********************************************************
+                             * Move object
+                             **********************************************************/
+                            aDragTimer.Start();
+
+                            pHdl = PickHandle(aMDPos);
+                            if ( ! rMEvt.IsRight())
+                                mpView->BegDragObj(aMDPos, nullptr, pHdl, nDrgLog);
+                        }
+                        else
+                        {
+                            /**********************************************************
+                             * Select object
+                             **********************************************************/
+                            if ( ! rMEvt.IsRight())
+                                mpView->BegMarkObj(aMDPos);
+                        }
+                    }
+
+                    if( bMarked && bTempRotation && (nSlotId == SID_OBJECT_ROTATE) && !rMEvt.IsShift() && (rMEvt.GetClicks() != 2) )
+                    {
+                        nSlotId = SID_OBJECT_SELECT;
+                        Activate();
+                    }
+                }
+            }
+        }
+    }
+    else if ( !bReadOnly
+              && (rMEvt.IsLeft() || rMEvt.IsRight())
+              && !mpView->IsAction())
+    {
+        /**********************************************************************
+        * BEZIER-EDITOR
+        **********************************************************************/
+        mpWindow->CaptureMouse();
+        SdrViewEvent aVEvt;
+        SdrHitKind eHit = mpView->PickAnything(rMEvt, SdrMouseEventKind::BUTTONDOWN, aVEvt);
+
+        if (eHit == SdrHitKind::Handle && aVEvt.mpHdl->GetKind() == SdrHdlKind::BezierWeight)
+        {
+            /******************************************************************
+            * Drag Handle
+            ******************************************************************/
+            if ( ! rMEvt.IsRight())
+                mpView->BegDragObj(aMDPos, nullptr, aVEvt.mpHdl, nDrgLog);
+        }
+        else if (eHit == SdrHitKind::MarkedObject && nEditMode == SID_BEZIER_INSERT)
+        {
+            /******************************************************************
+            * Insert gluepoint
+            ******************************************************************/
+            mpView->BegInsObjPoint(aMDPos, rMEvt.IsMod1());
+        }
+        else if (eHit == SdrHitKind::MarkedObject && rMEvt.IsMod1())
+        {
+            /******************************************************************
+            * Select gluepoint
+            ******************************************************************/
+            if (!rMEvt.IsShift())
+                mpView->UnmarkAllPoints();
+
+            if ( ! rMEvt.IsRight())
+                mpView->BegMarkPoints(aMDPos);
+        }
+        else if (eHit == SdrHitKind::MarkedObject && !rMEvt.IsShift() && !rMEvt.IsMod2())
+        {
+            /******************************************************************
+            * Move object
+            ******************************************************************/
+            if ( ! rMEvt.IsRight())
+                mpView->BegDragObj(aMDPos, nullptr, nullptr, nDrgLog);
+        }
+        else if (eHit == SdrHitKind::Handle)
+        {
+            /******************************************************************
+            * Select gluepoint
+            ******************************************************************/
+            if (!mpView->IsPointMarked(*aVEvt.mpHdl) || rMEvt.IsShift())
+            {
+                if (!rMEvt.IsShift())
+                {
+                    mpView->UnmarkAllPoints();
+                    pHdl = PickHandle(aMDPos);
+                }
+                else
+                {
+                    if (mpView->IsPointMarked(*aVEvt.mpHdl))
+                    {
+                        mpView->UnmarkPoint(*aVEvt.mpHdl);
+                        pHdl = SetPickedHandle(nullptr);
+                    }
+                    else
+                    {
+                        pHdl = PickHandle(aMDPos);
+                    }
+                }
+
+                if (pHdl)
+                {
+                    mpView->MarkPoint(*pHdl);
+                    if ( ! rMEvt.IsRight())
+                        mpView->BegDragObj(aMDPos, nullptr, pHdl, nDrgLog);
+
+                }
+            }
+            else
+            {
+                // Point IS marked and NO shift is pressed. Start
+                // dragging of selected point(s)
+                pHdl = PickHandle(aMDPos);
+                if(pHdl && ! rMEvt.IsRight())
+                    mpView->BegDragObj(aMDPos, nullptr, pHdl, nDrgLog);
+            }
+        }
+        else
+        {
+            /******************************************************************
+            * Select or drag object
+            ******************************************************************/
+            if (!rMEvt.IsShift() && !rMEvt.IsMod2() && eHit == SdrHitKind::UnmarkedObject)
+            {
+               mpView->UnmarkAllObj();
+            }
+
+            bool bMarked = false;
+
+            if (!rMEvt.IsMod1())
+            {
+                if (rMEvt.IsMod2())
+                {
+                    bMarked = mpView->MarkNextObj(aMDPos, nHitLog, rMEvt.IsShift());
+                }
+                else
+                {
+                    bMarked = mpView->MarkObj(aMDPos, nHitLog, rMEvt.IsShift());
+                }
+            }
+
+            const SdrMarkList& rMarkList = mpView->GetMarkedObjectList();
+            if (bMarked &&
+                (!rMEvt.IsShift() || eHit == SdrHitKind::MarkedObject))
+            {
+                // Move object
+                if ( ! rMEvt.IsRight())
+                    mpView->BegDragObj(aMDPos, nullptr, aVEvt.mpHdl, nDrgLog);
+            }
+            else if (rMarkList.GetMarkCount() != 0)
+            {
+                /**************************************************************
+                * Select gluepoint
+                **************************************************************/
+                if (!rMEvt.IsShift())
+                    mpView->UnmarkAllPoints();
+
+                if ( ! rMEvt.IsRight())
+                    mpView->BegMarkPoints(aMDPos);
+            }
+            else
+            {
+                /**************************************************************
+                * Select object
+                **************************************************************/
+                if ( ! rMEvt.IsRight())
+                    mpView->BegMarkObj(aMDPos);
+            }
+
+            ForcePointer(&rMEvt);
+        }
+    }
+
+    if (!bIsInDragMode)
+    {
+        ForcePointer(&rMEvt);
+    }
+
+    return bReturn;
+}
+
+bool FuSelection::MouseMove(const MouseEvent& rMEvt)
+{
+    bool bReturn = FuDraw::MouseMove(rMEvt);
+
+    if (aDragTimer.IsActive())
+    {
+        if(bFirstMouseMove)
+        {
+            bFirstMouseMove = false;
+        }
+        else
+        {
+            aDragTimer.Stop();
+        }
+    }
+
+    if (mpView->IsAction())
+    {
+        Point aPix(rMEvt.GetPosPixel());
+        Point aPnt(mpWindow->PixelToLogic(aPix));
+
+        ForceScroll(aPix);
+
+        if (mpView->IsInsObjPoint())
+        {
+            mpView->MovInsObjPoint(aPnt);
+        }
+        else
+        {
+            mpView->MovAction(aPnt);
+        }
+    }
+
+    ForcePointer(&rMEvt);
+
+    return bReturn;
+}
+
+bool FuSelection::MouseButtonUp(const MouseEvent& rMEvt)
+{
+    bool bReturn = false;
+    // When the right mouse button is pressed then only select objects
+    // (and deselect others) as a preparation for showing the context
+    // menu.
+    const bool bSelectionOnly = rMEvt.IsRight();
+
+    if (aDragTimer.IsActive() )
+    {
+        aDragTimer.Stop();
+        bIsInDragMode = false;
+    }
+
+    if( !mpView )
+        return false;
+
+    Point aPnt( mpWindow->PixelToLogic( rMEvt.GetPosPixel() ) );
+    sal_uInt16 nHitLog = sal_uInt16 ( mpWindow->PixelToLogic(Size(HITPIX,0)).Width() );
+    sal_uInt16 nDrgLog = sal_uInt16 ( mpWindow->PixelToLogic(Size(mpView->GetDragThresholdPixels(),0)).Width() );
+    const bool bPickedDiagramFrameHdl = mbPickedDiagramFrameHdl;
+
+    bool bWasDragged = false;
+    if (mpView->IsFrameDragSingles() || !mpView->HasMarkablePoints())
+    {
+        /**********************************************************************
+        * NO BEZIER_EDITOR
+        **********************************************************************/
+        if ( mpView->IsDragObj() )
+        {
+            /******************************************************************
+            * Object was moved
+            ******************************************************************/
+            FrameView* pFrameView = mrViewShell.GetFrameView();
+            bool bDragWithCopy = (rMEvt.IsMod1() && pFrameView->IsDragWithCopy());
+
+            if (bDragWithCopy)
+            {
+                bDragWithCopy = !mpView->IsPresObjSelected(false);
+            }
+
+            mpView->SetDragWithCopy(bDragWithCopy);
+
+            // A plain move drag whose drop centre lands inside the entered preview moves the
+            // dragged shape onto the slide that preview shows. The canvas drag is broken off
+            // first, so the whole change is the single undo action the move helper creates.
+            DrawViewShell* pPreviewShell = dynamic_cast<DrawViewShell*>(&mrViewShell);
+            if (comphelper::COKit::isActive() && pPreviewShell
+                && pPreviewShell->IsInPreviewEditMode() && !bDragWithCopy
+                && dynamic_cast<SdrDragMove*>(mpView->GetDragMethod()))
+            {
+                PreviewEditMode* pMode = pPreviewShell->GetPreviewEditMode();
+                SdrPageObj* pPreview = pMode->GetEnteredPreview();
+                SdPage* pSlide = static_cast<SdPage*>(pPreview->GetReferencedPage());
+                if (!pSlide)
+                {
+                    // The preview no longer shows a slide, so there is no target for the drop
+                    // and the mode is over. The drag ends on the ordinary path below.
+                    pPreviewShell->LeavePreviewEditMode();
+                }
+                else
+                {
+                    const SdrMarkList& rMarkList = mpView->GetMarkedObjectList();
+                    SdrObject* pDragged = rMarkList.GetMarkCount() == 1
+                                              ? rMarkList.GetMark(0)->GetMarkedSdrObj()
+                                              : nullptr;
+                    if (pDragged && pDragged->GetObjIdentifier() != SdrObjKind::Page
+                        && pDragged->GetObjIdentifier() != SdrObjKind::Edge)
+                    {
+                        const ::tools::Rectangle aDroppedRectangle
+                            = pDragged->GetLogicRect() + (aPnt - aMDPos);
+                        if (pPreview->GetSnapRect().Contains(aDroppedRectangle.Center()))
+                        {
+                            mpView->BrkDragObj();
+                            mpView->UnmarkAllObj();
+                            mrDoc.MoveShapeBetweenPages(
+                                *pDragged, *pSlide,
+                                SdDrawDocument::ConvertCanvasRectangleToSlide(aDroppedRectangle,
+                                                                              *pPreview));
+                            mrViewShell.GetDocSh()->SetModified();
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            bWasDragged = mpView->EndDragObj(mpView->IsDragWithCopy());
+
+            mpView->ForceMarkedToAnotherPage();
+
+            if (rMEvt.IsMod1() && !rMEvt.IsShift() && !rMEvt.IsMod2() && !bWasDragged && !moPickedHdlKind
+                && std::abs(aPnt.X() - aMDPos.X()) < nDrgLog
+                && std::abs(aPnt.Y() - aMDPos.Y()) < nDrgLog)
+            {
+                // A ctrl-press on a selected object starts a drag, which copies the selection
+                // when the mouse moves. Released in place, it is a ctrl-click, and the clicked
+                // object leaves the selection.
+                SdrPageView* pPV = nullptr;
+                SdrObject* pObj = mpView->PickObj(aMDPos, mpView->getHitTolLog(), pPV,
+                                                  SdrSearchOptions::MARKED);
+                if (pObj && pPV)
+                    mpView->MarkObj(pObj, pPV, true);
+            }
+
+            if (comphelper::COKit::isActive() && bWasDragged
+                && mrViewShell.GetActualPage()->IsCanvasPage())
+            {
+                // A committed drag may have moved or resized previews.
+                mrDoc.NotifyKitCanvasPreviewRectangles();
+            }
+
+            if (!rMEvt.IsShift() && !rMEvt.IsMod1() && !rMEvt.IsMod2() &&
+                !bSelectionChanged                   &&
+                std::abs(aPnt.X() - aMDPos.X()) < nDrgLog &&
+                std::abs(aPnt.Y() - aMDPos.Y()) < nDrgLog)
+            {
+                /*************************************************************
+                * If a user wants to click on an object in front of a marked
+                * one, he releases the mouse button immediately
+                **************************************************************/
+                SdrPageView* pPV;
+                SdrObject* pObj = mpView->PickObj(aMDPos, mpView->getHitTolLog(), pPV, SdrSearchOptions::ALSOONMASTER | SdrSearchOptions::BEFOREMARK);
+
+                if (pObj && pPV->IsObjMarkable(pObj))
+                {
+                    mpView->UnmarkAllObj();
+                    mpView->MarkObj(pObj,pPV);
+                    return true;
+                }
+
+                // check for single object selected
+                SdrObject* pSingleObj = nullptr;
+
+                const SdrMarkList& rMarkList = mpView->GetMarkedObjectList();
+                if (rMarkList.GetMarkCount()==1)
+                {
+                    pSingleObj = rMarkList.GetMark(0)->GetMarkedSdrObj();
+                }
+
+                /**************************************************************
+                * Toggle between selection and rotation
+                **************************************************************/
+                if (nSlotId == SID_OBJECT_SELECT
+                    && !comphelper::COKit::isActive()
+                    && mpView->IsRotateAllowed()
+
+                    && (rMEvt.GetClicks() != 2)
+                    && (mrViewShell.GetFrameView()->IsClickChangeRotation()
+                        || (pSingleObj
+                            && pSingleObj->GetObjInventor()==SdrInventor::E3d))
+                    && ! bSelectionOnly)
+
+                {
+                    bTempRotation = true;
+                    nSlotId = SID_OBJECT_ROTATE;
+                    Activate();
+                }
+                else if (nSlotId == SID_OBJECT_ROTATE)
+                {
+                    nSlotId = SID_OBJECT_SELECT;
+                    Activate();
+                }
+            }
+            else if (nSlotId == SID_CONVERT_TO_3D_LATHE)
+            {
+                if (!moPickedHdlKind)
+                {
+                    bSuppressChangesOfSelection = true;
+                    mpView->Start3DCreation();
+                    bSuppressChangesOfSelection = false;
+                }
+                else if (*moPickedHdlKind != SdrHdlKind::MirrorAxis &&
+                         *moPickedHdlKind != SdrHdlKind::Ref1 &&
+                         *moPickedHdlKind != SdrHdlKind::Ref2 && mpView->Is3DRotationCreationActive())
+                {
+                    /*********************************************************
+                    * If 3D-rotation bodies are about to be created,
+                    * end creation now
+                    **********************************************************/
+                    Degree100 nAngle1  = GetAngle(aPnt - mpView->GetRef1());
+                    nAngle1 -= 27000_deg100;
+                    nAngle1 = NormAngle36000(nAngle1);
+                    bool bMirrorSide1 = nAngle1 < 18000_deg100;
+
+                    if (bMirrorSide0 != bMirrorSide1)
+                    {
+                         bSuppressChangesOfSelection = true;
+                         mpWindow->EnterWait();
+                         mpView->End3DCreation();
+                         bSuppressChangesOfSelection = false;
+                         nSlotId = SID_OBJECT_SELECT;
+                         mpWindow->LeaveWait();
+                         Activate();
+                    }
+                }
+            }
+        }
+        else if (rMEvt.IsMod1()
+            && !rMEvt.IsMod2()
+            && std::abs(aPnt.X() - aMDPos.X()) < nDrgLog
+            && std::abs(aPnt.Y() - aMDPos.Y()) < nDrgLog
+            && !lcl_hitsCanvasPagePreview(mpView, mrViewShell, aPnt))
+        {
+            // A ctrl-click adds the object to the selection or removes it. It picks at the
+            // level of the entered group, so a click on a grouped object toggles the whole
+            // group. With an empty selection, or a selection that already holds an object from
+            // inside a group, it picks the object inside the group instead. Ctrl and shift
+            // together always pick inside the group.
+            const bool bDeep = rMEvt.IsShift() || mpView->GetMarkedObjectList().GetMarkCount() == 0
+                               || lcl_hasMarkedObjectInsideGroup(*mpView);
+            mpView->MarkObj(aPnt, nHitLog, true, bDeep);
+        }
+
+        if (mpView->IsAction() )
+        {
+            mpView->EndAction();
+        }
+
+        if (SdModule::get()->GetWaterCan())
+        {
+            if( rMEvt.IsRight() )
+            {
+                // In watering-can mode, on press onto right mouse button, an undo is executed
+                mrViewShell.GetViewFrame()->GetDispatcher()->Execute( SID_UNDO, SfxCallMode::ASYNCHRON );
+            }
+            else if (pWaterCanCandidate != nullptr)
+            {
+                // Is the candidate object still under the mouse?
+                if (pickObject (aPnt) == pWaterCanCandidate)
+                {
+                    SdStyleSheetPool* pPool = static_cast<SdStyleSheetPool*>(
+                        mpDocSh->GetStyleSheetPool());
+                    if (pPool != nullptr)
+                    {
+                        SfxStyleSheet* pStyleSheet = static_cast<SfxStyleSheet*>(
+                            pPool->GetActualStyleSheet());
+                        if (pStyleSheet != nullptr && mpView->IsUndoEnabled() )
+                        {
+                            // Added UNDOs for the WaterCan mode. This was never done in
+                            // the past, thus it was missing all the time.
+                            std::unique_ptr<SdrUndoAction> pUndoAttr = mrDoc.GetSdrUndoFactory().CreateUndoAttrObject(*pWaterCanCandidate, true, true);
+                            mpView->BegUndo(pUndoAttr->GetComment());
+                            mpView->AddUndo(mrDoc.GetSdrUndoFactory().CreateUndoGeoObject(*pWaterCanCandidate));
+                            mpView->AddUndo(std::move(pUndoAttr));
+
+                            pWaterCanCandidate->SetStyleSheet (pStyleSheet, false);
+
+                            mpView->EndUndo();
+                        }
+                    }
+                }
+            }
+            // else when there has been no object under the mouse when the
+            // button was pressed then nothing happens even when there is
+            // one now.
+        }
+
+        sal_uInt16 nClicks = rMEvt.GetClicks();
+
+        if (nClicks == 2 && rMEvt.IsLeft() && bMBDown &&
+            !rMEvt.IsMod1() && !rMEvt.IsShift() )
+        {
+            DoubleClick(rMEvt);
+        }
+
+        bMBDown = false;
+
+        ForcePointer(&rMEvt);
+        SetPickedHandle(nullptr);
+        mpWindow->ReleaseMouse();
+        SdrObject* pSingleObj = nullptr;
+        const SdrMarkList& rMarkList = mpView->GetMarkedObjectList();
+        const size_t nMarkCount = rMarkList.GetMarkCount();
+
+        if (nMarkCount==1)
+        {
+            pSingleObj = rMarkList.GetMark(0)->GetMarkedSdrObj();
+        }
+
+        if (!bWasDragged && pSingleObj && pSingleObj->isAnnotationObject() && rMEvt.IsLeft())
+        {
+            auto& pAnnotationData = pSingleObj->getAnnotationData();
+            if (pAnnotationData)
+            {
+                auto* pDrawViewShell = dynamic_cast<DrawViewShell*>(&mrViewShell);
+                if (pDrawViewShell && pDrawViewShell->getAnnotationManagerPtr())
+                    pDrawViewShell->getAnnotationManagerPtr()->SelectAnnotation(pAnnotationData->mxAnnotation, true);
+            }
+            return true;
+        }
+
+        if(!bWasDragged && nullptr != pSingleObj && pSingleObj->isDiagram())
+        {
+            if (bPickedDiagramFrameHdl)
+            {
+                // Check for click on svx::diagram::DiagramFrameHdl
+                // - if we hit a SdrHdl
+                // - if it was not moved
+                // - if single object is selected and it is a Diagram
+                // let the DiagramFrameHdl decide what to do
+                svx::diagram::DiagramFrameHdl::clicked(aPnt);
+                return true;
+            }
+            else
+            {
+                const std::shared_ptr< svx::diagram::DiagramHelper_svx >& rDiagramHelper(pSingleObj->getDiagramHelper());
+                if (rDiagramHelper)
+                {
+                    SdrPageView* pPV;
+                    SdrObject* pCandidate = mpView->PickObj(aMDPos, mpView->getHitTolLog(), pPV, SdrSearchOptions::DEEP);
+                    if (pCandidate && !pCandidate->isDiagram())
+                    {
+                        rDiagramHelper->markDirectDiagramSubSelection(*pCandidate);
+                        mpView->UnmarkAllObj();
+                        mpView->MarkObj(pSingleObj,pPV);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if ( (nSlotId != SID_OBJECT_SELECT && nMarkCount==0)                    ||
+             ( mpView->GetDragMode() == SdrDragMode::Crook &&
+              !mpView->IsCrookAllowed( mpView->IsCrookNoContortion() ) ) ||
+             ( mpView->GetDragMode() == SdrDragMode::Shear &&
+              !mpView->IsShearAllowed() && !mpView->IsDistortAllowed() ) ||
+             ( nSlotId==SID_CONVERT_TO_3D_LATHE && pSingleObj &&
+              (pSingleObj->GetObjInventor() != SdrInventor::Default         ||
+               pSingleObj->GetObjIdentifier() == SdrObjKind::Measure) ) )
+        {
+            bReturn = true;
+            ForcePointer(&rMEvt);
+            SetPickedHandle(nullptr);
+            mpWindow->ReleaseMouse();
+            FuDraw::MouseButtonUp(rMEvt);
+            mrViewShell.GetViewFrame()->GetDispatcher()->Execute(SID_OBJECT_SELECT, SfxCallMode::SYNCHRON);
+            return bReturn; // CAUTION, due to the synchronous slot, the object is deleted now.
+        }
+
+        FuDraw::MouseButtonUp(rMEvt);
+    }
+    else
+    {
+        /**********************************************************************
+        * BEZIER_EDITOR
+        **********************************************************************/
+        if ( mpView->IsAction() )
+        {
+            if ( mpView->IsInsObjPoint() )
+            {
+                mpView->EndInsObjPoint(SdrCreateCmd::ForceEnd);
+            }
+            else if ( mpView->IsDragObj() )
+            {
+                FrameView* pFrameView = mrViewShell.GetFrameView();
+                bool bDragWithCopy = (rMEvt.IsMod1() && pFrameView->IsDragWithCopy());
+
+                if (bDragWithCopy)
+                {
+                    bDragWithCopy = !mpView->IsPresObjSelected(false);
+                }
+
+                mpView->SetDragWithCopy(bDragWithCopy);
+                mpView->EndDragObj( mpView->IsDragWithCopy() );
+            }
+            else
+            {
+                mpView->EndAction();
+
+                sal_uInt16 nDrgLog2 = sal_uInt16 ( mpWindow->PixelToLogic(Size(mpView->GetDragThresholdPixels(),0)).Width() );
+                Point aPos = mpWindow->PixelToLogic( rMEvt.GetPosPixel() );
+
+                if (std::abs(aMDPos.X() - aPos.X()) < nDrgLog2 &&
+                    std::abs(aMDPos.Y() - aPos.Y()) < nDrgLog2 &&
+                    !rMEvt.IsShift() && !rMEvt.IsMod2())
+                {
+                    SdrViewEvent aVEvt;
+                    SdrHitKind eHit = mpView->PickAnything(rMEvt, SdrMouseEventKind::BUTTONDOWN, aVEvt);
+
+                    if (eHit == SdrHitKind::NONE)
+                    {
+                        // Click on the same place - unselect
+                        mpView->UnmarkAllObj();
+                    }
+                }
+            }
+        }
+        else if (!rMEvt.IsShift() && rMEvt.IsMod1() && !rMEvt.IsMod2() &&
+                 std::abs(aPnt.X() - aMDPos.X()) < nDrgLog &&
+                 std::abs(aPnt.Y() - aMDPos.Y()) < nDrgLog)
+        {
+            // Enter group
+            mpView->MarkObj(aPnt, nHitLog, false, rMEvt.IsMod1());
+        }
+
+        ForcePointer(&rMEvt);
+        SetPickedHandle(nullptr);
+        mpWindow->ReleaseMouse();
+
+        FuDraw::MouseButtonUp(rMEvt);
+    }
+
+    return bReturn;
+}
+
+/**
+ * Process keyboard input
+ * @returns true if a KeyEvent is being processed, false otherwise
+ */
+bool FuSelection::KeyInput(const KeyEvent& rKEvt)
+{
+    bool bReturn = false;
+
+    switch (rKEvt.GetKeyCode().GetCode())
+    {
+        case KEY_ESCAPE:
+        {
+            bReturn = FuSelection::cancel();
+        }
+        break;
+        //add keyboard operation for insert points in drawing curve
+        case KEY_UP:
+        case KEY_DOWN:
+        case KEY_LEFT:
+        case KEY_RIGHT:
+        {
+            if(rKEvt.GetKeyCode().IsShift()&&(nEditMode == SID_BEZIER_INSERT)){
+                ::tools::Long nX = 0;
+                ::tools::Long nY = 0;
+                sal_uInt16  nCode = rKEvt.GetKeyCode().GetCode();
+                if (nCode == KEY_UP)
+                {
+                    // scroll up
+                    nX = 0;
+                    nY =-1;
+                }
+                else if (nCode == KEY_DOWN)
+                {
+                    // scroll down
+                    nX = 0;
+                    nY = 1;
+                }
+                else if (nCode == KEY_LEFT)
+                {
+                    // scroll left
+                    nX =-1;
+                    nY = 0;
+                }
+                else if (nCode == KEY_RIGHT)
+                {
+                    // scroll right
+                    nX = 1;
+                    nY = 0;
+                }
+
+                Point centerPoint;
+                ::tools::Rectangle rect = mpView->GetMarkedObjRect();
+                centerPoint = mpWindow->LogicToPixel(rect.Center());
+                Point aPoint = bMovedToCenterPoint? oldPoint:centerPoint;
+                Point ePoint = aPoint + Point(nX,nY);
+                mpWindow->SetPointerPosPixel(ePoint);
+                //simulate mouse move action
+                MouseEvent eMevt(ePoint, 1, MouseEventModifiers::DRAGMOVE, MOUSE_LEFT, 0);
+                MouseMove(eMevt);
+                oldPoint = ePoint;
+                bMovedToCenterPoint = true;
+                bReturn = true;
+            }
+        }
+        break;
+        case KEY_RETURN:
+            if(rKEvt.GetKeyCode().IsShift()&&(nEditMode == SID_BEZIER_INSERT))
+            {
+                if(!bBeginInsertPoint)
+                {
+                    //simulate mouse button down action
+                    MouseEvent aMevt(oldPoint, 1,
+                                     MouseEventModifiers::SIMPLEMOVE | MouseEventModifiers::DRAGMOVE,
+                                     MOUSE_LEFT, KEY_SHIFT);
+                    MouseButtonDown(aMevt);
+                    mpWindow->CaptureMouse();
+                    bBeginInsertPoint = true;
+                }
+                else
+                {
+                    //simulate mouse button up action
+                    MouseEvent rMEvt(oldPoint, 1,
+                                     MouseEventModifiers::SIMPLEMOVE | MouseEventModifiers::ENTERWINDOW,
+                                     MOUSE_LEFT, KEY_SHIFT);
+                    MouseButtonUp(rMEvt);
+                    bBeginInsertPoint = false;
+                }
+                bReturn= true;
+            }
+            break;
+    }
+    if (!bReturn)
+    {
+        bReturn = FuDraw::KeyInput(rKEvt);
+
+        const SdrMarkList& rMarkList = mpView->GetMarkedObjectList();
+        if(rMarkList.GetMarkCount() == 0)
+        {
+            mpView->ResetCreationActive();
+
+            mrViewShell.GetViewFrame()->GetDispatcher()->Execute(SID_OBJECT_SELECT, SfxCallMode::ASYNCHRON);
+        }
+    }
+
+    return bReturn;
+
+}
+
+void FuSelection::Activate()
+{
+    SdrDragMode eMode;
+    mpView->ResetCreationActive();
+    mpView->SetEditMode(SdrViewEditMode::Edit);
+
+    switch( nSlotId )
+    {
+        case SID_OBJECT_ROTATE:
+        {
+            eMode = SdrDragMode::Rotate;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+        }
+        break;
+
+        case SID_OBJECT_MIRROR:
+        {
+            eMode = SdrDragMode::Mirror;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+        }
+        break;
+
+        case SID_OBJECT_CROP:
+        {
+            eMode = SdrDragMode::Crop;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+        }
+        break;
+
+        case SID_OBJECT_TRANSPARENCE:
+        {
+            eMode = SdrDragMode::Transparence;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+        }
+        break;
+
+        case SID_OBJECT_GRADIENT:
+        {
+            eMode = SdrDragMode::Gradient;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+        }
+        break;
+
+        case SID_OBJECT_SHEAR:
+        {
+            eMode = SdrDragMode::Shear;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+        }
+        break;
+
+        case SID_OBJECT_CROOK_ROTATE:
+        {
+            eMode = SdrDragMode::Crook;
+
+            if ( mpView->GetDragMode() != eMode )
+            {
+                mpView->SetDragMode(eMode);
+                mpView->SetCrookMode(SdrCrookMode::Rotate);
+            }
+        }
+        break;
+
+        case SID_OBJECT_CROOK_SLANT:
+        {
+            eMode = SdrDragMode::Crook;
+
+            if ( mpView->GetDragMode() != eMode )
+            {
+                mpView->SetDragMode(eMode);
+                mpView->SetCrookMode(SdrCrookMode::Slant);
+            }
+        }
+        break;
+
+        case SID_OBJECT_CROOK_STRETCH:
+        {
+            eMode = SdrDragMode::Crook;
+
+            if ( mpView->GetDragMode() != eMode )
+            {
+                mpView->SetDragMode(eMode);
+                mpView->SetCrookMode(SdrCrookMode::Stretch);
+            }
+        }
+        break;
+
+        case SID_CONVERT_TO_3D_LATHE:
+        {
+            eMode = SdrDragMode::Mirror;
+            bSuppressChangesOfSelection = true;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+
+            if (!mpView->Is3DRotationCreationActive())
+                mpView->Start3DCreation();
+
+            bSuppressChangesOfSelection = false;
+        }
+        break;
+
+        default:
+        {
+            eMode = SdrDragMode::Move;
+
+            if ( mpView->GetDragMode() != eMode )
+                mpView->SetDragMode(eMode);
+        }
+        break;
+    }
+
+    if (nSlotId != SID_OBJECT_ROTATE)
+    {
+        bTempRotation = false;
+    }
+
+    FuDraw::Activate();
+}
+
+void FuSelection::SelectionHasChanged()
+{
+    bSelectionChanged = true;
+
+    FuDraw::SelectionHasChanged();
+
+    if (mpView->Is3DRotationCreationActive() && !bSuppressChangesOfSelection)
+    {
+        // Switch rotation body -> selection
+        mpView->ResetCreationActive();
+        nSlotId = SID_OBJECT_SELECT;
+        Activate();
+    }
+
+    // Activate the right tool bar for the current context of the view.
+    mrViewShell.GetViewShellBase().GetToolBarManager()->SelectionHasChanged(mrViewShell, *mpView);
+}
+
+/**
+ * Set current bezier edit mode
+ */
+void FuSelection::SetEditMode(sal_uInt16 nMode)
+{
+    nEditMode = nMode;
+
+    if (nEditMode == SID_BEZIER_INSERT)
+    {
+        mpView->SetInsObjPointMode(true);
+    }
+    else
+    {
+        mpView->SetInsObjPointMode(false);
+    }
+
+    ForcePointer();
+
+    SfxBindings& rBindings = mrViewShell.GetViewFrame()->GetBindings();
+    rBindings.Invalidate(SID_BEZIER_MOVE);
+    rBindings.Invalidate(SID_BEZIER_INSERT);
+}
+
+/**
+ * Execute ImageMap interaction
+ */
+bool FuSelection::HandleImageMapClick(const SdrObject* pObj, const Point& rPos)
+{
+    bool bClosed = pObj->IsClosedObj();
+    bool bFilled = false;
+
+    if (bClosed)
+    {
+        SfxItemSet aSet(mrDoc.GetPool());
+
+        aSet.Put(pObj->GetMergedItemSet());
+
+        const XFillStyleItem& rFillStyle = aSet.Get(XATTR_FILLSTYLE);
+        bFilled = rFillStyle.GetValue() != drawing::FillStyle_NONE;
+    }
+
+    const SdrLayerIDSet* pVisiLayer = &mpView->GetSdrPageView()->GetVisibleLayers();
+    double fHitLog = mpWindow->PixelToLogic(Size(HITPIX, 0)).Width();
+    const ::tools::Long n2HitLog = fHitLog * 2;
+    Point aHitPosR(rPos);
+    Point aHitPosL(rPos);
+    Point aHitPosT(rPos);
+    Point aHitPosB(rPos);
+
+    aHitPosR.AdjustX(n2HitLog);
+    aHitPosL.AdjustX(-n2HitLog);
+    aHitPosT.AdjustY(n2HitLog);
+    aHitPosB.AdjustY(-n2HitLog);
+
+    if (!bClosed || !bFilled
+        || (SdrObjectPrimitiveHit(*pObj, aHitPosR, {fHitLog, fHitLog}, *mpView->GetSdrPageView(), pVisiLayer,
+                                  false)
+            && SdrObjectPrimitiveHit(*pObj, aHitPosL, {fHitLog, fHitLog}, *mpView->GetSdrPageView(),
+                                     pVisiLayer, false)
+            && SdrObjectPrimitiveHit(*pObj, aHitPosT, {fHitLog, fHitLog}, *mpView->GetSdrPageView(),
+                                     pVisiLayer, false)
+            && SdrObjectPrimitiveHit(*pObj, aHitPosB, {fHitLog, fHitLog}, *mpView->GetSdrPageView(),
+                                     pVisiLayer, false)))
+    {
+        if (SvxIMapInfo::GetIMapInfo(pObj))
+        {
+            const IMapObject* pIMapObj = SvxIMapInfo::GetHitIMapObject(pObj, rPos);
+
+            if (pIMapObj && !pIMapObj->GetURL().isEmpty())
+            {
+                // Jump to Document
+                mpWindow->ReleaseMouse();
+
+                if (comphelper::COKit::isActive() && !pIMapObj->GetURL().startsWith("#"))
+                {
+                    mrViewShell.GetViewShellBase().sendHyperlinkClicked(pIMapObj->GetURL());
+                    return true;
+                }
+
+                SfxStringItem aStrItem(SID_FILE_NAME, pIMapObj->GetURL());
+                SfxStringItem aReferer(SID_REFERER, mpDocSh->GetMedium()->GetName());
+                SfxViewFrame* pFrame = mrViewShell.GetViewFrame();
+                SfxFrameItem aFrameItem(SID_DOCFRAME, pFrame);
+                SfxBoolItem aBrowseItem(SID_BROWSE, true);
+                mpWindow->ReleaseMouse();
+                pFrame->GetDispatcher()->ExecuteList(
+                    SID_OPENDOC, SfxCallMode::ASYNCHRON,
+                    { &aStrItem, &aFrameItem, &aBrowseItem, &aReferer });
+
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/** is called when the current function should be aborted. <p>
+    This is used when a function gets a KEY_ESCAPE but can also
+    be called directly.
+
+    @returns true if an active function was aborted
+*/
+bool FuSelection::cancel()
+{
+    if (mpView->Is3DRotationCreationActive())
+    {
+        mpView->ResetCreationActive();
+        mrViewShell.GetViewFrame()->GetDispatcher()->Execute(SID_OBJECT_SELECT, SfxCallMode::ASYNCHRON);
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+SdrObject* FuSelection::pickObject (const Point& rTestPoint)
+{
+    SdrPageView* pPageView;
+    sal_uInt16 nHitLog = sal_uInt16 (mpWindow->PixelToLogic(Size(HITPIX,0)).Width());
+    return mpView->PickObj(rTestPoint, nHitLog, pPageView, SdrSearchOptions::PICKMARKABLE);
+}
+
+void FuSelection::ForcePointer(const MouseEvent* pMEvt)
+{
+    if(bMovedToCenterPoint && !bBeginInsertPoint && pMEvt)
+    {
+        MouseEvent aMEvt(pMEvt->GetPosPixel(), pMEvt->GetClicks(),
+            pMEvt->GetMode(), pMEvt->GetButtons(), pMEvt->GetModifier() & ~KEY_SHIFT);
+        FuDraw::ForcePointer(&aMEvt);
+    }
+    else
+    {
+        FuDraw::ForcePointer(pMEvt);
+    }
+}
+
+} // end of namespace sd
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

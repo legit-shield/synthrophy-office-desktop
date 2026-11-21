@@ -1,0 +1,1733 @@
+/* Backstage View Styles */
+
+.backstage-view {
+	/* Backstage accent color: the document type color, or purple when no document is open. */
+	--doc-type-color: rgb(var(--doc-type));
+	--color-on-primary: #ffffff;
+	/* A page preview is 126x176, a landscape preview is 170x128. */
+	--template-preview-height: 176px;
+	--template-page-preview-width: 126px;
+	--template-preview-max-width: 170px;
+	--template-landscape-preview-height: 128px;
+	--template-card-width: calc(var(--template-preview-max-width) + 2 * var(--spacing-m));
+	--color-primary-text: #ffffff;
+	--color-accent-background: var(--color-background-lighter);
+
+	--icon-primary-color: rgb(58, 58, 56);
+	--icon-secondary-color: var(--doc-type-color);
+
+	user-select: none;
+
+	position: fixed;
+	top: 0;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	background-color: var(--color-backstage-background);
+	z-index: 1100;
+	display: flex;
+	flex-direction: column;
+	font-family: var(--cool-font);
+}
+
+body:not([data-doctype]) .backstage-view {
+	--doc-type: 92, 41, 131;
+}
+
+/* Fills for the classes in the embedded icons, which take theme colours here. In an icon
+ * loaded as an image, each shape's own fill attribute applies. */
+.backstage-view .icon-primary {
+	fill: var(--icon-primary-color);
+}
+.backstage-view .icon-secondary {
+	fill: var(--icon-secondary-color);
+}
+.backstage-view .icon-white {
+	fill: rgb(250, 250, 250);
+}
+.backstage-view .icon-gray {
+	fill: rgb(121, 119, 116);
+}
+.backstage-view .icon-light-purple {
+	fill: rgb(176, 142, 202);
+}
+
+[data-theme='dark'] .backstage-view {
+	--color-accent-background: var(--doc-type-color);
+	--icon-primary-color: rgb(138, 138, 138);
+}
+
+[data-theme='dark'] .backstage-view .icon-white {
+	fill: transparent;
+}
+
+[data-theme='dark'] .backstage-sidebar-item.active {
+	--icon-primary-color: white;
+}
+
+/* Sidebar's save icon: make it outline on dark mode */
+[data-theme='dark'] #backstage-save .icon-primary {
+	stroke-width: 0.4;
+	stroke: var(--icon-primary-color);
+}
+[data-theme='dark'] #backstage-save .icon-white {
+	fill: var(--color-backstage-background-dark);
+}
+[data-theme='dark'] #backstage-save .icon-gray {
+	fill: var(--color-backstage-background-dark);
+}
+
+.backstage-view.hidden {
+	display: none;
+}
+
+.backstage-header {
+	height: 48px;
+	background-color: var(--doc-type-color);
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 0 16px 0 20px;
+	box-shadow: 0 1px 2px var(--color-black-5);
+	color: var(--color-on-primary);
+}
+
+.backstage-header-title {
+	font-weight: 600;
+	font-size: var(--medium-font-size);
+	letter-spacing: -0.01em;
+	color: var(--color-on-primary);
+	display: inline-flex;
+	align-items: center;
+	gap: var(--spacing-s);
+}
+
+.backstage-header-title::before {
+	background-image: url('images/collabora-office-white.svg');
+}
+
+.backstage-header-close {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 36px;
+	height: 36px;
+	background: none;
+	border: none;
+	color: var(--color-on-primary);
+	cursor: pointer;
+	border-radius: 0;
+}
+
+.backstage-sidebar-icon,
+.backstage-sidebar-back-icon,
+.backstage-header-close-icon {
+	display: inline-block;
+	width: var(--btn-img-size);
+	height: var(--btn-img-size);
+}
+
+.backstage-header-title::before,
+.backstage-sidebar-back-icon::before,
+.backstage-header-close-icon::before {
+	content: '';
+	display: inline-block;
+	width: var(--btn-img-size);
+	height: var(--btn-img-size);
+	background-repeat: no-repeat;
+	background-position: center;
+	background-size: contain;
+}
+
+.backstage-header-close-icon::before {
+	background-image: url('images/dark/closedoc.svg');
+}
+
+.backstage-main-wrapper {
+	display: flex;
+	flex: 1;
+	overflow: hidden;
+}
+
+.backstage-sidebar {
+	width: 10rem;
+	background-color: var(--color-backstage-background-dark);
+	border-right: 1px solid var(--color-toolbar-border);
+	padding: 16px 0;
+	overflow-y: auto;
+	box-shadow: 1px 0 3px var(--color-black-5);
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+
+.backstage-sidebar-back {
+	display: inline-flex;
+	align-items: center;
+	justify-content: flex-start;
+	width: auto;
+	margin: 0 24px;
+	color: var(--doc-type-color);
+	cursor: pointer;
+	background: transparent;
+	padding-bottom: 1rem;
+}
+
+.backstage-sidebar-back:focus-visible {
+	outline: 2px solid var(--doc-type-color, #0b87e7);
+	outline-offset: 2px;
+	border-radius: var(--border-radius);
+}
+
+.backstage-sidebar-back-icon::before {
+	background-image: url('images/arrow-left.svg');
+}
+
+[data-theme='dark'] .backstage-sidebar-back-icon::before {
+	background-image: url('images/dark/arrow-left.svg');
+}
+
+.backstage-sidebar-tabs {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	gap: var(--spacing-s);
+	min-height: 0;
+	margin-bottom: 30px;
+}
+
+.backstage-sidebar-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 2px 16px;
+	cursor: pointer;
+	color: var(--color-main-text);
+	font-size: var(--medium-font-size);
+	transition: all var(--duration-normal) var(--ease-standard);
+	position: relative;
+	margin: 2px 8px;
+	border-radius: var(--border-radius);
+}
+
+.backstage-sidebar-item.active {
+	background-color: transparent;
+	color: var(--color-main-text);
+	--icon-primary-color: var(--doc-type-color);
+}
+
+.backstage-sidebar-item:hover {
+	background-color: var(--color-background-dark);
+}
+
+.backstage-sidebar-item:focus-visible {
+	background-color: var(--color-background-dark);
+	outline: 2px solid var(--doc-type-color, #0b87e7);
+	outline-offset: -2px;
+}
+
+.backstage-sidebar-item.disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+	pointer-events: none;
+}
+
+.backstage-sidebar-item.disabled:hover {
+	background-color: transparent;
+}
+
+.backstage-sidebar-item img {
+	display: none;
+}
+
+#backstage-sidebar-common-break.backstage-sidebar-item {
+	height: 2px;
+	background-color: var(--color-toolbar-border);
+	padding: 0;
+	cursor: default;
+	/* Starts under the icons of the entries. Ends level with the break at the foot of the
+	   sidebar. */
+	margin-inline-start: 24px;
+	margin-inline-end: 20px;
+	/* The gap in the tab list and the margin of an entry add 6px more, so the line has 14px of
+	   space above and below. */
+	margin-block: 8px;
+}
+
+#backstage-sidebar-horizontal-break.backstage-sidebar-item {
+	height: 2px;
+	background-color: var(--color-toolbar-border);
+	padding: 0;
+	margin-bottom: 8px;
+	margin-top: auto;
+	margin-inline-start: 20px;
+	margin-inline-end: 20px;
+}
+
+#backstage-quit.backstage-sidebar-item,
+#backstage-options.backstage-sidebar-item,
+#backstage-about.backstage-sidebar-item {
+	justify-content: center;
+	margin-top: 0 !important;
+	margin-bottom: 0 !important;
+	padding: 4px 16px;
+}
+
+/* Starter mode: vertical layout with big centered icons */
+.is-starter-mode .backstage-sidebar-item {
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	padding: 12px 8px;
+	gap: var(--spacing-m);
+}
+
+
+.is-starter-mode .backstage-sidebar-item span {
+	font-size: 16px;
+	text-align: center;
+}
+
+.is-starter-mode .backstage-sidebar-item.active {
+	box-shadow: none;
+}
+
+/* Starter mode: larger icons */
+.is-starter-mode .backstage-sidebar-icon {
+	width: 38px;
+	height: 38px;
+}
+
+.is-starter-mode .backstage-sidebar-icon svg {
+	width: 38px;
+	height: 38px;
+}
+
+.backstage-content {
+	flex: 1;
+	padding: 20px;
+	overflow-y: auto;
+	background-color: var(--color-backstage-background);
+}
+
+.backstage-content-title {
+	font-size: 20px;
+	font-weight: 400;
+	margin-bottom: 8px;
+	color: var(--color-text-dark);
+	letter-spacing: -0.02em;
+}
+
+.backstage-content-description {
+	font-size: var(--default-font-size);
+	color: var(--color-text-light);
+	margin-bottom: 24px;
+	line-height: 1.5;
+	margin-top: 0px;
+}
+
+/* Home view specific styles */
+.backstage-home-templates-row {
+	display: flex;
+	flex-wrap: nowrap;
+	align-items: stretch;
+	gap: calc(var(--spacing-xl) + var(--spacing-m));
+	margin-bottom: var(--spacing-m);
+	padding: 0 0 0.5rem;
+	justify-content: flex-start;
+	max-width: 100%;
+	overflow: hidden;
+}
+
+.backstage-home-templates-row .backstage-template-card {
+	flex: 0 0 auto;
+	box-sizing: border-box;
+}
+
+.backstage-home-more-templates {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing-xl);
+	margin-bottom: calc(var(--spacing-xl) + var(--spacing-m));
+}
+
+.backstage-home-divider {
+	flex: 1;
+	height: 1px;
+	background-color: var(--color-toolbar-border);
+}
+
+/* Shared secondary-action button, used by the home "More Templates" and the
+ * open "Add Cloud +" actions. Follows the canonical secondary button: 32px
+ * tall via 8px/12px spacing tokens, --border-radius corners, default font. */
+#backstage-view .backstage-home-more-button,
+#backstage-view .backstage-open-add-cloud-button,
+#backstage-view .backstage-manage-add-template-button,
+#backstage-view .backstage-manage-templates-button,
+#backstage-view .backstage-rename-template-button,
+#backstage-view .backstage-remove-template-button {
+	background: var(--color-accent-background);
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius);
+	padding: var(--spacing-m) var(--spacing-l);
+	font-size: var(--default-font-size);
+	font-weight: 600;
+	color: var(--color-main-text);
+	cursor: pointer;
+	transition: all var(--duration-normal) var(--ease-standard);
+	white-space: nowrap;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+}
+
+#backstage-view .backstage-home-more-button:hover,
+#backstage-view .backstage-home-more-button:focus-visible,
+#backstage-view .backstage-open-add-cloud-button:hover,
+#backstage-view .backstage-open-add-cloud-button:focus-visible,
+#backstage-view .backstage-manage-add-template-button:hover,
+#backstage-view .backstage-manage-add-template-button:focus-visible,
+#backstage-view .backstage-manage-templates-button:hover,
+#backstage-view .backstage-manage-templates-button:focus-visible,
+#backstage-view .backstage-rename-template-button:hover,
+#backstage-view .backstage-rename-template-button:focus-visible {
+	background-color: var(--color-background-dark);
+	border-color: var(--doc-type-color);
+	outline: none;
+}
+
+.backstage-templates-empty {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: var(--spacing-xl);
+	margin-top: 32px;
+	padding: 24px;
+	border: 1px dashed var(--color-border);
+	border-radius: var(--border-radius-large);
+	max-width: 420px;
+}
+
+/* Every card is one column of the same width, so the columns of all sections line up. The cards
+   of a row stretch to the height of the tallest card in that row. */
+.backstage-templates-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, var(--template-card-width));
+	gap: calc(var(--spacing-xl) + var(--spacing-m));
+}
+
+.backstage-template-card {
+	position: relative;
+	padding: var(--spacing-m);
+	border-radius: var(--border-radius);
+	cursor: pointer;
+	text-align: center;
+	transition: background-color var(--duration-normal) var(--ease-standard);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	box-sizing: border-box;
+	width: var(--template-card-width);
+}
+
+
+.backstage-template-card:hover {
+	background-color: var(--color-backstage-hover);
+}
+
+/* The star shows on hover and on keyboard focus, and stays on a favorite. It sits in the top
+   corner of the card at the end side, in the space that a preview of full height leaves free. */
+#backstage-view .backstage-template-favorite {
+	position: absolute;
+	top: var(--spacing-s);
+	inset-inline-end: var(--spacing-s);
+	width: var(--btn-img-size);
+	height: var(--btn-img-size);
+	min-width: 0;
+	margin: 0;
+	padding: 0;
+	border: none;
+	border-radius: var(--border-radius);
+	background: url('images/template-favorite-off.svg') no-repeat center / 20px;
+	cursor: pointer;
+	opacity: 0;
+}
+
+#backstage-view .backstage-template-favorite[aria-pressed='true'] {
+	background-image: url('images/template-favorite-on.svg');
+}
+
+[data-theme='dark'] #backstage-view .backstage-template-favorite {
+	background-image: url('images/dark/template-favorite-off.svg');
+}
+
+[data-theme='dark'] #backstage-view .backstage-template-favorite[aria-pressed='true'] {
+	background-image: url('images/dark/template-favorite-on.svg');
+}
+
+#backstage-view .backstage-template-card:hover .backstage-template-favorite,
+#backstage-view .backstage-template-card:focus-within .backstage-template-favorite,
+#backstage-view .backstage-template-card.is-favorite .backstage-template-favorite {
+	opacity: 1;
+}
+
+/* The star has no border or background of its own. The desktop button hover colours in
+   device-desktop.css are !important. */
+#backstage-view .backstage-template-favorite:hover {
+	background-color: transparent !important;
+	border: none;
+}
+
+#backstage-view .backstage-template-favorite:focus-visible {
+	outline: 2px solid var(--doc-type-color);
+}
+
+.backstage-snackbar {
+	position: absolute;
+	bottom: var(--spacing-xl);
+	inset-inline: 0;
+	display: flex;
+	align-items: center;
+	box-sizing: border-box;
+	width: fit-content;
+	max-width: calc(100% - 2 * var(--spacing-xl));
+	min-height: 48px;
+	margin-inline: auto;
+	padding: var(--spacing-m) var(--spacing-l);
+	border-radius: var(--border-radius);
+	background-color: #323232;
+	color: white;
+	font-size: var(--header-font-size);
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+	pointer-events: none;
+	animation: slide-up-in var(--duration-normal) var(--ease-out);
+}
+
+.backstage-snackbar.is-leaving {
+	animation: fade-out var(--duration-fast) var(--ease-in) forwards;
+}
+
+/* The preview area has the height of a page preview, and each preview sits in its middle, so the
+   names of a row line up. */
+.template-thumbnail {
+	height: var(--template-preview-height);
+	padding: 0;
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	background: transparent;
+	flex: 0 0 auto;
+}
+
+.template-thumbnail img {
+	box-sizing: border-box;
+	max-width: var(--template-preview-max-width);
+	max-height: var(--template-preview-height);
+	width: auto;
+	height: auto;
+	display: block;
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius-medium);
+}
+
+.template-thumbnail img.is-page,
+.template-thumbnail img.is-landscape {
+	object-fit: cover;
+	object-position: top;
+}
+
+.template-thumbnail img.is-page {
+	width: var(--template-page-preview-width);
+	height: var(--template-preview-height);
+}
+
+.template-thumbnail img.is-landscape {
+	width: var(--template-preview-max-width);
+	height: var(--template-landscape-preview-height);
+	object-position: left top;
+}
+
+[dir='rtl'] .template-thumbnail img.is-landscape {
+	object-position: right top;
+}
+
+/* The icon of the document type stands in for a missing preview, on a box of page size. */
+.template-thumbnail img.is-type-icon {
+	width: var(--template-page-preview-width);
+	height: var(--template-preview-height);
+	padding: 64px 39px;
+	object-fit: contain;
+	background-color: var(--color-background-lighter);
+}
+
+.template-name {
+	font-size: var(--default-font-size);
+	color: var(--color-main-text);
+	font-weight: 500;
+	margin-top: var(--spacing-m);
+	width: 0;
+	min-width: 100%;
+	/* A name shows at most two lines. */
+	max-height: 3em;
+	white-space: normal;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	text-wrap: balance;
+}
+
+.backstage-template-explorer {
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing-l);
+}
+
+.backstage-templates-heading,
+.backstage-template-section-title {
+	font-size: var(--header-font-size);
+	font-weight: 600;
+	color: var(--color-main-text);
+	margin: 0;
+}
+
+.backstage-templates-heading {
+	margin-top: var(--spacing-xl);
+}
+
+.backstage-template-sections {
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing-s);
+}
+
+.backstage-template-section-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--spacing-m);
+	min-height: 28px;
+	margin-top: var(--spacing-s);
+}
+
+.template-filter-bar {
+	display: flex;
+	gap: var(--spacing-m);
+	flex-wrap: wrap;
+}
+
+#backstage-view .template-type-button {
+	height: var(--btn-size);
+	margin: 0;
+	border: 1px solid var(--color-border);
+	background: transparent;
+	border-radius: var(--border-radius);
+	padding: 0 var(--spacing-l);
+	font-size: var(--default-font-size);
+	font-weight: 500;
+	color: var(--color-main-text);
+	cursor: pointer;
+}
+
+/* The desktop button hover colours in device-desktop.css are !important. */
+#backstage-view .template-type-button:hover {
+	background-color: var(--color-backstage-hover) !important;
+	color: var(--color-main-text) !important;
+	border-color: var(--color-border);
+}
+
+#backstage-view .template-type-button.active {
+	background-color: var(--doc-type-color) !important;
+	border-color: var(--doc-type-color);
+	color: var(--color-on-primary) !important;
+}
+
+/* The search field and the chips stay at the top while the templates scroll under them. The
+   offset is the padding of .backstage-content, so the bar sticks to the edge of the view. */
+.template-search-bar {
+	position: sticky;
+	top: -20px;
+	z-index: 1;
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing-l);
+	/* The top padding covers the edge of the view while the bar sticks. In the layout the
+	   negative margin cancels it, so the field stays close to the content above. */
+	margin-top: calc(-1 * var(--spacing-m));
+	padding-block: var(--spacing-m);
+	background-color: var(--color-backstage-background);
+}
+
+.template-search {
+	position: relative;
+	display: flex;
+}
+
+.template-search-icon {
+	position: absolute;
+	inset-inline-start: var(--spacing-l);
+	top: 50%;
+	width: var(--btn-img-size-s);
+	height: var(--btn-img-size-s);
+	transform: translateY(-50%);
+	pointer-events: none;
+	background: url('images/lc_recsearch.svg') no-repeat center / contain;
+}
+
+[data-theme='dark'] .template-search-icon {
+	background-image: url('images/dark/lc_recsearch.svg');
+}
+
+.template-search-input {
+	flex: 1;
+	height: 32px;
+	padding: 0 var(--spacing-l);
+	padding-inline-start: calc(var(--spacing-l) + var(--btn-img-size-s) + var(--spacing-m));
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius);
+	font-size: var(--default-font-size);
+	background: var(--color-background-lighter);
+	color: var(--color-main-text);
+}
+
+.template-search-input:focus {
+	outline: none;
+	border-color: var(--doc-type-color);
+	box-shadow: 0 0 0 1px var(--doc-type-color);
+}
+
+.template-blank-row {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, var(--template-card-width));
+	gap: calc(var(--spacing-xl) + var(--spacing-m));
+	overflow-x: auto;
+	padding-block: var(--spacing-m);
+}
+
+.template-grid-empty {
+	grid-column: 1 / -1;
+	text-align: center;
+	color: var(--color-text-light);
+	padding: 24px 0;
+	font-size: var(--medium-font-size);
+}
+
+/* My templates and Manage templates */
+#backstage-view .backstage-manage-templates-button {
+	margin: 0;
+}
+
+.backstage-add-template-card .template-name {
+	color: var(--doc-type-color);
+}
+
+[data-theme='dark'] .backstage-add-template-card {
+	--doc-type-color: var(--color-main-text);
+}
+
+.backstage-add-template-card .template-thumbnail {
+	box-sizing: border-box;
+	width: var(--template-page-preview-width);
+	height: var(--template-preview-height);
+	align-items: center;
+	border: none;
+}
+
+/* A dashed border draws short dashes, so four gradients draw the outline with 11px dashes. */
+.backstage-add-template-card .template-thumbnail,
+.backstage-template-drop-zone {
+	--add-template-dash-color: var(--color-border-dark);
+	--add-template-dash: var(--add-template-dash-color) 0 11px, transparent 11px 22px;
+	background-image: repeating-linear-gradient(90deg, var(--add-template-dash)),
+		repeating-linear-gradient(90deg, var(--add-template-dash)),
+		repeating-linear-gradient(180deg, var(--add-template-dash)),
+		repeating-linear-gradient(180deg, var(--add-template-dash));
+	background-position: top, bottom, left, right;
+	background-size: 100% 1px, 100% 1px, 1px 100%, 1px 100%;
+	background-repeat: no-repeat;
+}
+
+.backstage-add-template-card:hover .template-thumbnail,
+.backstage-add-template-card:focus-visible .template-thumbnail {
+	--add-template-dash-color: var(--doc-type-color);
+}
+
+.backstage-add-template-plus {
+	position: relative;
+	width: 14px;
+	height: 14px;
+}
+
+/* The plus has lines of 2px with round ends. The boxes have even sizes, so the lines start on
+   whole pixels. */
+.backstage-add-template-plus::before,
+.backstage-add-template-plus::after {
+	content: '';
+	position: absolute;
+	border-radius: 1px;
+	background-color: var(--doc-type-color);
+}
+
+.backstage-add-template-plus::before {
+	top: 0;
+	left: calc(50% - 1px);
+	width: 2px;
+	height: 100%;
+}
+
+.backstage-add-template-plus::after {
+	top: calc(50% - 1px);
+	left: 0;
+	width: 100%;
+	height: 2px;
+}
+
+.backstage-manage-templates-title {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing-m);
+	margin-top: var(--spacing-m);
+}
+
+.backstage-manage-templates .backstage-content-description {
+	margin-bottom: var(--spacing-xl);
+}
+
+.backstage-manage-templates-title .backstage-content-title {
+	margin: 0;
+}
+
+.backstage-manage-add-template-button .backstage-add-template-plus {
+	width: 10px;
+	height: 10px;
+}
+
+.backstage-manage-templates .template-search-bar {
+	margin-bottom: var(--spacing-s);
+}
+
+.backstage-manage-templates-empty {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	padding-top: 112px;
+	text-align: center;
+}
+
+.backstage-manage-templates-empty-title {
+	margin: 0 0 var(--spacing-m);
+	font-size: var(--header-font-size);
+	font-weight: 600;
+	color: var(--color-main-text);
+}
+
+#backstage-view .backstage-manage-templates-back {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: var(--btn-size);
+	height: var(--btn-size);
+	padding: 0;
+	border: 1px solid transparent;
+	border-radius: var(--border-radius);
+	background: transparent;
+	cursor: pointer;
+}
+
+#backstage-view .backstage-manage-templates-back:hover {
+	border-color: var(--color-btn-border);
+	background-color: var(--color-background-tabs-group);
+}
+
+#backstage-view .backstage-manage-add-template-button,
+#backstage-view .backstage-manage-templates-row-actions .button {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--spacing-s);
+	margin: 0;
+	line-height: normal;
+}
+
+#backstage-view .backstage-manage-add-template-button {
+	gap: calc(var(--spacing-m) + var(--spacing-xs));
+	margin-inline-start: auto;
+}
+
+#backstage-view .backstage-home-more-button,
+#backstage-view .backstage-manage-add-template-button,
+#backstage-view .backstage-manage-templates-button,
+#backstage-view .backstage-rename-template-button {
+	color: var(--doc-type-color);
+}
+
+[data-theme='dark'] #backstage-view .backstage-home-more-button,
+[data-theme='dark'] #backstage-view .backstage-manage-add-template-button,
+[data-theme='dark'] #backstage-view .backstage-manage-templates-button,
+[data-theme='dark'] #backstage-view .backstage-rename-template-button {
+	--doc-type-color: var(--color-main-text);
+}
+
+.backstage-template-action-icon {
+	width: var(--btn-img-size-s);
+	height: var(--btn-img-size-s);
+	background: no-repeat center / contain;
+}
+
+.backstage-rename-template-button .backstage-template-action-icon {
+	background-image: url('images/lc_edit.svg');
+}
+
+.backstage-remove-template-button .backstage-template-action-icon {
+	background-image: url('images/lc_trash.svg');
+}
+
+[data-theme='dark'] .backstage-rename-template-button .backstage-template-action-icon {
+	background-image: url('images/dark/lc_edit.svg');
+}
+
+[data-theme='dark'] .backstage-remove-template-button .backstage-template-action-icon {
+	background-image: url('images/dark/lc_trash.svg');
+}
+
+/* A text button: the icon toolbar button look, with a label. */
+#backstage-view .backstage-remove-template-button {
+	background-color: transparent;
+	border-color: transparent;
+}
+
+#backstage-view .backstage-remove-template-button:hover,
+#backstage-view .backstage-remove-template-button:focus-visible {
+	background-color: var(--color-background-tabs-group);
+	border-color: var(--color-btn-border);
+	outline: none;
+}
+
+.backstage-manage-templates-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: var(--default-font-size);
+	color: var(--color-main-text);
+}
+
+.backstage-manage-templates-table th:first-child {
+	width: 50%;
+}
+
+.backstage-manage-templates-table th:last-child {
+	width: 1%;
+}
+
+.backstage-manage-templates-table td {
+	height: var(--list-row-height);
+	padding: 0 16px;
+	border-bottom: 1px solid var(--color-border);
+}
+
+.backstage-manage-templates-row:hover td {
+	background-color: var(--color-backstage-hover);
+}
+
+.backstage-manage-templates-row-actions {
+	text-align: end;
+	white-space: nowrap;
+}
+
+.backstage-manage-templates-name-wrapper {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing-l);
+}
+
+.backstage-manage-templates-name-wrapper .backstage-recent-document-icon {
+	width: 24px;
+	height: 24px;
+}
+
+#backstage-view .backstage-manage-templates-row-actions .button + .button {
+	margin-inline-start: var(--spacing-m);
+}
+
+.backstage-template-type-tag {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: var(--border-radius);
+	background-color: var(--color-backstage-hover);
+	color: var(--color-text-dark);
+	font-size: var(--default-font-size);
+}
+
+.backstage-manage-templates-row:hover .backstage-template-type-tag {
+	background-color: var(--color-background-lighter);
+}
+
+/* The dialog takes the widest size of .backstage-modal, 480px less its padding. */
+.backstage-template-file-area {
+	width: 432px;
+	max-width: 100%;
+}
+
+.backstage-template-drop-zone {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: var(--spacing-m);
+	min-height: 110px;
+	background-color: var(--color-main-background);
+	color: var(--color-text-dark);
+	font-size: var(--default-font-size);
+}
+
+#backstage-view .backstage-template-drop-zone .button {
+	margin: 0;
+	background-color: var(--color-background-lighter);
+	color: var(--doc-type-color);
+	font-weight: 600;
+}
+
+#backstage-view .backstage-template-drop-zone .button:hover,
+#backstage-view .backstage-template-drop-zone .button:focus-visible {
+	background-color: var(--color-background-dark);
+	border-color: var(--doc-type-color);
+}
+
+[data-theme='dark'] #backstage-view .backstage-template-drop-zone .button {
+	--doc-type-color: var(--color-main-text);
+}
+
+.backstage-template-file {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing-l);
+	padding: var(--spacing-m) var(--spacing-l);
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius);
+	background-color: var(--color-main-background);
+}
+
+.backstage-template-file-page {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	width: 34px;
+	height: 46px;
+	border: 1px solid var(--color-border);
+	background-color: var(--color-background-lighter);
+}
+
+.backstage-template-file-info {
+	flex: 1;
+	min-width: 0;
+}
+
+.backstage-template-file-name {
+	font-size: var(--default-font-size);
+	font-weight: 600;
+	color: var(--color-main-text);
+	overflow-wrap: anywhere;
+}
+
+.backstage-template-file-details {
+	color: var(--color-text-light);
+	font-size: var(--default-font-size);
+}
+
+.backstage-modal-error {
+	margin: 0;
+	color: var(--color-error);
+	font-size: var(--default-font-size);
+}
+
+.backstage-modal-error:empty {
+	display: none;
+}
+
+
+.backstage-formats-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+	gap: var(--spacing-l);
+	margin-top: 20px;
+}
+
+.backstage-format-card {
+	background: var(--color-background-lighter);
+	border: 1px solid var(--color-border);
+	padding: 16px 20px;
+	cursor: pointer;
+	border-radius: var(--border-radius-large);
+	text-align: center;
+	transition: all var(--duration-normal) var(--ease-standard);
+	box-shadow: 0 1px 3px var(--color-black-5);
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	gap: var(--spacing-m);
+}
+
+.backstage-format-card:hover {
+	background-color: var(--color-background-dark);
+	border-color: var(--doc-type-color);
+	box-shadow: 0 2px 6px var(--color-black-10);
+	transform: translateY(-1px);
+}
+
+.format-icon {
+	font-size: var(--medium-font-size);
+	font-weight: 600;
+	color: var(--doc-type-color);
+	min-height: 24px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.format-description {
+	font-size: calc(var(--default-font-size) - 1px);
+	color: var(--color-text-light);
+	margin-top: 4px;
+}
+
+.backstage-action-button {
+	background: var(--doc-type-color);
+	color: var(--color-primary-text);
+	border: none;
+	padding: 12px 32px;
+	font-size: var(--medium-font-size);
+	cursor: pointer;
+	margin-top: 12px;
+	border-radius: var(--border-radius);
+	font-weight: 600;
+	box-shadow: 0 2px 4px var(--color-black-10);
+	transition: all var(--duration-normal) var(--ease-standard);
+}
+
+.backstage-action-button:hover {
+	background-color: var(--doc-type-color);
+	box-shadow: 0 3px 6px var(--color-black-15);
+	transform: translateY(-1px);
+	opacity: 0.9;
+}
+
+.backstage-action-button:active {
+	transform: translateY(0);
+	box-shadow: 0 1px 2px var(--color-black-10);
+}
+
+.backstage-info-properties {
+	max-width: 32rem;
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius-large);
+	padding: 1.5rem;
+}
+
+.backstage-section-header {
+	margin-bottom: 1rem;
+	color: var(--color-text-dark);
+}
+
+.backstage-properties-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+	margin-bottom: 1rem;
+}
+
+.backstage-property-item {
+	display: flex;
+	padding: 0.25rem 0;
+}
+
+.property-label {
+	font-size: var(--medium-font-size);
+	color: var(--color-text-light);
+	min-width: 6rem;
+}
+
+.property-value {
+	font-size: var(--medium-font-size);
+	color: var(--color-main-text);
+	word-break: break-word;
+	flex: 1;
+}
+
+.backstage-recent-documents-table {
+	width: 100%;
+	border-collapse: collapse;
+	margin-top: 16px;
+}
+
+.backstage-recent-documents-header {
+	border-bottom: 2px solid var(--color-border);
+}
+
+.backstage-recent-documents-header-row {
+	height: 40px;
+}
+
+.backstage-recent-documents-header-cell {
+	font-size: var(--medium-font-size);
+	color: var(--color-main-text);
+	font-weight: 500;
+	text-align: left;
+	padding: 8px 16px;
+}
+
+.backstage-recent-documents-header-cell:first-child {
+	padding-left: 16px;
+	width: 60%;
+}
+
+.backstage-recent-documents-header-cell:last-child {
+	width: 40%;
+	padding-left: 32px;
+}
+
+.backstage-recent-document-row {
+	cursor: pointer;
+	transition: background-color var(--duration-normal) var(--ease-standard);
+}
+
+.backstage-recent-document-row:hover {
+	background-color: var(--color-backstage-hover);
+}
+
+.backstage-recent-document-name-cell,
+.backstage-recent-document-time-cell {
+	padding: 12px 16px;
+	vertical-align: top;
+}
+
+.backstage-recent-document-name-cell {
+	padding-left: 16px;
+}
+
+.backstage-recent-document-time-cell {
+	padding-left: 32px;
+	color: var(--color-text-light);
+	font-size: var(--default-font-size);
+	font-weight: 400;
+}
+
+.backstage-recent-document-content-wrapper {
+	display: flex;
+	align-items: flex-start;
+	gap: 10px;
+}
+
+.backstage-recent-document-text-wrapper {
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing-s);
+	flex: 1;
+	min-width: 0;
+}
+
+.backstage-recent-document-name-text {
+	font-size: var(--medium-font-size);
+	color: var(--color-text-dark);
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.backstage-recent-document-path-text {
+	font-size: calc(var(--default-font-size) - 1px);
+	color: var(--color-text-light);
+	font-weight: 400;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.backstage-recent-document-icon {
+	display: inline-block;
+	width: 20px;
+	height: 20px;
+	background-size: contain;
+	background-repeat: no-repeat;
+	background-position: center;
+	flex-shrink: 0;
+}
+
+.backstage-doc-icon-writer {
+	background-image: url('images/x-office-document.svg');
+}
+
+.backstage-doc-icon-calc {
+	background-image: url('images/x-office-spreadsheet.svg');
+}
+
+.backstage-doc-icon-impress {
+	background-image: url('images/x-office-presentation.svg');
+}
+
+.backstage-doc-icon-draw {
+	background-image: url('images/x-office-drawing.svg');
+}
+
+.backstage-doc-icon-pdf {
+	background-image: url('images/application-pdf.svg');
+}
+
+/* Hint shown while a file is dragged from the operating system over the
+ * window. It covers the whole window and only appears while a drag is in
+ * progress. Pointer events stay off so it never blocks the content beneath. */
+.coda-drop-overlay {
+	position: fixed;
+	inset: 0;
+	z-index: 1200;
+	display: none;
+	align-items: center;
+	justify-content: center;
+	background-color: var(--color-overlay);
+	pointer-events: none;
+}
+
+.coda-drop-overlay.is-visible {
+	display: flex;
+}
+
+.coda-drop-overlay-card {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: var(--spacing-xl);
+	padding: calc(var(--spacing-xl) * 2.5) calc(var(--spacing-xl) * 3.5);
+	border-radius: var(--border-radius-large);
+	background-color: var(--color-background-lighter);
+	color: var(--color-main-text);
+	border: 2px dashed var(--color-border);
+	box-shadow: var(--shadow-subtle);
+}
+
+.coda-drop-overlay-icon {
+	width: 64px;
+	height: 64px;
+	background: url('images/lc_file.svg') no-repeat center / contain;
+}
+
+/* In dark mode the dashed outline uses the mid-grey border token and the
+ * icon uses its light-stroke variant, so both stay visible on the dark
+ * card. */
+[data-theme='dark'] .coda-drop-overlay-card {
+	border-color: var(--color-border-dark-63);
+}
+
+[data-theme='dark'] .coda-drop-overlay-icon {
+	background-image: url('images/dark/lc_file.svg');
+}
+
+.coda-drop-overlay-text {
+	font-family: var(--cool-font);
+	font-size: var(--header-font-size);
+	font-weight: 600;
+}
+
+/* Open view: single row of large tiles */
+.backstage-open-tiles-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+	margin-top: 16px;
+}
+
+.backstage-open-tiles-separator {
+	flex: 0 0 auto;
+	align-self: stretch;
+	width: 1px;
+	background: var(--color-border, #d0d0d0);
+}
+
+.backstage-open-tile {
+	width: 150px;
+	height: 150px;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 12px;
+	padding: 12px;
+	box-sizing: border-box;
+	cursor: pointer;
+	user-select: none;
+	--icon-primary-color: var(--color-main-text);
+}
+
+.backstage-open-tile:hover,
+.backstage-open-tile:focus-visible {
+	background: var(--color-background-hover, #f0f0f0);
+	border: 1px solid var(--color-border, #d0d0d0);
+	border-radius: 6px;
+	outline: none;
+}
+
+.backstage-open-tile-icon {
+	width: 64px;
+	height: 64px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.backstage-open-tile-icon svg {
+	width: 100%;
+	height: 100%;
+}
+
+/* Cloud service logos. These are fixed-colour artwork drawn as a background
+ * image, so a branding can point them at its own logo. The bare class draws the
+ * generic cloud; each service adds its own image on top of it. */
+.backstage-cloud-icon {
+	background-image: url('images/cloud-providers/generic.svg');
+	background-repeat: no-repeat;
+	background-position: center;
+	background-size: contain;
+}
+
+.backstage-cloud-icon-nextcloud {
+	background-image: url('images/cloud-providers/nextcloud.svg');
+}
+
+.backstage-cloud-icon-opencloud {
+	background-image: url('images/cloud-providers/opencloud.svg');
+}
+
+.backstage-cloud-icon-seafile {
+	background-image: url('images/cloud-providers/seafile.svg');
+}
+
+.backstage-open-tile-label {
+	font-size: 14px;
+	font-weight: 500;
+	text-align: center;
+	line-height: 1.2;
+	color: var(--color-main-text);
+}
+
+.backstage-open-tile.is-cloud-provider {
+	position: relative;
+}
+
+.backstage-open-tile.is-cloud-provider .backstage-open-tile-label {
+	font-weight: 700;
+}
+
+#backstage-view .backstage-open-tile-edit {
+	position: absolute;
+	top: 6px;
+	right: 6px;
+	width: 32px;
+	height: 32px;
+	padding: 0;
+	border: 1px solid transparent;
+	border-radius: 4px;
+	background: transparent;
+	cursor: pointer;
+	opacity: 0;
+	transition: opacity var(--duration-fast) var(--ease-standard),
+		border-color var(--duration-fast) var(--ease-standard);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+#backstage-view .backstage-open-tile.is-cloud-provider:hover .backstage-open-tile-edit,
+#backstage-view .backstage-open-tile.is-cloud-provider:focus-within .backstage-open-tile-edit,
+#backstage-view .backstage-open-tile-edit:focus-visible {
+	opacity: 1;
+}
+
+#backstage-view .backstage-open-tile-edit:hover,
+#backstage-view .backstage-open-tile-edit:focus-visible {
+	border-color: var(--color-border);
+}
+
+#backstage-view .backstage-open-tile-edit svg {
+	width: 20px;
+	height: 20px;
+}
+
+.backstage-open-tile-sublabel {
+	font-size: 12px;
+	color: var(--color-text-lighter);
+	text-align: center;
+	line-height: 1.2;
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.backstage-open-actions-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin-top: 24px;
+}
+
+.backstage-open-actions-divider {
+	flex: 1;
+	height: 1px;
+	background: var(--color-border, #d0d0d0);
+}
+
+/* Add-cloud modal */
+.backstage-modal-overlay {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.4);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	z-index: 1200;
+}
+
+.backstage-modal {
+	background: var(--color-background-lighter, #fff);
+	border-radius: 8px;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+	padding: 24px;
+	min-width: 360px;
+	max-width: 480px;
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+
+.backstage-modal-title {
+	margin: 0;
+	font-size: 18px;
+	font-weight: 600;
+	color: var(--color-text-dark);
+}
+
+.backstage-modal-subtitle {
+	margin: 0;
+	font-size: 14px;
+	color: var(--color-text-lighter);
+	line-height: 1.4;
+}
+
+.backstage-modal-preview {
+	display: flex;
+	justify-content: center;
+	padding: 4px 0;
+}
+
+.backstage-open-tile.is-preview {
+	cursor: default;
+	pointer-events: none;
+}
+
+.backstage-modal-provider-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 12px 14px;
+	background-color: var(--color-background-dark);
+	border: 1px solid var(--color-border);
+	border-radius: 6px;
+}
+
+.backstage-modal-provider-row-icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 48px;
+	height: 48px;
+	flex-shrink: 0;
+}
+
+.backstage-modal-provider-row-icon svg {
+	width: 100%;
+	height: 100%;
+}
+
+.backstage-modal-provider-row-text {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.backstage-modal-provider-row-type {
+	font-weight: 700;
+}
+
+.backstage-modal-provider-row-name {
+	color: var(--color-text-lighter);
+	font-size: 13px;
+}
+
+.backstage-modal-form {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+.backstage-modal-field {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.backstage-modal-field-label {
+	font-size: 13px;
+	font-weight: 500;
+	color: var(--color-text-dark);
+}
+
+.backstage-modal-field-hint {
+	font-size: 12px;
+	color: var(--color-text-lighter);
+	margin-top: 4px;
+}
+
+.backstage-modal-danger-section {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 12px 14px;
+	background: rgba(233, 50, 45, 0.08);
+	border: 1px solid rgba(233, 50, 45, 0.3);
+	border-radius: 6px;
+}
+
+.backstage-modal-danger-text {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.backstage-modal-danger-heading {
+	margin: 0;
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--color-error, #e9322d);
+}
+
+.backstage-modal-danger-subtitle {
+	font-size: 12px;
+	color: var(--color-text-lighter);
+}
+
+.backstage-modal-dropdown {
+	position: relative;
+	display: block;
+	align-self: stretch;
+	width: 100%;
+	box-sizing: border-box;
+}
+
+#backstage-view .backstage-modal-dropdown-toggle {
+	appearance: none;
+	margin: 0;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	box-sizing: border-box;
+	padding: 6px 8px;
+	font: inherit;
+	font-size: 14px;
+	border: 1px solid var(--color-border, #d0d0d0);
+	border-radius: 4px;
+	background: var(--color-background-lighter, #fff);
+	color: var(--color-main-text);
+	cursor: pointer;
+	text-align: left;
+}
+
+#backstage-view .backstage-modal-dropdown-toggle:focus {
+	outline: none;
+	border-color: var(--doc-type-color);
+}
+
+.backstage-modal-dropdown-icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	flex-shrink: 0;
+}
+
+.backstage-modal-dropdown-icon svg {
+	width: 100%;
+	height: 100%;
+}
+
+.backstage-modal-dropdown-label {
+	flex: 1;
+}
+
+.backstage-modal-dropdown-arrow {
+	color: var(--color-text-lighter);
+	font-size: 12px;
+}
+
+.backstage-modal-dropdown-list {
+	display: none;
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: calc(100% + 2px);
+	margin: 0;
+	padding: 4px 0;
+	list-style: none;
+	background: var(--color-background-lighter, #fff);
+	border: 1px solid var(--color-border, #d0d0d0);
+	border-radius: 4px;
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+	z-index: 10;
+}
+
+.backstage-modal-dropdown.is-open .backstage-modal-dropdown-list {
+	display: block;
+}
+
+.backstage-modal-dropdown-option {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	font-size: 14px;
+	color: var(--color-main-text);
+	cursor: pointer;
+	user-select: none;
+}
+
+.backstage-modal-dropdown-option:hover,
+.backstage-modal-dropdown-option:focus-visible {
+	background: var(--color-background-dark);
+	outline: none;
+}
+
+.backstage-modal-dropdown-option[aria-selected='true'] {
+	font-weight: 600;
+}
+
+.backstage-modal-input {
+	padding: 6px 8px;
+	font-size: 14px;
+	border: 1px solid var(--color-border, #d0d0d0);
+	border-radius: 4px;
+	background: var(--color-background-lighter, #fff);
+	color: var(--color-main-text);
+}
+
+.backstage-modal-input:focus {
+	outline: none;
+	border-color: var(--doc-type-color);
+}
+
+.backstage-modal-actions {
+	display: flex;
+	justify-content: flex-end;
+	margin-top: 4px;
+}

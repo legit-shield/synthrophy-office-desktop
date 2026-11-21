@@ -1,0 +1,2250 @@
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * AI Chat Sidebar - polished styling for JSDialog widgets in #sidebar-panel
+ */
+
+/* -- Animations -- */
+
+@keyframes aichat-slide-up {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes aichat-twist {
+	0%,
+	100% {
+		transform: rotate(0) scale(1);
+	}
+	50% {
+		transform: rotate(90deg) scale(0.82);
+	}
+}
+
+@keyframes aichat-shimmer {
+	from {
+		background-position: 100% 0;
+	}
+	to {
+		background-position: 0 0;
+	}
+}
+
+/* The ring gradient repeats every half of its width, so one shift of 100% loops without a
+   jump. */
+@keyframes aichat-ring {
+	from {
+		background-position: 0 0;
+	}
+	to {
+		background-position: 100% 0;
+	}
+}
+
+/* -- AI sidebar container -- */
+
+#aichat-panel {
+	height: 100%;
+}
+
+/* -- Main container -- */
+
+/* The panel scrolls as a whole. Normally everything fits and the transcript
+   is the only scroller, but at high browser zoom the header, tone picker and
+   input alone can be taller than the dock - then this scroller is what makes
+   the clipped parts reachable. */
+#aichat-main {
+	--aichat-accent: var(--doc-type, 11, 135, 231);
+	/* Secondary text, mixed from the text and background colours, so it is muted in both
+	   themes. */
+	--aichat-text-muted: color-mix(
+		in srgb,
+		var(--color-main-text) 70%,
+		var(--color-main-background)
+	);
+	/* Red text, darkened in the light theme and lightened in the dark one, so it reads on
+	   either background. */
+	--aichat-error-text: color-mix(
+		in srgb,
+		var(--color-error) 82%,
+		var(--color-main-text)
+	);
+	/* A neutral tint for code, quotes and table headers that shows on both themes. */
+	--aichat-tint: color-mix(in srgb, var(--color-main-text) 7%, transparent);
+	--aichat-hairline: color-mix(in srgb, var(--color-main-text) 13%, transparent);
+	--aichat-font-mono: ui-monospace, 'SFMono-Regular', 'Cascadia Mono',
+		'Liberation Mono', Menlo, monospace;
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	height: 100%;
+	overflow-x: hidden;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: var(--scrollbar-width);
+	scrollbar-color: var(--scrollbar-color);
+	background: var(--color-main-background);
+}
+
+/* -- Header -- */
+
+#aichat-header {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	align-items: center;
+	padding: 0 8px 0 12px;
+	min-height: 44px;
+	border-bottom: 1px solid var(--aichat-hairline);
+	gap: var(--spacing-m);
+	flex-shrink: 0;
+	background: var(--color-main-background);
+	z-index: 1;
+	/* Keep New conversation / Close reachable while the panel is scrolled. */
+	position: sticky;
+	top: 0;
+}
+
+#aichat-title {
+	flex: 1;
+	font-weight: 600;
+	font-size: 13.5px;
+	letter-spacing: -0.01em;
+	color: var(--color-main-text);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+#aichat-header-icon {
+	width: 18px;
+	height: 18px;
+	margin: 0;
+	padding: 0;
+	flex-shrink: 0;
+}
+
+/* Header buttons - icon style */
+#aichat-header .ui-pushbutton-wrapper {
+	margin: 0;
+}
+
+#aichat-header button.ui-pushbutton {
+	padding: var(--spacing-s);
+	width: 28px;
+	height: 28px;
+	border: 1px solid transparent;
+	border-radius: var(--border-radius);
+	background: transparent;
+	cursor: pointer;
+	transition: all var(--duration-fast) var(--ease-standard);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+#aichat-header button.ui-pushbutton:hover:not([disabled]) {
+	background: var(--aichat-tint);
+}
+
+/* The generic disabled button style in btns.css fills and borders the button with
+   !important. A disabled header button keeps the flat look of the enabled ones. */
+#aichat-header button.ui-pushbutton[disabled] {
+	background-color: transparent !important;
+	border-color: transparent !important;
+}
+
+#aichat-header button.ui-pushbutton img {
+	width: 16px;
+	height: 16px;
+	opacity: 0.7;
+}
+
+#aichat-header button.ui-pushbutton:hover img {
+	opacity: 1;
+}
+
+/* -- Messages area -- */
+
+#aichat-messages-area {
+	flex: 1;
+	/* Being a scroll container, its automatic minimum size is zero, so in a
+	   cramped panel it would shrink away to nothing instead of letting
+	   #aichat-main scroll. Floor it so the transcript stays usable and the
+	   surplus becomes panel scroll. */
+	min-height: 140px;
+	overflow-y: auto;
+	padding: var(--spacing-xl) 14px 10px;
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: var(--spacing-xl);
+	scrollbar-width: var(--scrollbar-width);
+	scrollbar-color: var(--scrollbar-color);
+	user-select: text;
+	mask-image: linear-gradient(
+		to bottom,
+		transparent 0,
+		black 12px,
+		black calc(100% - 12px),
+		transparent 100%
+	);
+}
+
+/* An open picker is what the user asked to see, so the transcript gives up its floor and the
+   picker takes the room it needs. The panel scrolls only when the picker alone is taller than
+   the dock. */
+#aichat-main:has(.aichat-tone-picker-open, .aichat-prompt-picker-open) #aichat-messages-area {
+	min-height: 0;
+}
+
+#aichat-messages-list {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: var(--spacing-xl);
+}
+
+/* Push a short transcript to the bottom so the newest message stays next to
+   the reply input. In a flex column an auto top margin absorbs the spare
+   room, and collapses once the content overflows, leaving scrolling intact. */
+#aichat-messages-list:not(:has(#aichat-empty-state)) {
+	margin-top: auto;
+}
+
+#aichat-messages-list:has(#aichat-empty-state) {
+	flex: 1;
+	gap: var(--spacing-l);
+}
+
+/* -- Empty state --
+   The greeting, the question and the suggestions all sit at the bottom, next to the input box:
+   the auto top margin of the title takes up the room above them. */
+
+#aichat-empty-title {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: 6px;
+	margin: auto 0 0;
+	padding: 0 4px;
+}
+
+#aichat-empty-state-greeting {
+	color: var(--color-main-text);
+	text-align: start;
+	text-wrap: balance;
+	padding: 0;
+	margin: 0;
+	font-size: 24px;
+	font-weight: 600;
+	letter-spacing: -0.02em;
+	line-height: 1.2;
+}
+
+/* The name takes the colour of the app: Writer, Calc, Impress or Draw. */
+#aichat-empty-state-greeting .aichat-greeting-name {
+	color: rgb(var(--aichat-accent));
+}
+
+#aichat-empty-state {
+	color: var(--aichat-text-muted);
+	text-align: start;
+	text-wrap: balance;
+	padding: 0;
+	margin: 0;
+	font-size: 15px;
+	line-height: 1.35;
+}
+
+#aichat-eu-wrapper {
+	display: flex;
+	flex-direction: row;
+	align-items: flex-start;
+	gap: 7px;
+	padding: 7px 4px 2px;
+	cursor: help;
+}
+
+/* ai.ethical_rating_message=false: no tooltip to reveal, so no help cursor. */
+#aichat-eu-wrapper.aichat-eu-no-rating-message {
+	cursor: default;
+}
+
+#aichat-eu-notice {
+	color: var(--aichat-text-muted);
+	text-align: start;
+	font-size: 11px;
+	line-height: 1.4;
+	letter-spacing: 0.01em;
+	flex: 1;
+	margin: 0;
+	padding: 0;
+}
+
+/* -- Ethical AI rating badge -- */
+
+#aichat-rating-badge {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	width: 10px;
+	height: 10px;
+	min-width: 10px;
+	margin-top: 3px;
+	border-radius: 50%;
+	font-size: 10px;
+	font-weight: 700;
+	color: transparent;
+	background: #888;
+	flex-shrink: 0;
+	line-height: 1;
+}
+
+#aichat-rating-badge[data-rating='A'] {
+	background: #2a7a2a;
+}
+#aichat-rating-badge[data-rating='B'] {
+	background: #b56a00;
+}
+#aichat-rating-badge[data-rating='C'] {
+	background: #a33;
+}
+#aichat-rating-badge[data-rating='U'] {
+	background: #888;
+}
+
+/* -- Hint (transient inline warning) -- */
+
+#aichat-hint {
+	padding: 8px 14px;
+	font-size: 12px;
+	line-height: 1.5;
+	color: var(--color-warning);
+	background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+	border-top: 1px solid
+		color-mix(in srgb, var(--color-warning) 25%, transparent);
+	flex-shrink: 0;
+}
+
+/* -- Message bubbles (shared) -- */
+
+[id^='aichat-msg-'] {
+	max-width: 88%;
+	word-wrap: break-word;
+	overflow-wrap: break-word;
+	line-height: 1.55;
+	animation: aichat-slide-up var(--duration-normal) var(--ease-out);
+	position: relative;
+}
+
+[id^='aichat-msg-'] > [id^='aichat-msg-text-'] {
+	white-space: pre-wrap;
+	font-size: 13px;
+}
+
+/* -- User messages -- */
+
+[id^='aichat-msg-'].aichat-msg-user {
+	align-self: flex-end;
+	max-width: 85%;
+	background: rgba(var(--aichat-accent), 0.13);
+	color: var(--color-main-text);
+	padding: var(--spacing-m) var(--spacing-l);
+	border-radius: var(--border-radius-large) var(--border-radius-large)
+		var(--border-radius) var(--border-radius-large);
+}
+
+[id^='aichat-msg-'].aichat-msg-user [id^='aichat-msg-text-'] {
+	color: var(--color-main-text);
+}
+
+/* Context badge inside user bubble */
+[id^='aichat-msg-'].aichat-msg-user [id^='aichat-context-'] {
+	background: color-mix(
+		in srgb,
+		var(--color-background-lighter) 60%,
+		transparent
+	);
+	color: var(--aichat-text-muted);
+	border-left: 2px solid rgba(var(--aichat-accent), 0.45);
+	border-radius: var(--border-radius);
+	font-size: 11.5px;
+	font-style: normal;
+	padding: 5px var(--spacing-m);
+	margin: 2px -4px 6px;
+}
+
+/* -- Assistant messages -- */
+
+/* A reply reads as plain text on the panel, beside a small sparkle, like part of the
+   document. Error and approval messages put a box back round it below. */
+[id^='aichat-msg-'].aichat-msg-assistant {
+	align-self: stretch;
+	max-width: none;
+	padding-left: 26px;
+	line-height: 1.6;
+}
+
+[id^='aichat-msg-'].aichat-msg-assistant::before {
+	content: '';
+	position: absolute;
+	left: 0;
+	top: 2px;
+	width: 16px;
+	height: 16px;
+	background: url('images/lc_aichat_sparkle.svg') center / contain no-repeat;
+}
+
+[data-theme='dark'] [id^='aichat-msg-'].aichat-msg-assistant::before {
+	background-image: url('images/dark/lc_aichat_sparkle.svg');
+}
+
+/* -- Context badge (selected text preview) -- */
+
+[id^='aichat-context-'] {
+	font-size: 11px;
+	color: var(--aichat-text-muted);
+	background-color: var(--aichat-tint);
+	padding: 5px 10px;
+	border-left: 3px solid rgba(var(--aichat-accent), 0.5);
+	border-radius: 0 var(--border-radius-s) var(--border-radius-s) 0;
+	margin-bottom: 6px;
+	max-height: 120px;
+	overflow-y: auto;
+	display: block;
+	font-style: italic;
+	line-height: 1.4;
+	white-space: normal;
+}
+
+[id^='aichat-context-'] p {
+	margin: 0;
+	display: inline;
+}
+
+[id^='aichat-context-'] h3,
+[id^='aichat-context-'] h4,
+[id^='aichat-context-'] h5 {
+	font-size: 11px;
+	font-weight: 600;
+	margin: 0;
+	display: inline;
+}
+
+/* -- Loading indicator (three bouncing dots) -- */
+
+/* -- Loading indicator (a twisting sparkle beside the progress text) -- */
+
+#aichat-loading-dots {
+	display: flex;
+	align-items: center;
+	gap: 3px;
+	position: relative;
+	min-height: 22px;
+	max-width: 100%;
+	box-sizing: border-box;
+	padding-left: 26px;
+	align-self: flex-start;
+	animation: aichat-slide-up var(--duration-normal) var(--ease-out);
+}
+
+#aichat-loading-dots::before {
+	content: '';
+	position: absolute;
+	left: 0;
+	top: 3px;
+	width: 16px;
+	height: 16px;
+	background: url('images/lc_aichat_sparkle.svg') center / contain no-repeat;
+	animation: aichat-twist 1.8s ease-in-out infinite;
+}
+
+[data-theme='dark'] #aichat-loading-dots::before {
+	background-image: url('images/dark/lc_aichat_sparkle.svg');
+}
+
+#aichat-progress-text {
+	font-size: 12.5px !important;
+	color: var(--aichat-text-muted) !important;
+	line-height: normal !important;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* A band of light sweeps through the progress text while the request runs. */
+@supports (background-clip: text) {
+	#aichat-progress-text {
+		color: transparent !important;
+		background: linear-gradient(
+			90deg,
+			var(--aichat-text-muted) 0%,
+			var(--aichat-text-muted) 38%,
+			var(--color-main-text) 50%,
+			var(--aichat-text-muted) 62%,
+			var(--aichat-text-muted) 100%
+		)
+			0 0 / 250% 100%;
+		background-clip: text;
+		animation: aichat-shimmer 2.2s linear infinite;
+	}
+}
+
+/* -- Action buttons -- */
+
+[id^='aichat-actions-'] {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	justify-content: flex-start;
+	gap: var(--spacing-xs);
+	margin-top: 6px;
+	margin-left: -7px;
+	flex-wrap: wrap;
+	transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+[id^='aichat-actions-'] .ui-pushbutton-wrapper {
+	margin: 0;
+}
+
+/* Scoped under the messages list id so these rules outrank the generic button rule in
+   btns.css, which otherwise fills, borders and spaces out the buttons. */
+#aichat-messages-list [id^='aichat-actions-'] button.ui-pushbutton {
+	margin: 0;
+	padding: 0 7px;
+	width: auto;
+	min-width: 26px;
+	height: 26px;
+	border-radius: var(--border-radius-pill);
+	border: none;
+	background: transparent;
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		color var(--duration-fast) var(--ease-standard);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 5px;
+	font-size: 11.5px;
+	font-family: var(--cool-font);
+	color: var(--aichat-text-muted);
+}
+
+#aichat-messages-list [id^='aichat-actions-'] button.ui-pushbutton img {
+	width: 14px;
+	height: 14px;
+	opacity: 0.75;
+}
+
+#aichat-messages-list [id^='aichat-actions-'] button.ui-pushbutton:hover {
+	background: var(--aichat-tint);
+	color: var(--color-main-text);
+}
+
+#aichat-messages-list
+[id^='aichat-actions-']
+button.ui-pushbutton:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 1px;
+}
+
+/* With a mouse, a reply that a later reply follows shows its actions on hover or keyboard
+   focus. The newest reply, and every reply on a touch screen, keeps them in view. */
+@media (hover: hover) {
+	.aichat-msg-assistant:has(~ .aichat-msg-assistant) [id^='aichat-actions-'] {
+		opacity: 0;
+	}
+
+	.aichat-msg-assistant:hover [id^='aichat-actions-'],
+	.aichat-msg-assistant:focus-within [id^='aichat-actions-'] {
+		opacity: 1;
+	}
+}
+
+#aichat-messages-list [id^='aichat-actions-'] button.ui-pushbutton:hover img {
+	opacity: 1;
+}
+
+/* Hide spacer elements used to force JSDialog container creation */
+[id^='aichat-actions-spacer-'],
+[id^='aichat-msg-spacer-'],
+[id^='aichat-msg-'][id$='-spacer'],
+#aichat-messages-spacer,
+#aichat-loading-dots-spacer {
+	display: none !important;
+}
+
+/* -- Input area -- */
+
+#aichat-input-area {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: 0;
+	padding: 6px var(--spacing-l) var(--spacing-s);
+	flex-shrink: 0;
+	background: var(--color-main-background);
+}
+
+#aichat-input-container {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: 6px;
+	position: relative;
+	border: 1px solid var(--aichat-hairline);
+	border-radius: var(--border-radius-large);
+	background: var(--color-background-lighter);
+	padding: var(--spacing-m) var(--spacing-m) var(--spacing-m) 10px;
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05),
+		0 8px 24px -10px rgba(0, 0, 0, 0.22);
+	transition: border-color var(--duration-normal) var(--ease-standard),
+		box-shadow var(--duration-normal) var(--ease-standard);
+}
+
+#aichat-input-container:focus-within {
+	border-color: rgb(var(--aichat-accent));
+	box-shadow: 0 0 0 3px rgba(var(--aichat-accent), 0.14),
+		0 8px 24px -10px rgba(0, 0, 0, 0.22);
+}
+
+/* While a request runs, a band of the app colour travels round the border. The stop mode
+   class on the send button marks that state. */
+@supports (mask-composite: exclude) {
+	#aichat-input-container:has(.aichat-stop-mode) {
+		border-color: transparent;
+	}
+
+	#aichat-input-container:has(.aichat-stop-mode)::before {
+		content: '';
+		position: absolute;
+		inset: -1px;
+		padding: 1.5px;
+		border-radius: inherit;
+		pointer-events: none;
+		background: linear-gradient(
+			90deg,
+			rgba(var(--aichat-accent), 0.18),
+			rgb(var(--aichat-accent)),
+			rgba(var(--aichat-accent), 0.18),
+			rgb(var(--aichat-accent)),
+			rgba(var(--aichat-accent), 0.18)
+		)
+			0 0 / 200% 100%;
+		mask: linear-gradient(#000 0 0) content-box,
+			linear-gradient(#000 0 0);
+		mask-composite: exclude;
+		animation: aichat-ring 1.6s linear infinite;
+	}
+}
+
+#aichat-input-area .ui-textarea {
+	box-sizing: border-box;
+	flex: 1;
+	min-height: 40px;
+	max-height: 120px;
+	resize: none;
+	border: none;
+	background: transparent;
+	padding: 3px 4px;
+	font-family: var(--cool-font);
+	font-size: 13px;
+	line-height: 1.4;
+	color: var(--color-main-text);
+}
+
+#aichat-input-area .ui-textarea:focus {
+	outline: none;
+}
+
+#aichat-input-area .ui-textarea::placeholder {
+	color: var(--aichat-text-muted);
+	opacity: 1;
+}
+
+/* -- Send button (circular icon) -- */
+
+#aichat-send-btn button.ui-pushbutton {
+	padding: 0;
+	width: 30px;
+	height: 30px;
+	flex-shrink: 0;
+	background: rgb(var(--aichat-accent));
+	border: none;
+	border-radius: 50%;
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		transform var(--duration-instant) var(--ease-standard),
+		opacity var(--duration-fast) var(--ease-standard);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+#aichat-send-btn button.ui-pushbutton img {
+	width: 16px;
+	height: 16px;
+	filter: brightness(0) invert(1);
+}
+
+#aichat-send-btn button.ui-pushbutton:hover {
+	background: linear-gradient(rgba(0, 0, 0, 0.22), rgba(0, 0, 0, 0.22)),
+		rgb(var(--aichat-accent));
+}
+
+#aichat-send-btn button.ui-pushbutton:active {
+	transform: scale(0.93);
+}
+
+/* An empty field leaves the button grey. It takes the app colour once there is text. */
+#aichat-send-btn button.ui-pushbutton[disabled] {
+	background: var(--aichat-tint) !important;
+	border: none !important;
+	cursor: default;
+	transform: none;
+}
+
+#aichat-send-btn button.ui-pushbutton[disabled] img {
+	filter: none;
+	opacity: 0.45;
+}
+
+/* -- Stop mode (send button restyled during processing) --
+   Stop is a neutral control, as red marks errors in this panel. */
+
+#aichat-send-btn button.ui-pushbutton.aichat-stop-mode {
+	background: var(--color-main-text);
+}
+
+#aichat-send-btn button.ui-pushbutton.aichat-stop-mode:hover {
+	background: color-mix(
+		in srgb,
+		var(--color-main-text) 82%,
+		var(--color-main-background)
+	);
+}
+
+[data-theme='dark'] #aichat-send-btn button.ui-pushbutton.aichat-stop-mode img {
+	filter: brightness(0);
+}
+
+#aichat-send-btn button.ui-pushbutton.aichat-stop-mode img {
+	width: 14px;
+	height: 14px;
+}
+
+/* -- Input toolbar (tone chip + send button row inside input container) -- */
+
+#aichat-input-toolbar {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	justify-content: space-between;
+	align-items: center;
+	gap: 8px;
+}
+
+#aichat-input-toolbar > .ui-pushbutton-wrapper {
+	margin: 0;
+	flex-shrink: 0;
+}
+
+/* -- Tone chip (inside input toolbar) -- */
+
+/* The margin resets the one the generic button rule in btns.css gives every button. The label and
+   the arrow after it are laid out like the language button in the status bar. */
+#aichat-tone-chip button.ui-pushbutton,
+#aichat-prompt-chip button.ui-pushbutton {
+	display: inline-flex;
+	align-items: center;
+	margin: 0;
+	border-radius: var(--border-radius-pill);
+	padding: 0 8px 0 10px;
+	font-size: 12px;
+	height: 26px;
+	background: var(--aichat-tint);
+	border: 1px solid transparent;
+	color: var(--color-main-text);
+	font-family: var(--cool-font);
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		border-color var(--duration-fast) var(--ease-standard);
+	white-space: nowrap;
+}
+
+/* The same triangle as the dropdown arrow of the language button, pointing up while the panel is
+   open. */
+#aichat-tone-chip button.ui-pushbutton::after,
+#aichat-prompt-chip button.ui-pushbutton::after {
+	content: '';
+	width: 0;
+	height: 0;
+	margin-left: 6px;
+	border-left: 4px solid transparent;
+	border-right: 4px solid transparent;
+	border-top: 5px solid currentColor;
+}
+
+#aichat-tone-chip button.ui-pushbutton[aria-expanded='true']::after,
+#aichat-prompt-chip button.ui-pushbutton[aria-expanded='true']::after {
+	border-top: 0;
+	border-bottom: 5px solid currentColor;
+}
+
+#aichat-tone-chip button.ui-pushbutton:hover:not([disabled]),
+#aichat-prompt-chip button.ui-pushbutton:hover:not([disabled]) {
+	background: rgba(var(--aichat-accent), 0.12);
+}
+
+#aichat-tone-chip button.ui-pushbutton[disabled],
+#aichat-prompt-chip button.ui-pushbutton[disabled] {
+	opacity: 0.4;
+	cursor: default;
+}
+
+/* -- Tone picker panel -- */
+
+#aichat-tone-picker,
+#aichat-prompt-picker {
+	display: none !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: 6px;
+	row-gap: 6px;
+	padding: 10px 12px 12px;
+	margin: 0 12px 8px;
+	border: 1px solid var(--color-border);
+	border-radius: 12px;
+	background: var(--color-background-lighter);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04),
+		0 1px 2px rgba(0, 0, 0, 0.03);
+	/* When the panel is short the picker shrinks and scrolls its content, down
+	   to a floor that still shows the title and a row or two of tones. Past
+	   that the surplus turns into scroll on the panel instead, which is what
+	   keeps the picker a readable size at 400% browser zoom, where the whole
+	   dock is only a couple of hundred CSS pixels tall. The floor stays below
+	   the shortest content the picker ever holds, so a roomy panel is
+	   unchanged and no state gains empty space. */
+	flex-shrink: 1;
+	min-height: 170px;
+	overflow-y: auto;
+	overflow-x: hidden;
+	scrollbar-width: var(--scrollbar-width);
+	scrollbar-color: var(--scrollbar-color);
+	position: relative;
+}
+
+#aichat-tone-picker.aichat-tone-picker-open,
+#aichat-prompt-picker.aichat-prompt-picker-open {
+	display: flex !important;
+}
+
+#aichat-tone-picker-header {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	justify-content: space-between;
+	align-items: center;
+}
+
+#aichat-tone-title,
+#aichat-prompt-title {
+	font-weight: 600;
+	font-size: 13.5px;
+	letter-spacing: -0.01em;
+	color: var(--color-main-text);
+}
+
+#aichat-tone-reset button.ui-pushbutton {
+	background: transparent;
+	border: none;
+	padding: 2px 4px;
+	color: var(--aichat-text-muted);
+	font-size: 12px;
+	cursor: pointer;
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+}
+
+#aichat-tone-reset button.ui-pushbutton img {
+	width: 12px;
+	height: 12px;
+	opacity: 0.6;
+}
+
+#aichat-tone-reset button.ui-pushbutton:hover {
+	color: var(--color-main-text);
+	text-decoration: underline;
+}
+
+#aichat-tone-reset button.ui-pushbutton:hover img {
+	opacity: 1;
+}
+
+#aichat-tone-presets {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+#aichat-tone-emojify-row {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	justify-content: flex-end;
+	align-items: center;
+	gap: 10px;
+	margin-top: 4px;
+}
+
+#aichat-tone-emojify-label {
+	font-size: 12px;
+	color: var(--color-main-text);
+}
+
+#aichat-tone-emojify button.ui-pushbutton {
+	position: relative;
+	display: inline-block;
+	width: 36px;
+	height: 20px;
+	min-width: 0;
+	padding: 0;
+	/* Hide the "On"/"Off" label visually; aria-label + aria-pressed
+	   carry the state to assistive tech. */
+	text-indent: -9999px;
+	overflow: hidden;
+	border-radius: 999px;
+	border: 1px solid var(--color-border);
+	background: var(--color-border);
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		border-color var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-tone-emojify button.ui-pushbutton::before {
+	content: '';
+	position: absolute;
+	top: 1px;
+	left: 1px;
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+	transform: translateX(0);
+	transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-tone-emojify button.ui-pushbutton[aria-pressed='true'] {
+	background: rgb(var(--aichat-accent));
+	border-color: rgb(var(--aichat-accent));
+}
+
+#aichat-tone-emojify button.ui-pushbutton[aria-pressed='true']::before {
+	transform: translateX(16px);
+}
+
+#aichat-tone-emojify button.ui-pushbutton:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 2px;
+}
+
+/* -- Your tones (custom-tone chips in the picker) --
+   Chips themselves are styled by the generic .ui-chip rules in
+   jsdialogs.css; this section only handles row layout and label. */
+
+#aichat-tone-your-tones-label {
+	font-weight: 600;
+	font-size: 12.5px;
+	color: var(--color-main-text);
+	margin-top: 8px;
+}
+
+#aichat-tone-customs,
+#aichat-prompt-list {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+#aichat-tone-picker .ui-chip,
+#aichat-prompt-picker .ui-chip {
+	flex: 0 0 auto;
+	align-self: flex-start;
+}
+
+#aichat-tone-picker .ui-chip:hover,
+#aichat-prompt-picker .ui-chip:hover {
+	border-color: rgba(var(--aichat-accent), 0.4);
+}
+
+#aichat-tone-add,
+#aichat-prompt-add {
+	justify-content: flex-start !important;
+	align-self: flex-start;
+}
+
+#aichat-tone-add button.ui-pushbutton,
+#aichat-prompt-add button.ui-pushbutton {
+	background: transparent;
+	border: none;
+	padding: 6px 2px;
+	height: auto;
+	font-size: 12.5px;
+	color: var(--aichat-text-muted);
+	cursor: pointer;
+	margin-top: 4px;
+	transition: color var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-tone-add button.ui-pushbutton:hover:not([disabled]),
+#aichat-prompt-add button.ui-pushbutton:hover:not([disabled]) {
+	color: var(--color-main-text);
+	text-decoration: underline;
+}
+
+#aichat-tone-add button.ui-pushbutton[disabled],
+#aichat-prompt-add button.ui-pushbutton[disabled] {
+	opacity: 0.5;
+	cursor: default;
+}
+
+/* -- Add / edit tone form -- */
+
+#aichat-tone-form,
+#aichat-prompt-form {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: 8px;
+}
+
+#aichat-tone-form-header,
+#aichat-prompt-form-header {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	align-items: center;
+	gap: 6px;
+}
+
+#aichat-tone-form-back button.ui-pushbutton,
+#aichat-prompt-form-back button.ui-pushbutton {
+	background: transparent;
+	border: none;
+	font-size: 16px;
+	line-height: 1;
+	padding: 2px 6px;
+	cursor: pointer;
+	color: var(--color-main-text);
+	border-radius: 6px;
+}
+
+#aichat-tone-form-back button.ui-pushbutton:hover,
+#aichat-prompt-form-back button.ui-pushbutton:hover {
+	background: rgba(var(--aichat-accent), 0.08);
+}
+
+#aichat-tone-form-title,
+#aichat-prompt-form-title {
+	font-weight: 600;
+	font-size: 13.5px;
+	color: var(--color-main-text);
+}
+
+#aichat-tone-form-icon-label,
+#aichat-tone-form-name-label,
+#aichat-tone-form-desc-label,
+#aichat-prompt-form-name-label,
+#aichat-prompt-form-text-label {
+	font-size: 11.5px;
+	font-weight: 600;
+	color: var(--aichat-text-muted);
+	letter-spacing: 0.01em;
+	text-transform: uppercase;
+	margin-top: 2px;
+}
+
+#aichat-tone-form-icons {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+#aichat-tone-form-icons > .ui-pushbutton-wrapper {
+	flex: 0 0 auto;
+	margin: 0;
+}
+
+#aichat-tone-form-icons [id^='aichat-tone-form-icon-'] button.ui-pushbutton,
+#aichat-tone-form-emoji-more button.ui-pushbutton {
+	width: 32px;
+	height: 32px;
+	padding: 0;
+	font-size: 18px;
+	line-height: 1;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 999px;
+	background: var(--color-main-background);
+	border: 1px solid var(--color-border);
+	color: var(--color-main-text);
+	cursor: pointer;
+	transition: border-color var(--duration-fast) var(--ease-standard),
+		background var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-tone-form-icons
+[id^='aichat-tone-form-icon-']
+button.ui-pushbutton:hover,
+#aichat-tone-form-emoji-more button.ui-pushbutton:hover {
+	border-color: rgb(var(--aichat-accent));
+	background: rgba(var(--aichat-accent), 0.06);
+}
+
+#aichat-tone-form-icons
+[id^='aichat-tone-form-icon-']
+button.ui-pushbutton[aria-pressed='true'] {
+	border-color: rgb(var(--aichat-accent));
+	background: rgba(var(--aichat-accent), 0.18);
+	box-shadow: 0 0 0 2px rgba(var(--aichat-accent), 0.35);
+}
+
+#aichat-tone-form-icons
+[id^='aichat-tone-form-icon-']
+button.ui-pushbutton[aria-pressed='true']:hover {
+	background: rgba(var(--aichat-accent), 0.22);
+}
+
+#aichat-tone-form-emoji-more button.ui-pushbutton {
+	color: var(--aichat-text-muted);
+}
+
+#aichat-tone-form-name input.ui-edit,
+#aichat-prompt-form-name input.ui-edit {
+	width: 100%;
+	box-sizing: border-box;
+	padding: 8px 10px;
+	border: 1px solid var(--color-border);
+	border-radius: 8px;
+	background: var(--color-main-background);
+	font-size: 13px;
+	color: var(--color-main-text);
+	font-family: var(--cool-font);
+}
+
+#aichat-tone-form-name input.ui-edit:focus,
+#aichat-prompt-form-name input.ui-edit:focus {
+	border-color: rgb(var(--aichat-accent));
+	outline: none;
+}
+
+#aichat-tone-form-desc.ui-textarea,
+#aichat-tone-form-desc textarea.ui-textarea,
+#aichat-prompt-form-text.ui-textarea,
+#aichat-prompt-form-text textarea.ui-textarea {
+	width: 100%;
+	box-sizing: border-box;
+	min-height: 78px;
+	max-height: 180px;
+	padding: 8px 10px;
+	border: 1px solid var(--color-border);
+	border-radius: 8px;
+	background: var(--color-main-background);
+	font-size: 13px;
+	color: var(--color-main-text);
+	font-family: var(--cool-font);
+	resize: vertical;
+}
+
+#aichat-tone-form-desc.ui-textarea:focus,
+#aichat-tone-form-desc textarea.ui-textarea:focus,
+#aichat-prompt-form-text.ui-textarea:focus,
+#aichat-prompt-form-text textarea.ui-textarea:focus {
+	border-color: rgb(var(--aichat-accent));
+	outline: none;
+}
+
+#aichat-tone-form-actions,
+#aichat-prompt-form-actions {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	justify-content: flex-end;
+	align-items: center;
+	gap: 6px;
+	margin-top: 4px;
+}
+
+#aichat-tone-form-actions > .ui-pushbutton-wrapper,
+#aichat-prompt-form-actions > .ui-pushbutton-wrapper {
+	flex: 0 0 auto;
+	margin: 0;
+}
+
+/* The delete button is an icon at the end of the form header, styled like the trash button in
+   the sidebar header. */
+#aichat-tone-form-delete,
+#aichat-prompt-form-delete {
+	margin: 0 0 0 auto;
+}
+
+#aichat-tone-form-delete button.ui-pushbutton,
+#aichat-prompt-form-delete button.ui-pushbutton {
+	padding: var(--spacing-s);
+	width: 28px;
+	height: 28px;
+	margin: 0;
+	border: 1px solid transparent;
+	border-radius: var(--border-radius);
+	background: transparent;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+#aichat-tone-form-delete button.ui-pushbutton:hover,
+#aichat-prompt-form-delete button.ui-pushbutton:hover {
+	background: var(--aichat-tint);
+}
+
+#aichat-tone-form-delete button.ui-pushbutton img,
+#aichat-prompt-form-delete button.ui-pushbutton img {
+	width: 16px;
+	height: 16px;
+	opacity: 0.7;
+}
+
+#aichat-tone-form-delete button.ui-pushbutton:hover img,
+#aichat-prompt-form-delete button.ui-pushbutton:hover img {
+	opacity: 1;
+}
+
+#aichat-tone-form-cancel button.ui-pushbutton,
+#aichat-prompt-form-cancel button.ui-pushbutton {
+	margin: 0;
+	background: transparent;
+	border: 1px solid var(--color-border);
+	color: var(--color-main-text);
+	border-radius: 999px;
+	padding: 6px 14px;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+#aichat-tone-form-cancel button.ui-pushbutton:hover,
+#aichat-prompt-form-cancel button.ui-pushbutton:hover {
+	background: rgba(var(--aichat-accent), 0.06);
+	border-color: rgba(var(--aichat-accent), 0.4);
+}
+
+#aichat-tone-form-save button.ui-pushbutton,
+#aichat-prompt-form-save button.ui-pushbutton {
+	margin: 0;
+	background: rgb(var(--aichat-accent));
+	border: 1px solid rgb(var(--aichat-accent));
+	color: #fff;
+	border-radius: 999px;
+	padding: 6px 14px;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+#aichat-tone-form-save button.ui-pushbutton:hover:not([disabled]),
+#aichat-prompt-form-save button.ui-pushbutton:hover:not([disabled]) {
+	filter: brightness(0.94);
+}
+
+#aichat-tone-form-save button.ui-pushbutton[disabled],
+#aichat-prompt-form-save button.ui-pushbutton[disabled] {
+	opacity: 0.5;
+	cursor: default;
+}
+
+/* -- Inline delete-tone confirm panel -- */
+
+#aichat-tone-delete-confirm,
+#aichat-prompt-delete-confirm {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: 8px;
+	padding: 12px;
+	border: 1px solid var(--color-border);
+	border-radius: 10px;
+	background: var(--color-background-lighter);
+}
+
+#aichat-tone-delete-confirm-title,
+#aichat-prompt-delete-confirm-title {
+	font-weight: 600;
+	font-size: 14px;
+	color: var(--color-main-text);
+}
+
+#aichat-tone-delete-confirm-desc,
+#aichat-prompt-delete-confirm-desc {
+	font-size: 12.5px;
+	color: var(--aichat-text-muted);
+}
+
+#aichat-tone-delete-confirm-preview {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	align-items: center;
+	margin: 4px 0 8px;
+}
+
+#aichat-tone-delete-confirm-preview .ui-chip {
+	flex: 0 0 auto;
+	align-self: flex-start;
+	pointer-events: none;
+}
+
+#aichat-tone-delete-confirm-preview .ui-chip-main {
+	cursor: default;
+}
+
+#aichat-tone-delete-confirm-actions,
+#aichat-prompt-delete-confirm-actions {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	justify-content: flex-end;
+	align-items: center;
+	gap: 8px;
+}
+
+#aichat-tone-delete-confirm-actions > .ui-pushbutton-wrapper,
+#aichat-prompt-delete-confirm-actions > .ui-pushbutton-wrapper {
+	flex: 0 0 auto;
+	margin: 0;
+}
+
+#aichat-tone-delete-confirm-cancel button.ui-pushbutton,
+#aichat-prompt-delete-confirm-cancel button.ui-pushbutton {
+	background: transparent;
+	border: 1px solid var(--color-border);
+	color: var(--color-main-text);
+	border-radius: 999px;
+	padding: 6px 14px;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+#aichat-tone-delete-confirm-cancel button.ui-pushbutton:hover,
+#aichat-prompt-delete-confirm-cancel button.ui-pushbutton:hover {
+	background: rgba(var(--aichat-accent), 0.06);
+	border-color: rgba(var(--aichat-accent), 0.4);
+}
+
+#aichat-tone-delete-confirm-ok button.ui-pushbutton,
+#aichat-prompt-delete-confirm-ok button.ui-pushbutton {
+	background: var(--color-error);
+	border: 1px solid var(--color-error);
+	color: #fff;
+	border-radius: 999px;
+	padding: 6px 14px;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+#aichat-tone-delete-confirm-ok button.ui-pushbutton:hover,
+#aichat-prompt-delete-confirm-ok button.ui-pushbutton:hover {
+	filter: brightness(0.94);
+}
+
+#aichat-tone-delete-confirm-ok button.ui-pushbutton:focus-visible,
+#aichat-prompt-delete-confirm-ok button.ui-pushbutton:focus-visible {
+	outline: 2px solid var(--color-error);
+	outline-offset: 2px;
+}
+
+/* -- Saved prompts: the chips next to the input, the picker texts and the slash list -- */
+
+#aichat-input-chips {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	align-items: center;
+	gap: 6px;
+}
+
+#aichat-input-chips > .ui-pushbutton-wrapper {
+	margin: 0;
+}
+
+#aichat-prompt-empty,
+#aichat-prompt-tip {
+	font-size: 12px;
+	color: var(--color-text-lighter);
+}
+
+#aichat-prompt-tip {
+	margin-bottom: 4px;
+}
+
+#aichat-slash-menu {
+	display: none !important;
+	grid-auto-flow: unset !important;
+	flex-direction: column;
+	gap: 2px;
+	padding: 6px;
+	margin: 0 12px 8px;
+	border: 1px solid var(--color-border);
+	border-radius: 12px;
+	background: var(--color-background-lighter);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04),
+		0 1px 2px rgba(0, 0, 0, 0.03);
+	max-height: 240px;
+	overflow-y: auto;
+}
+
+#aichat-slash-menu.aichat-slash-menu-open {
+	display: flex !important;
+}
+
+#aichat-slash-menu > .ui-pushbutton-wrapper {
+	margin: 0;
+	justify-content: stretch !important;
+}
+
+#aichat-slash-menu button.ui-pushbutton {
+	width: 100%;
+	margin: 0;
+	text-align: start;
+	background: transparent;
+	border: none;
+	border-radius: 8px;
+	padding: 6px 10px;
+	font-size: 13px;
+	color: var(--color-main-text);
+	cursor: pointer;
+}
+
+#aichat-slash-menu button.ui-pushbutton:hover:not([disabled]),
+#aichat-slash-menu button.ui-pushbutton[aria-pressed='true'] {
+	background: rgba(var(--aichat-accent), 0.12);
+}
+
+#aichat-slash-add button.ui-pushbutton {
+	color: var(--aichat-text-muted);
+}
+
+#aichat-slash-empty {
+	font-size: 12px;
+	color: var(--color-text-lighter);
+	padding: 4px 10px;
+}
+
+
+/* -- Emoji picker overlay (anchors the generic .ui-emoji-picker widget) -- */
+
+#aichat-tone-form-emoji-picker {
+	/* The picker is the containing block and the scroll container, so this
+	   overlay scrolls together with the form content. */
+	position: absolute;
+	left: 12px;
+	right: 12px;
+	top: 64px;
+	z-index: 20;
+	max-height: min(320px, 45vh);
+	overflow-y: auto;
+	background: var(--color-main-background);
+	border: 1px solid var(--color-border);
+	border-radius: 10px;
+	box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+}
+
+#aichat-tone-form-emoji-picker .ui-emoji-picker-search:focus {
+	border-color: rgb(var(--aichat-accent));
+}
+
+#aichat-tone-form-emoji-picker .ui-emoji-picker-cell:hover,
+#aichat-tone-form-emoji-picker .ui-emoji-picker-cell:focus-visible {
+	background: rgba(var(--aichat-accent), 0.1);
+}
+
+/* -- Markdown rendering in assistant messages -- */
+
+[id^='aichat-msg-'].aichat-msg-assistant > [id^='aichat-msg-text-'] {
+	white-space: normal;
+	display: block;
+	overflow-x: auto;
+}
+
+.aichat-msg-assistant h3 {
+	font-size: 15px;
+	font-weight: 600;
+	margin: 8px 0 4px;
+	line-height: 1.3;
+	color: var(--color-main-text);
+}
+
+.aichat-msg-assistant h3:first-child,
+.aichat-msg-assistant h4:first-child,
+.aichat-msg-assistant h5:first-child {
+	margin-top: 0;
+}
+
+.aichat-msg-assistant h4 {
+	font-size: 14px;
+	font-weight: 600;
+	margin: 6px 0 3px;
+	line-height: 1.3;
+	color: var(--color-main-text);
+}
+
+.aichat-msg-assistant h5 {
+	font-size: 13px;
+	font-weight: 600;
+	margin: 4px 0 2px;
+	line-height: 1.3;
+	color: var(--color-main-text);
+}
+
+.aichat-msg-assistant code {
+	background: var(--aichat-tint);
+	padding: 1px 5px;
+	border-radius: 3px;
+	font-family: var(--aichat-font-mono);
+	font-size: 12px;
+}
+
+.aichat-msg-assistant pre {
+	background: var(--aichat-tint);
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius);
+	padding: 8px 10px;
+	margin: 6px 0;
+	overflow-x: auto;
+	font-size: 12px;
+	line-height: 1.45;
+}
+
+.aichat-msg-assistant pre code {
+	background: none;
+	padding: 0;
+	font-size: inherit;
+}
+
+.aichat-msg-assistant ul,
+.aichat-msg-assistant ol {
+	margin: 4px 0;
+	padding-left: 20px;
+}
+
+.aichat-msg-assistant li {
+	margin: 2px 0;
+	line-height: 1.4;
+}
+
+.aichat-msg-assistant a {
+	color: rgb(var(--aichat-accent));
+	text-decoration: underline;
+	text-decoration-color: rgba(var(--aichat-accent), 0.3);
+}
+
+.aichat-msg-assistant a:hover {
+	text-decoration-color: rgb(var(--aichat-accent));
+}
+
+.aichat-msg-assistant p {
+	margin: 0 0 4px;
+	line-height: 1.45;
+}
+
+.aichat-msg-assistant p:last-child {
+	margin-bottom: 0;
+}
+
+.aichat-msg-assistant strong {
+	font-weight: 600;
+}
+
+.aichat-msg-assistant em {
+	font-style: italic;
+}
+
+.aichat-msg-assistant table {
+	border-collapse: collapse;
+	margin: 6px 0;
+	font-size: 12px;
+}
+
+.aichat-msg-assistant th,
+.aichat-msg-assistant td {
+	border: 1px solid var(--color-border);
+	padding: 4px 8px;
+}
+
+.aichat-msg-assistant th {
+	background: var(--aichat-tint);
+	font-weight: 600;
+}
+
+.aichat-msg-assistant blockquote {
+	border-left: 3px solid var(--color-border);
+	margin: 6px 0;
+	padding: 4px 10px;
+	color: var(--aichat-text-muted);
+}
+
+.aichat-msg-assistant del {
+	text-decoration: line-through;
+}
+
+/* -- Generated images -- */
+
+.aichat-generated-image {
+	max-width: 100%;
+	border-radius: var(--border-radius);
+	margin: 4px 0;
+	cursor: pointer;
+}
+
+/* -- Error messages -- */
+
+[id^='aichat-msg-'].aichat-msg-error,
+[id^='aichat-msg-'].aichat-msg-approval {
+	padding: 10px var(--spacing-l);
+	border: 1px solid var(--aichat-hairline);
+	border-radius: var(--border-radius-large);
+}
+
+[id^='aichat-msg-'].aichat-msg-error::before,
+[id^='aichat-msg-'].aichat-msg-approval::before {
+	content: none;
+}
+
+[id^='aichat-msg-'].aichat-msg-error {
+	border-color: color-mix(in srgb, var(--color-error) 30%, transparent);
+	background: color-mix(in srgb, var(--color-error) 4%, transparent);
+}
+
+[id^='aichat-msg-'].aichat-msg-error [id^='aichat-msg-text-'] {
+	color: var(--aichat-error-text);
+	font-size: 12px;
+}
+
+/* -- Retry button on error messages (scoped like the approval buttons) -- */
+
+[id^='aichat-retry-'] {
+	margin-top: 6px;
+}
+
+#aichat-messages-list [id^='aichat-retry-'] button.ui-pushbutton {
+	font-size: 12px;
+	color: var(--aichat-error-text);
+	border: 1px solid color-mix(in srgb, var(--color-error) 30%, transparent);
+	background: transparent;
+	height: auto;
+	margin: 0;
+	padding: 4px 12px;
+	border-radius: var(--border-radius-pill);
+	cursor: pointer;
+	transition: all var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-messages-list [id^='aichat-retry-'] button.ui-pushbutton:hover {
+	background: color-mix(in srgb, var(--color-error) 6%, transparent);
+	border-color: var(--color-error);
+}
+
+/* -- Approval buttons --
+   Scoped under the messages list id so these rules outrank the generic button rule in
+   btns.css, which otherwise turns the buttons grey. */
+
+.aichat-approval-buttons {
+	display: flex;
+	gap: var(--spacing-m);
+	margin-top: 2px;
+}
+
+#aichat-messages-list .aichat-approve-btn,
+#aichat-messages-list .aichat-reject-btn {
+	height: auto;
+	margin: 0;
+	padding: 6px 16px;
+	font-size: 12.5px;
+	font-family: var(--cool-font);
+	font-weight: 500;
+	border-radius: var(--border-radius-pill);
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		border-color var(--duration-fast) var(--ease-standard),
+		box-shadow var(--duration-fast) var(--ease-standard);
+	line-height: 1.4;
+}
+
+#aichat-messages-list .aichat-approve-btn {
+	background: rgb(var(--aichat-accent));
+	color: var(--color-primary-text);
+	border: 1px solid rgb(var(--aichat-accent));
+}
+
+#aichat-messages-list .aichat-approve-btn:hover {
+	box-shadow: 0 2px 8px rgba(var(--aichat-accent), 0.3);
+	background: linear-gradient(var(--color-black-10), var(--color-black-10)),
+		rgb(var(--aichat-accent));
+}
+
+#aichat-messages-list .aichat-approve-btn:active {
+	transform: scale(0.97);
+}
+
+#aichat-messages-list .aichat-approve-btn:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 2px;
+}
+
+#aichat-messages-list .aichat-reject-btn {
+	background: transparent;
+	color: var(--color-main-text);
+	border: 1px solid var(--color-border);
+}
+
+#aichat-messages-list .aichat-reject-btn:hover {
+	border-color: var(--color-error);
+	color: var(--aichat-error-text);
+	background: color-mix(in srgb, var(--color-error) 4%, transparent);
+}
+
+#aichat-messages-list .aichat-reject-btn:active {
+	transform: scale(0.97);
+}
+
+#aichat-messages-list .aichat-reject-btn:focus-visible {
+	outline: 2px solid var(--color-error);
+	outline-offset: 2px;
+}
+
+/* -- Design template picker shown before generating a deck --
+   Scoped under the messages list id so these rules outrank the generic
+   button reset in btns.css, which otherwise forces a fixed height and
+   strips the card's width, border, and margins. */
+
+#aichat-messages-list .aichat-template-picker {
+	margin-top: var(--spacing-m);
+	font-size: 0; /* swallow whitespace between inline-block cards */
+}
+
+#aichat-messages-list .aichat-template-card {
+	display: inline-block;
+	vertical-align: top;
+	width: 116px;
+	height: auto;
+	box-sizing: border-box;
+	margin: 0 var(--spacing-m) var(--spacing-m) 0;
+	padding: 5px;
+	border: 1px solid var(--color-border);
+	border-radius: 10px;
+	background: var(--color-background-lighter);
+	cursor: pointer;
+	text-align: center;
+	font-family: var(--cool-font);
+}
+
+#aichat-messages-list .aichat-template-card:hover {
+	border-color: rgb(var(--aichat-accent));
+	box-shadow: 0 2px 8px rgba(var(--aichat-accent), 0.3);
+}
+
+#aichat-messages-list .aichat-template-card:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 2px;
+}
+
+#aichat-messages-list .aichat-template-thumb {
+	display: block;
+	width: 104px;
+	height: 59px;
+	object-fit: cover;
+	border-radius: 4px;
+}
+
+#aichat-messages-list .aichat-template-name {
+	display: block;
+	margin-top: 4px;
+	font-size: 12px;
+	line-height: 1.3;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+#aichat-messages-list .aichat-template-skip {
+	display: inline-block;
+	vertical-align: top;
+	width: auto;
+	height: auto;
+	margin-top: var(--spacing-m);
+	padding: 6px 16px;
+	font-size: 12.5px;
+	font-family: var(--cool-font);
+	font-weight: 500;
+	border-radius: 14px;
+	border: 1px solid var(--color-border);
+	background: transparent;
+	cursor: pointer;
+}
+
+#aichat-messages-list .aichat-template-skip:hover {
+	border-color: rgb(var(--aichat-accent));
+}
+
+#aichat-messages-list .aichat-template-skip:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 2px;
+}
+
+/* The selected entry of a decision card's design picker. */
+#aichat-messages-list .aichat-template-card[aria-pressed='true'],
+#aichat-messages-list .aichat-template-skip[aria-pressed='true'] {
+	border-color: rgb(var(--aichat-accent));
+	box-shadow: 0 0 0 1px rgb(var(--aichat-accent));
+}
+
+#aichat-messages-list .aichat-design-section {
+	margin-top: var(--spacing-m);
+	padding-top: var(--spacing-m);
+	border-top: 1px solid var(--color-border);
+}
+
+#aichat-messages-list .aichat-design-label {
+	font-size: 12.5px;
+	font-weight: 500;
+	font-family: var(--cool-font);
+}
+
+/* At the top of the outline card the strip stays one row tall: the
+   cards scroll horizontally and the reserved height keeps the rows
+   below from shifting when the catalog arrives. */
+#aichat-messages-list .aichat-outline-card .aichat-design-section {
+	margin-top: 0;
+	margin-bottom: var(--spacing-m);
+	padding-top: 0;
+	padding-bottom: var(--spacing-m);
+	border-top: none;
+	border-bottom: 1px solid var(--color-border);
+}
+
+#aichat-messages-list .aichat-outline-card .aichat-template-picker {
+	white-space: nowrap;
+	overflow-x: auto;
+	min-height: 108px;
+}
+
+/* -- Editable deck outline card shown before the slides are built --
+   Every row is a mini slide card that stands for the slide it will become.
+   A left edge encodes the slide's structural part; the eyebrow text names
+   that part as well, so nothing is carried by colour alone. Scoped under
+   the messages list id, like the template picker, so these rules outrank
+   the generic input and button resets that would otherwise strip the
+   card's layout. */
+
+#aichat-messages-list .aichat-outline-card {
+	margin-top: var(--spacing-m);
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+#aichat-messages-list .aichat-outline-row {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 10px;
+	border: 1px solid var(--color-border);
+	border-left: 3px solid var(--color-border);
+	border-radius: var(--border-radius);
+	background: var(--color-main-background);
+}
+
+/* The opening, divider and closing slides shape the deck, so their edge
+   takes the accent colour; body slides keep the neutral edge. */
+#aichat-messages-list .aichat-outline-part-opening,
+#aichat-messages-list .aichat-outline-part-divider,
+#aichat-messages-list .aichat-outline-part-closing {
+	border-left-color: rgb(var(--aichat-accent));
+}
+
+#aichat-messages-list .aichat-outline-header {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+#aichat-messages-list .aichat-outline-num {
+	flex-shrink: 0;
+	font-size: 12px;
+	color: var(--aichat-text-muted);
+}
+
+#aichat-messages-list .aichat-outline-eyebrow {
+	flex: 1;
+	font-size: 0.7em;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--aichat-text-muted);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+#aichat-messages-list .aichat-outline-delete {
+	flex-shrink: 0;
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	border: none;
+	border-radius: var(--border-radius);
+	background: transparent;
+	color: var(--aichat-text-muted);
+	font-size: 15px;
+	line-height: 1;
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		color var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-messages-list .aichat-outline-delete:hover,
+#aichat-messages-list .aichat-outline-delete:focus-visible {
+	background: color-mix(in srgb, var(--color-error) 8%, transparent);
+	color: var(--aichat-error-text);
+}
+
+#aichat-messages-list .aichat-outline-delete:focus-visible {
+	outline: 2px solid var(--color-error);
+	outline-offset: 1px;
+}
+
+/* The title reads as the slide's heading; the editable box only appears
+   on hover, with an accent underline on focus. */
+#aichat-messages-list .aichat-outline-title {
+	width: 100%;
+	box-sizing: border-box;
+	padding: 2px 4px;
+	border: none;
+	border-bottom: 1px solid transparent;
+	border-radius: 3px;
+	background: transparent;
+	color: var(--color-main-text);
+	font-family: var(--cool-font);
+	font-size: 0.95em;
+	font-weight: 600;
+}
+
+#aichat-messages-list .aichat-outline-title:hover {
+	background: rgba(var(--aichat-accent), 0.05);
+}
+
+#aichat-messages-list .aichat-outline-title:focus {
+	outline: none;
+	background: transparent;
+	border-bottom-color: rgb(var(--aichat-accent));
+}
+
+/* The gist is an inline, auto-growing description styled like the title
+   but muted; it starts as one line and the box only shows on hover. */
+#aichat-messages-list .aichat-outline-gist {
+	width: 100%;
+	box-sizing: border-box;
+	padding: 2px 4px;
+	border: none;
+	border-bottom: 1px solid transparent;
+	border-radius: 3px;
+	background: transparent;
+	color: var(--aichat-text-muted);
+	font-family: var(--cool-font);
+	font-size: 0.85em;
+	line-height: 1.4;
+	resize: none;
+	overflow: hidden;
+}
+
+#aichat-messages-list .aichat-outline-gist::placeholder {
+	color: var(--aichat-text-muted);
+}
+
+#aichat-messages-list .aichat-outline-gist:hover {
+	background: rgba(var(--aichat-accent), 0.05);
+}
+
+#aichat-messages-list .aichat-outline-gist:focus {
+	outline: none;
+	background: transparent;
+	border-bottom-color: rgb(var(--aichat-accent));
+}
+
+/* A ghost, full-width button at the end of the list that adds a blank
+   slide row. The dashed edge and muted text set it apart from a real
+   slide card without competing with the approve button below. */
+#aichat-messages-list .aichat-outline-add {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	width: 100%;
+	box-sizing: border-box;
+	padding: 8px 10px;
+	border: 1px dashed var(--color-border);
+	border-radius: var(--border-radius);
+	background: transparent;
+	color: var(--aichat-text-muted);
+	font-family: var(--cool-font);
+	font-size: 0.9em;
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		border-color var(--duration-fast) var(--ease-standard),
+		color var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-messages-list .aichat-outline-add:hover {
+	border-color: rgb(var(--aichat-accent));
+	background: rgba(var(--aichat-accent), 0.05);
+	color: rgb(var(--aichat-accent));
+}
+
+#aichat-messages-list .aichat-outline-add:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 2px;
+}
+
+#aichat-messages-list .aichat-outline-add-icon {
+	font-size: 1.1em;
+	line-height: 1;
+}
+
+#aichat-messages-list .aichat-outline-card .aichat-approval-buttons {
+	margin-top: var(--spacing-m);
+}
+
+/* A muted note under the buttons, shown only while approve is blocked. */
+#aichat-messages-list .aichat-outline-hint {
+	margin-top: var(--spacing-s);
+	font-size: 0.8em;
+	color: var(--aichat-text-muted);
+}
+
+#aichat-messages-list .aichat-approve-btn:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+
+#aichat-messages-list .aichat-approve-btn:disabled:hover {
+	box-shadow: none;
+	background: rgb(var(--aichat-accent));
+}
+
+/* -- Inline clickable section/range names in an assistant reply -- */
+
+.aichat-choice-link {
+	color: rgb(var(--aichat-accent));
+	cursor: pointer;
+	text-decoration: underline;
+	text-decoration-style: dotted;
+	text-decoration-color: rgba(var(--aichat-accent), 0.5);
+	text-underline-offset: 2px;
+	border-radius: 2px;
+}
+
+.aichat-choice-link:hover {
+	text-decoration-style: solid;
+	text-decoration-color: rgb(var(--aichat-accent));
+}
+
+.aichat-choice-link:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 2px;
+}
+
+/* -- Approval card (tool call requiring user action) -- */
+
+[id^='aichat-msg-'].aichat-msg-approval {
+	border-color: rgba(var(--aichat-accent), 0.4);
+	background: rgba(var(--aichat-accent), 0.05);
+}
+
+/* Modify actions get a warning-tinted appearance */
+[id^='aichat-msg-'].aichat-msg-approval-modify {
+	border-color: color-mix(in srgb, var(--color-warning) 50%, transparent);
+	background: color-mix(in srgb, var(--color-warning) 6%, transparent);
+}
+
+/* -- Selection context indicator (attachment chip inside the input box) -- */
+
+#aichat-selection-context {
+	display: inline-flex;
+	align-items: center;
+	align-self: flex-start;
+	max-width: 100%;
+	box-sizing: border-box;
+	height: 22px;
+	padding: 0 9px;
+	font-size: 11px;
+	line-height: 1;
+	color: rgb(var(--aichat-accent));
+	background: rgba(var(--aichat-accent), 0.1);
+	border: none;
+	border-radius: var(--border-radius-pill);
+	margin: 0;
+	white-space: nowrap;
+	overflow: hidden;
+	animation: aichat-slide-up var(--duration-fast) var(--ease-out);
+}
+
+/* -- Prompt suggestions (a wrapping row of pills) -- */
+
+#aichat-chips {
+	display: flex !important;
+	grid-auto-flow: unset !important;
+	flex-direction: row;
+	flex-wrap: wrap;
+	gap: 6px;
+	padding: 0;
+	align-self: stretch;
+}
+
+/* Individual suggestion - pushbutton wrapper */
+#aichat-chips > [id^='aichat-chip-'],
+#aichat-chips > #aichat-see-more {
+	margin: 0;
+	animation: aichat-slide-up var(--duration-normal) var(--ease-out) both;
+}
+
+#aichat-chips > [id^='aichat-chip-']:nth-child(2) {
+	animation-delay: 0.04s;
+}
+
+#aichat-chips > [id^='aichat-chip-']:nth-child(3) {
+	animation-delay: 0.08s;
+}
+
+#aichat-chips > [id^='aichat-chip-']:nth-child(n + 4) {
+	animation-delay: 0.12s;
+}
+
+/* Pill button appearance, shared with the "See more" / "See less" toggle. The margin resets the
+   one the generic button rule in btns.css gives every button. */
+#aichat-chips > [id^='aichat-chip-'] > button.ui-pushbutton,
+#aichat-chips > #aichat-see-more > button.ui-pushbutton {
+	width: auto;
+	height: 30px;
+	margin: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: flex-start;
+	gap: 6px;
+	padding: 0 var(--spacing-l) 0 9px;
+	border: 1px solid var(--aichat-hairline);
+	border-radius: var(--border-radius-pill);
+	background: var(--color-background-lighter);
+	font-size: 12.5px;
+	font-family: var(--cool-font);
+	line-height: 1.2;
+	white-space: nowrap;
+	color: var(--color-main-text);
+	cursor: pointer;
+	transition: border-color var(--duration-fast) var(--ease-standard),
+		background var(--duration-fast) var(--ease-standard);
+}
+
+#aichat-chips > [id^='aichat-chip-'] > button.ui-pushbutton img {
+	width: 16px;
+	height: 16px;
+	flex-shrink: 0;
+}
+
+#aichat-chips > [id^='aichat-chip-'] > button.ui-pushbutton:hover,
+#aichat-chips > [id^='aichat-chip-'] > button.ui-pushbutton:focus-visible,
+#aichat-chips > #aichat-see-more > button.ui-pushbutton:hover,
+#aichat-chips > #aichat-see-more > button.ui-pushbutton:focus-visible {
+	border-color: rgba(var(--aichat-accent), 0.55);
+	background: rgba(var(--aichat-accent), 0.06);
+}
+
+#aichat-chips > [id^='aichat-chip-'] > button.ui-pushbutton:focus-visible,
+#aichat-chips > #aichat-see-more > button.ui-pushbutton:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 1px;
+}
+
+/* The toggle has no icon and a dashed edge, so it reads apart from the suggestions. */
+#aichat-chips > #aichat-see-more > button.ui-pushbutton {
+	padding: 0 var(--spacing-l);
+	border-style: dashed;
+	color: rgb(var(--aichat-accent));
+}
+
+/* -- Clickable cell references -- */
+
+.aichat-cell-ref {
+	font-family: var(--aichat-font-mono);
+	color: rgb(var(--aichat-accent));
+	background: rgba(var(--aichat-accent), 0.08);
+	padding: 1px 4px;
+	border-radius: 3px;
+	border-bottom: 1px dotted rgba(var(--aichat-accent), 0.5);
+	cursor: pointer;
+	transition: background var(--duration-fast) var(--ease-standard),
+		border-color var(--duration-fast) var(--ease-standard);
+	font-size: 12px;
+	white-space: nowrap;
+}
+
+.aichat-cell-ref:hover {
+	background: rgba(var(--aichat-accent), 0.15);
+	border-bottom-color: rgb(var(--aichat-accent));
+}
+
+.aichat-cell-ref:focus-visible {
+	outline: 2px solid rgb(var(--aichat-accent));
+	outline-offset: 1px;
+	border-bottom-color: rgb(var(--aichat-accent));
+}
+
+.aichat-cell-ref:active {
+	background: rgba(var(--aichat-accent), 0.22);
+}
+
+/* -- Accessibility: reduced motion -- */
+
+/* The looping animations stop here. A loop does not take its time from the motion tokens,
+   which cool.css shortens to 1ms, because a 1ms loop would flicker. */
+@media (prefers-reduced-motion: reduce) {
+	[id^='aichat-msg-'],
+	#aichat-loading-dots,
+	#aichat-loading-dots::before,
+	#aichat-chips > [id^='aichat-chip-'],
+	#aichat-chips > #aichat-see-more,
+	#aichat-selection-context,
+	#aichat-input-container:has(.aichat-stop-mode)::before {
+		animation: none;
+	}
+
+	#aichat-progress-text {
+		animation: none !important;
+		background: none !important;
+		color: var(--aichat-text-muted) !important;
+	}
+
+	#aichat-messages-list .aichat-approve-btn:active,
+	#aichat-messages-list .aichat-reject-btn:active {
+		transform: none;
+	}
+}

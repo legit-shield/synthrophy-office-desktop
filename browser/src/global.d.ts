@@ -1,0 +1,661 @@
+/* -*- tab-width: 4 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+// TypeScript declarations for the global scope (e.g., window, document, etc.)
+
+interface DocumentMetadata {
+	modifiedBy: string;
+	modificationDate: string;
+}
+
+interface CompareDocumentsMetadata {
+	otherDocument: DocumentMetadata;
+	thisDocument: DocumentMetadata;
+}
+
+interface CompareDocumentProperties {
+	metadata: CompareDocumentsMetadata;
+}
+
+interface COOLTouch {
+	isTouchEvent: (e: Event | HammerInput) => boolean;
+	touchOnly: <F extends (e: Event | HammerInput) => void>(
+		f: F,
+	) => (e: Event | HammerInput) => ReturnType<F> | undefined;
+	mouseOnly: <F extends (e: Event | HammerInput) => void>(
+		f: F,
+	) => (e: Event | HammerInput) => ReturnType<F> | undefined;
+	hasPrimaryTouchscreen: () => boolean;
+	hasAnyTouchscreen: () => boolean;
+	lastEventWasTouch: boolean | null;
+	lastEventTime: Date | null;
+	currentlyUsingTouchscreen: () => boolean;
+}
+
+// What the engine says about one remote sentence checker, through the
+// .uno:RemoteGrammarCheckers command values: how it is set up, what the
+// server offers, and what the server set up. The key never comes.
+interface RemoteCheckerInfo {
+	id: 'languagetool' | 'duden' | 'grammalecte';
+	enabled: boolean;
+	baseURL: string;
+	username?: string;
+	hasCredentials: boolean;
+	sslVerify: boolean;
+	allowUserSettings: boolean;
+	checksSpelling: boolean;
+	locales: string[];
+	spellcheckingLevel?: number;
+	orthographyStandard?: string;
+	messageLevel?: number;
+	propertySets?: string[];
+	dictionaries?: string[];
+	availablePropertySets?: string[];
+	availableDictionaries?: string[];
+	style?: Record<string, boolean>;
+	options?: Record<string, boolean>;
+	server?: Partial<RemoteCheckerInfo>;
+}
+
+// What the engine says about one translation provider, through the
+// .uno:TranslationProviders command values. The key never comes.
+interface TranslationProviderInfo {
+	id: 'deepl' | 'libretranslate';
+	name: string;
+	enabled: boolean;
+	configured: boolean;
+	allowUserSettings: boolean;
+	hasCredentials: boolean;
+	apiURL?: string;
+	baseURL?: string;
+	sslVerify?: boolean;
+	targetLanguages: string[];
+	server?: Partial<TranslationProviderInfo>;
+}
+
+// The translation providers: which one is asked for, which one the server
+// asks for, which one translates, and each of them.
+interface TranslationProvidersInfo {
+	provider: string;
+	serverProvider?: string;
+	active: string;
+	providers: TranslationProviderInfo[];
+}
+
+interface Window {
+	touch: COOLTouch;
+	setLogging(value: boolean): void;
+	postMobileMessage(msg: string): void;
+	// Pixel side length of one document tile.
+	tileSize: number;
+}
+
+/*
+// Extend the JSDialog namespace
+declare namespace JSDialog {
+    class StatusBar {
+        constructor();
+        show(text: string, timeout?: number): void;
+        hide(): void;
+        setText(text: string): void;
+        showProgress(text: string, progress: number): void;
+        hideProgress(): void;
+    }
+}
+
+// Extend the global L namespace
+declare namespace L {
+    class Map {
+        constructor(element: string | HTMLElement, options?: any);
+        addLayer(layer: any): this;
+        removeLayer(layer: any): this;
+        fire(type: string, data?: any, propagate?: boolean): this;
+        on(type: string, fn: (event: any) => void, context?: any): this;
+        off(type: string, fn?: (event: any) => void, context?: any): this;
+        once(type: string, fn: (event: any) => void, context?: any): this;
+        hasEventListeners(type: string): boolean;
+        addEventListener(type: string, fn: (event: any) => void, context?: any): this;
+        removeEventListener(type: string, fn?: (event: any) => void, context?: any): this;
+        eachLayer(fn: (layer: any) => void, context?: any): this;
+        getZoom(): number;
+        fitBounds(bounds: any, options?: any): this; // Replace 'any' with the appropriate type if known
+
+        statusBar: JSDialog.StatusBar
+    }
+
+    class Control {
+        protected _map: window.L.Map; // Expose _map as a protected property
+
+        constructor(options?: any);
+        addTo(map: window.L.Map): this;
+        remove(): this;
+        // Add other methods and properties as needed
+        getPosition(): string;
+        setPosition(position: string): this;
+        getContainer(): HTMLElement | undefined;
+        onAdd(map: window.L.Map): HTMLElement;
+        onRemove(map: window.L.Map): void;
+
+            // Properties
+            options: any; // Replace 'any' with the appropriate type if known
+            _container: HTMLElement | undefined;
+            _position: string;
+
+            // Methods
+            addControl(control: window.L.Control): this;
+            removeControl(control: window.L.Control): this;
+            getContainer(): HTMLElement | undefined;
+            setContainer(container: HTMLElement): void;
+            getOptions(): any;
+            setOptions(options: any): void;
+            getMap(): window.L.Map | undefined;
+            setMap(map: window.L.Map): void;
+            menubar(): void; // Add menubar functionality if applicable
+
+        static extend(props: any): any;
+    }
+
+    const control: Control;
+    const map: window.L.Map;
+}
+*/
+
+interface AppInterface {
+	sectionContainer: CanvasSectionContainer;
+	zoomControl: ZoomControl;
+	LOUtil: typeof LOUtil;
+	socket: Socket;
+	setPermission: (permission: string) => void;
+	util: typeof Util;
+	CSections: any;
+	activeDocument: null | DocumentBase;
+	definitions: any;
+	dpiScale: number;
+	canvasSize: null | cool.SimplePoint;
+	viewId: null | number;
+	isAdminUser: null | boolean;
+	UNOModifier: { SHIFT: number; CTRL: number; ALT: number; CTRLMAC: number };
+	JSButtons: {
+		left: number;
+		middle: number;
+		right: number;
+	};
+	LOButtons: {
+		left: number;
+		middle: number;
+		right: number;
+	};
+	calc: {
+		maxColumnCount: number;
+		maxRowCount: number;
+		cellAddress: null | cool.SimplePoint;
+		cellCursorVisible: boolean;
+		cellCursorRectangle: null | cool.SimpleRectangle;
+		cellCursorSheet: number;
+		decimalSeparator: null | string; // Current cell's decimal separator.
+		otherCellCursors: any;
+		splitCoordinate: null | cool.SimplePoint;
+		partHashes: null | Array<string>; // the engine's hash of each sheet, from the status message
+		/// The id of each sheet as a vector part, by sheet index, from the status message. Null
+		/// before the first status. The id stays with a sheet when it moves to another index.
+		partIds: null | Array<string>;
+		filterPopupCell: any; // The cell a filter popup belongs to: { popupId, column, row }.
+		isRTL(): boolean;
+		isSelectedPartSheetView(): boolean;
+		/// Holds the cells drawn from vector primitives, once a view draws from them.
+		vectorManager: null | CalcVectorManager;
+	};
+	impress: {
+		partList: any; // Info for parts.
+		notesMode: boolean;
+		hasOverviewPage: boolean; // Whether the document has an Overview slide (part 0 when present).
+		savedViewMode: string | null; // 'normal' | 'notes' | 'master' | null
+		twipsCorrection: number;
+		getIndexFromPart(part: string): number;
+		isSlideHidden(partNo: number): boolean;
+		areAllSlidesHidden(): boolean;
+		isSlideImportSupported(): boolean;
+		getSelectedSlidesCount(): number;
+		getSelectedSectionName(): string | null;
+		// The slide sections of the document, in slide order.
+		sections: Array<{
+			name: string;
+			id?: string;
+			startIndex: number;
+			slideCount: number;
+		}> | null;
+		// Canvas-space preview rectangles, twips.
+		previewRects: Array<{ part: number; rectangle: any }> | null;
+		previewEditMode: {
+			active: boolean;
+			part: number;
+			// The entered preview's canvas rectangle, twips.
+			rectangle: any;
+			// Slide size in twips, for building slide-space rectangles.
+			slideWidth: number;
+			slideHeight: number;
+		};
+		// Canvas-space rectangle of the preview-selected shape.
+		previewShapeSelection: any;
+		// Part whose preview is the current graphic selection on the overview page, or -1.
+		selectedPreviewPart: number;
+	};
+	writer: {
+		compareDocumentProperties: CompareDocumentProperties | null;
+		compareDocumentOldFileName: string | null;
+		savedViewMode: string | null; // 'multipage' | 'normal' | null
+	};
+	Evented: typeof Evented;
+	Log: Logger;
+	DebugManager: typeof DebugManager;
+	dispatcher: any;
+	layoutingService: any;
+	serverConnectionService: any;
+	timerRegistry: any;
+	twipsToPixels: number;
+	pixelsToTwips: number;
+	accessibilityState: boolean;
+	UI: {
+		language: {
+			fromURL: string;
+			fromBrowser: string;
+			notebookbarAccessibility: any;
+		};
+		notebookbarAccessibility: any;
+		compactViewAccessibility: any;
+		horizontalRuler: HRuler | null;
+		verticalRuler: VRuler | null;
+	};
+	colorPalettes: any; // TODO declare according to Widget.ColorPicker.ts
+	colorNames: any; // TODO declare according to Widget.ColorPicker.ts
+	console: Console;
+	map: MapInterface; // TODO should be window.L.Map
+	// file defined in: src/docstate.ts
+	file: {
+		editComment: boolean;
+		allowManageRedlines: boolean;
+		readOnly: boolean;
+		modified: boolean;
+		permission: string;
+		viewModeExtensions: string;
+		isHybridPDF: boolean;
+		masterDocument: boolean;
+		disableSidebar: boolean;
+		inputSequence: number;
+		textCursor: {
+			visible: boolean;
+			rectangle: null | cool.SimpleRectangle;
+			// The caret's paragraph and character index, or null before a
+			// cursor message carries them.
+			logical: null | cool.LogicalCaret;
+			// The other end of the selected text, in the same terms, or null
+			// when no text is selected.
+			anchor?: null | cool.LogicalCaret;
+			// The id of the text frame or the drawing object whose text holds
+			// the caret, or null when the cursor message names none.
+			object?: null | number;
+		};
+		fileBasedView: boolean;
+		writer: {
+			pageRectangleList: Array<any>;
+			pageIds: string[];
+		};
+	};
+	roundedDpiScale: number;
+	following: {
+		mode: string;
+		viewId: number;
+	};
+	tile: {
+		size: null | cool.SimplePoint;
+		/// The tiles held in the browser.
+		count(): number;
+	};
+	exportFormats: Array<ExportFormat>;
+	getExportFormats: (docType: string) => Array<ExportFormat>;
+	initExportFormats: (docType: string) => void;
+	updateExportFormatsVisibility: () => void;
+	isExportEntryVisible: (id: string) => boolean;
+	languages: Array<{ translated: string; neutral: string; iso: string }>;
+	// The sentence checking rule packages the engine reports as installed.
+	sentenceCheckingPackages?: Array<{ id: string; locale: string }>;
+	// The remote sentence checkers as the engine has them set up.
+	remoteGrammarCheckers?: RemoteCheckerInfo[];
+	// The translation providers as the engine runs them, for the settings dialog.
+	translationProviders?: TranslationProvidersInfo | null;
+	// Whether this document is running with this user's own document
+	// settings. It is running with whoever opened it first's.
+	userPresetsApplied?: boolean;
+	// Whether a document settings change made now would be felt in this
+	// document, rather than waiting for the next one to be opened.
+	documentSettingsLive?: boolean;
+	favouriteLanguages: Array<string>;
+	tableStyles: TableStylesService;
+	tableStyleGallery: TableStyleGalleryService;
+	onboardingTour: OnboardingTourController | null;
+	colorLastSelection: any;
+	serverAudit: any;
+	remoteLinks: Array<{
+		name?: string;
+		state: string;
+		error?: string;
+		lastModifiedTime?: string;
+		persistentLink: string;
+		access?: string;
+	}>;
+	// One-time token authorizing this view to call a POST to /cool/links
+	linkToken: string;
+	events: DocEvents;
+	showNavigator: boolean;
+
+	// Below are only used for Cypress tests
+	allDialogs?: string[];
+	a11yValidator?: A11yValidator;
+	A11yValidatorException?: typeof A11yValidatorException;
+	serverInfo: ServerInfo;
+	[key: string]: any; // other properties as needed
+}
+
+// Add the app declaration
+declare const app: AppInterface;
+
+// Extend the global Document interface
+interface Document {
+	mozFullscreenElement: Element | null;
+	msFullscreenElement: Element | null;
+	webkitFullscreenElement: Element | null;
+}
+
+// Extend the global Element interface with checkVisibility, which the DOM
+// types of the TypeScript release in use do not declare yet. It answers
+// whether the element is rendered, so a display: none ancestor makes it false.
+// Every option defaults to false, so visibility: hidden and a skipped
+// content-visibility subtree only count as invisible when asked for.
+interface CheckVisibilityOptions {
+	contentVisibilityAuto?: boolean;
+	opacityProperty?: boolean;
+	visibilityProperty?: boolean;
+}
+
+interface Element {
+	checkVisibility(options?: CheckVisibilityOptions): boolean;
+}
+
+// Extend StringConstructor
+interface StringConstructor {
+	locale: string; // from cool-src.js
+}
+
+// Common interface of all types of sockets created by createWebSocket().
+interface SockInterface {
+	onclose: (event: CloseEvent) => void;
+	onerror: (event: Event) => void;
+	onmessage: (event: MessageEvent) => void;
+	onopen: (event: Event) => void;
+	close: (code?: number, reason?: string) => void;
+	send: (data: MessageInterface) => void;
+	setUnloading?: () => void;
+
+	readyState: 0 | 1 | 2 | 3;
+	binaryType: 'blob' | 'arraybuffer';
+}
+
+interface ServerInfo {
+	coolwsdVersion: string;
+	coolwsdHash: string;
+	serverId: string;
+	osInfo: string;
+	wsdOptions: any;
+}
+
+interface ErrorMessages {
+	diskfull: string;
+	emptyhosturl: string;
+	limitreached: string;
+	infoandsupport: string;
+	limitreachedprod: string;
+	serviceunavailable: string;
+	unauthorized: string;
+	accessrevoked: string;
+	accessdowngraded: string;
+	verificationerror: string;
+	wrongwopisrc: string;
+	sessionexpiry: string;
+	sessionexpired: string;
+	faileddocloading: string;
+	invalidLink: string;
+	leaving: string;
+	docloadtimeout: string;
+	docunloadingretry: string;
+	docunloadinggiveup: string;
+	clusterconfiguration: string;
+	websocketproxyfailure: string;
+	websocketgenericfailure: string;
+
+	storage: {
+		loadfailed: string;
+		savediskfull: string;
+		savetoolarge: string;
+		saveunauthorized: string;
+		savefailed: string;
+		saveprecondition: string;
+		renamefailed: string;
+		saveasfailed?: string;
+	};
+
+	uploadfile: {
+		notfound: string;
+		toolarge: string;
+	};
+}
+
+interface PluralParseRule {
+	nplurals: number;
+	select: (n: number) => number;
+}
+
+// Accessibility validator interface for Cypress tests
+interface A11yValidator {
+	checkWidget(type: string, element: HTMLElement): void;
+}
+
+// Extend the global Window interface
+// Defined in: js/global.js
+interface Window {
+	// app defined in: js/bundle.js
+	app: AppInterface;
+	// The real window.open, stashed before the mobile/desktop app redirects
+	// window.open to its own handler. Used to open real slideshow and
+	// presenter console windows. Defined in js/global.js.
+	origOpen?: typeof window.open;
+	// coolParams defined in: js/global.js
+	coolParams: {
+		p: URLSearchParams;
+
+		get(name: string): string;
+	};
+	mode: {
+		isSmallScreenDevice(): boolean;
+		isDesktop(): boolean;
+		isTablet(): boolean;
+		isCODesktop(): boolean;
+		isChromebook(): boolean;
+		isInteractivePreview(): boolean;
+		getDeviceFormFactor(): string;
+	};
+	prefs: {
+		useBrowserSetting: boolean;
+		getBoolean(key: string, defaultValue?: boolean): boolean;
+		getNumber(key: string, defaultValue?: number): number;
+		get(key: string, defaultValue?: any): any;
+		_initializeBrowserSetting(msg: string): void;
+		set(key: string, value: any): void;
+		remove(key: string): void;
+		setMultiple(prefs: Record<string, string>): void;
+		sendPendingBrowserSettingsUpdate(): void;
+		recordStoredBrowserSettings(settings: Record<string, string>): void;
+		canPersist: boolean;
+		prefersDarkOS(): boolean;
+		hasExplicitDarkModePref(): boolean;
+		seedDarkModeDefault(): boolean;
+		spellOnlineForLoad(): string;
+	};
+	KeyboardShortcuts: KeyboardShortcuts;
+
+	PluralForms: {
+		parseRule: (header: string) => null | PluralParseRule;
+		defaultRule: PluralParseRule;
+	};
+	_n: (singular: string, plural: string, count: number) => string;
+
+	// The theme and the document background the load message carried.
+	themeSentWithLoad?: { theme: boolean; background: boolean };
+
+	starterScreen: boolean;
+	aiEthicalRatingMessage: boolean;
+	showAISidebar: boolean;
+	showAINotebookbar: boolean;
+	allowUpdateNotification: boolean;
+	autoShowWelcome: boolean;
+	bundlejsLoaded: boolean;
+	canvasSlideshowEnabled: boolean;
+	remoteLinksEnabled: boolean;
+	translationEnabled: boolean;
+	documentSigningEnabled: boolean;
+	deviceFormFactor?: string;
+	enableAccessibility: boolean;
+	enableExperimentalFeatures: boolean;
+	// True when jsdialogs in the Qt shell render as their own native
+	// windows. Left unset in the application, so the value is false.
+	enablePopoutDialogs?: boolean;
+	enableDebug: boolean;
+	simulateError: (name: string) => boolean;
+	enableMacrosExecution: boolean;
+	hideLegacyScriptWarning: boolean;
+	enableWelcomeMessage: boolean;
+	expectedServerId: string;
+	extraExportFormats: string[];
+	fullyLoadedAndReady: boolean;
+	imgDatas: string[];
+	indirectSocket: boolean;
+	migrating: boolean;
+	mobileMenuWizard: boolean;
+	pageMobileWizard: boolean;
+	protocolDebug: boolean;
+	routeToken: string;
+	// The latest token from the server's 'reconnecttoken:' message. Defined in
+	// js/global.js.
+	reconnectToken: string;
+	mobileDialogId?: number;
+	savedUIState: boolean;
+	sidebarId: number;
+	userInterfaceMode: string;
+	ThisIsAnApp: boolean;
+	ThisIsTheAndroidApp: boolean;
+	ThisIsTheEmscriptenApp: boolean;
+	ThisIsTheiOSApp: boolean;
+	ThisIsTheMacOSApp: boolean;
+	ThisIsTheQtApp: boolean;
+	ThisIsTheWindowsApp: boolean;
+	codaRemotePage?: object;
+	// The file properties of a remote document, from /co/collab.
+	codaRemoteFileInfo?: object;
+	wopiSrc: string;
+	zoteroEnabled: boolean;
+	accessToken: string;
+	accessTokenTTL: string;
+	wopiSettingBaseUrl: string;
+	socketProxy: boolean;
+	langParam: string;
+	logoURL?: string;
+	accessibilityStatementUrl: string;
+	MobileAppName: string;
+	wopiHostId: string;
+	vendor: string;
+	copyrightYear: string;
+	WOPIPostmessageReady: boolean;
+	coolPreview: boolean;
+
+	socket: SockInterface;
+	errorMessages: ErrorMessages;
+	queueMsg: MessageInterface[];
+
+	makeWopiCoolWsUrl(path: string, docUrlParams: string): string;
+	makeWsUrlWopiSrc(
+		path: string,
+		docUrlParams: string,
+		suffix?: string,
+		wopiSrcParam?: string,
+	): string;
+	createShapesPanel(shapeType: string): HTMLDivElement;
+	initializedUI?: () => void; // initializedUI is an optional function, potentially defined in branding
+	setupToolbar(map: any): void; // TODO should be L.Map
+	makeWsUrl: (url: string) => string;
+	makeHttpUrl: (path: string) => string;
+	getBorderStyleUNOCommand: (
+		a: number,
+		b: number,
+		c: number,
+		d: number,
+		e: number,
+		f: number,
+		g: number,
+	) => string;
+	getUNOCommand: (unoData: UnoCommand) => string;
+	getColorPickerData: (type: string) => any;
+	getConditionalFormatMenuElements: (
+		more: string,
+		dropdown: boolean,
+	) => HTMLElement;
+	getConditionalColorScaleMenuElements: (
+		more: string,
+		dropdown: boolean,
+	) => HTMLElement;
+	getConditionalDataBarMenuElements: (
+		more: string,
+		dropdown: boolean,
+	) => HTMLElement;
+	getConnectorsPopupElements: (
+		callback: EventListenerOrEventListenerObject,
+	) => HTMLElement;
+	getLinesPopupElements: (
+		callback: EventListenerOrEventListenerObject,
+	) => HTMLElement;
+	getCurvesPopupElements: (
+		callback: EventListenerOrEventListenerObject,
+	) => HTMLElement;
+	getInsertTablePopupElements: (
+		callback: EventListenerOrEventListenerObject,
+	) => HTMLElement;
+	getShapesPopupElements: (
+		callback: EventListenerOrEventListenerObject,
+	) => HTMLElement;
+	editorUpdate: (e: Event) => void;
+	unoCmdToToolbarId: (name: string) => string;
+	L: any;
+	createWebSocket(url: string): SockInterface;
+	seedCypressAccessibilityState(): void;
+	getAccessibilityState(): boolean;
+	getFocusRingColor(): string;
+	makeClientVisibleArea(): string;
+	postMobileDebug(msg: string): void;
+
+	removeAccessKey(text: string): string;
+	contextMenuWizard: boolean;
+
+	RenderManager: typeof RenderManager;
+	TextSelections: typeof TextSelections;
+}
+
+// For localization
+declare function _(text: string): string;
+// Picks the plural form the language asks for and puts count in place of %n.
+declare function _n(singular: string, plural: string, count: number): string;

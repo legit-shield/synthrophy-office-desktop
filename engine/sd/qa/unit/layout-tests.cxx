@@ -1,0 +1,899 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <sal/config.h>
+
+#include <config_vclplug.h>
+
+#include "sdmodeltestbase.hxx"
+
+#include <comphelper/kit.hxx>
+#include <rtl/character.hxx>
+#include <sfx2/objsh.hxx>
+#include <sfx2/sfxbasemodel.hxx>
+#include <svx/compatflags.hxx>
+
+#include <drawdoc.hxx>
+#include <unomodel.hxx>
+
+#include <com/sun/star/beans/XPropertySet.hpp>
+#include <com/sun/star/drawing/XDrawPage.hpp>
+#include <com/sun/star/drawing/XDrawPages.hpp>
+#include <com/sun/star/drawing/XDrawPagesSupplier.hpp>
+#include <com/sun/star/drawing/XShape.hpp>
+#include <com/sun/star/lang/XMultiServiceFactory.hpp>
+#include <com/sun/star/text/XText.hpp>
+#include <com/sun/star/text/XTextContent.hpp>
+
+class SdLayoutTest : public SdModelTestBase
+{
+public:
+    SdLayoutTest()
+        : SdModelTestBase(u"/sd/qa/unit/data/"_ustr)
+    {
+    }
+
+    SdDrawDocument* getDoc()
+    {
+        auto* pImpress = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+        CPPUNIT_ASSERT(pImpress);
+        auto* pDoc = pImpress->GetDoc();
+        CPPUNIT_ASSERT(pDoc);
+        return pDoc;
+    }
+
+    // Item texts ("A1", "B2", ...) of the layout, each with the label drawn before it
+    OUString getNumberedItems()
+    {
+        xmlDocUniquePtr pXmlDoc = parseLayout();
+        OUStringBuffer aItems;
+        OUString aLabel;
+        const int nCount = countXPathNodes(pXmlDoc, "//textarray");
+        for (int i = 1; i <= nCount; ++i)
+        {
+            const OUString aText
+                = getXPathContent(pXmlDoc, "(//textarray)[" + OString::number(i) + "]/text");
+            if (aText.endsWith("."))
+                aLabel = aText;
+            else if (aText.getLength() == 2 && rtl::isAsciiDigit(aText[1]))
+            {
+                aItems.append(aLabel + aText + " ");
+                aLabel.clear();
+            }
+        }
+        return aItems.makeStringAndClear();
+    }
+};
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf104722)
+{
+    createSdImpressDoc("pptx/tdf104722.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Without the fix in place, this would have failed with
+    // - Expected: 2093
+    // - Actual  : -10276
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]", "x", u"2093");
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]", "y", u"9056");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf135843)
+{
+    createSdImpressDoc("pptx/tdf135843.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Without the fix, the test fails with:
+    // - Expected: 21167
+    // - Actual  : 4218
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[5]/polyline[1]/point[1]", "x", u"21167");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[5]/polyline[1]/point[1]", "y", u"3866");
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[5]/polyline[1]/point[2]", "x", u"21167");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[5]/polyline[1]/point[2]", "y", u"5956");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf146876)
+{
+    createSdImpressDoc("odp/tdf146876.odp");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Check the shape is inside the (5000,8500) - (11500,12500) area
+    for (size_t i = 2; i < 4; ++i)
+    {
+        for (size_t j = 1; j < 6; ++j)
+        {
+            const OString xPath = "/metafile/push[1]/push[1]/push[" + OString::number(i)
+                                  + "]/polyline/point[" + OString::number(j) + "]";
+            const sal_Int32 nX = getXPath(pXmlDoc, xPath, "x").toInt32();
+            const sal_Int32 nY = getXPath(pXmlDoc, xPath, "y").toInt32();
+
+            // Without the fix in place, this test would have failed with
+            // - Expected greater or equal than: 5000
+            // - Actual  : 0
+            CPPUNIT_ASSERT_GREATEREQUAL(sal_Int32(5000), nX);
+            CPPUNIT_ASSERT_LESSEQUAL(sal_Int32(11500), nX);
+
+            CPPUNIT_ASSERT_GREATEREQUAL(sal_Int32(8500), nY);
+            CPPUNIT_ASSERT_LESSEQUAL(sal_Int32(12500), nY);
+        }
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf136949)
+{
+    createSdImpressDoc("odp/tdf136949.odp");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Without the fix in place, this test would have failed with
+    // - Expected: 13687
+    // - Actual  : 2832
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[7]/polyline/point[1]", "x", u"13687");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[7]/polyline/point[2]", "x", u"24759");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf128212)
+{
+    createSdImpressDoc("pptx/tdf128212.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // The position of the rotated text depends on the calculated text size. This depends on
+    // rendering, so it differs a bit on different platforms. Hence rather big delta here.
+
+    if (comphelper::COKit::isActive())
+    {
+        // The Kit scales the font instead of the map mode, so the translation is in the text
+        // position, and the two deltas add up
+        assertXPath(pXmlDoc, "//push[@flags='PushMapMode']", 0);
+        assertXPathDoubleValue(pXmlDoc, "//textarray", "x", 331.0 + 4760.0, 6.0);
+        assertXPathDoubleValue(pXmlDoc, "//textarray", "y", 9420.0 - 2250.0, 13.0);
+        return;
+    }
+
+    // translation
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']", 1);
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "mapunit", u"MapRelative");
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "x", 372.0, 3.0);
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "y", 9370.0, 16.0);
+    // no scaling
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "scalex", u"(1/1)");
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "scaley", u"(1/1)");
+
+    // text position
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/textarray", "x", 4717.0, 3.0);
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/textarray", "y", -2250.0, 3.0);
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testColumnsLayout)
+{
+    // This tests a 2-column text box's layout
+
+    const OUString sText[] = {
+        u"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vestibulum consequat mi quis "
+        "pretium semper. Proin luctus orci ac neque venenatis, quis commodo dolor posuere. "
+        "Curabitur dignissim sapien quis cursus egestas. Donec blandit auctor arcu, nec "
+        "pellentesque eros molestie eget. In consectetur aliquam hendrerit. Sed cursus mauris "
+        "vitae ligula pellentesque, non pellentesque urna aliquet. Fusce placerat mauris enim, "
+        "nec rutrum purus semper vel. Praesent tincidunt neque eu pellentesque pharetra. Fusce "
+        "pellentesque est orci."_ustr,
+        u"Integer sodales tincidunt tristique. Sed a metus posuere, adipiscing nunc et, viverra "
+        "odio. Donec auctor molestie sem, sit amet tristique lectus hendrerit sed. Cras sodales "
+        "nisl sed orci mattis iaculis. Nunc eget dolor accumsan, pharetra risus a, vestibulum "
+        "mauris. Nunc vulputate lobortis mollis. Vivamus nec tellus faucibus, tempor magna nec, "
+        "facilisis felis. Donec commodo enim a vehicula pellentesque. Nullam vehicula vestibulum "
+        "est vel ultricies."_ustr,
+        u"Aliquam velit massa, laoreet vel leo nec, volutpat facilisis eros. Donec consequat arcu "
+        "ut diam tempor luctus. Cum sociis natoque penatibus et magnis dis parturient montes, "
+        "nascetur ridiculus mus. Praesent vitae lacus vel leo sodales pharetra a a nibh. "
+        "Vestibulum ante ipsum primis in faucibus orci luctus et ultrices posuere cubilia Curae; "
+        "Nam luctus tempus nibh, fringilla dictum augue consectetur eget. Curabitur at ante sit "
+        "amet tortor pharetra molestie eu nec ante. Mauris tincidunt, nibh eu sollicitudin "
+        "molestie, dolor sapien congue tortor, a pulvinar sapien turpis sed ante. Donec nec est "
+        "elementum, euismod nulla in, mollis nunc."_ustr
+    };
+
+    // sentence#, index, length, x, y
+    const std::tuple<int, int, int, int, int> strings[] = {
+        // Column 1
+        { 0, 0, 40, 3750, 3190 },
+        { 0, 40, 41, 3750, 3584 },
+        { 0, 81, 39, 3750, 3978 },
+        { 0, 120, 33, 3750, 4372 },
+        { 0, 153, 35, 3750, 4766 },
+        { 0, 188, 34, 3750, 5160 },
+        { 0, 222, 38, 3750, 5554 },
+        { 0, 260, 35, 3750, 5948 },
+        { 0, 295, 37, 3750, 6342 },
+        { 0, 332, 31, 3750, 6736 },
+        { 0, 363, 33, 3750, 7130 },
+        { 0, 396, 39, 3750, 7524 },
+        { 0, 435, 37, 3750, 7918 },
+        { 0, 472, 32, 3750, 8312 },
+        { 0, 504, 22, 3750, 8706 },
+        { 1, 0, 43, 3750, 9100 },
+        { 1, 43, 35, 3750, 9494 },
+        { 1, 78, 36, 3750, 9888 },
+        { 1, 114, 41, 3750, 10282 },
+        { 1, 155, 39, 3750, 10676 },
+        { 1, 194, 35, 3750, 11070 },
+        { 1, 229, 37, 3750, 11464 },
+        { 1, 266, 40, 3750, 11858 },
+        { 1, 306, 39, 3750, 12252 },
+        { 1, 345, 38, 3750, 12646 },
+        { 1, 383, 39, 3750, 13040 },
+        { 1, 422, 29, 3750, 13434 },
+        { 2, 0, 42, 3750, 13828 },
+        { 2, 42, 41, 3750, 14222 },
+        { 2, 83, 39, 3750, 14616 },
+        { 2, 122, 32, 3750, 15010 },
+        { 2, 154, 38, 3750, 15404 },
+        { 2, 192, 34, 3750, 15798 },
+        { 2, 226, 38, 3750, 16192 },
+        // Column 2
+        { 2, 264, 42, 10725, 3190 },
+        { 2, 306, 39, 10725, 3584 },
+        { 2, 345, 37, 10725, 3978 },
+        { 2, 382, 37, 10725, 4372 },
+        { 2, 419, 42, 10725, 4766 },
+        { 2, 461, 36, 10725, 5160 },
+        { 2, 497, 36, 10725, 5554 },
+        { 2, 533, 40, 10725, 5948 },
+        { 2, 573, 35, 10725, 6342 },
+        { 2, 608, 30, 10725, 6736 },
+    };
+
+    createSdDrawDoc("odg/two_columns.odg");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    for (size_t i = 0; i < SAL_N_ELEMENTS(strings); ++i)
+    {
+        const auto & [ sentence, index, length, x, y ] = strings[i];
+        OString sXPath = "/metafile/push[1]/push[1]/textarray[" + OString::number(i + 1) + "]";
+        assertXPathContent(pXmlDoc, sXPath + "/text", sText[sentence]);
+        assertXPath(pXmlDoc, sXPath, "index", OUString::number(index));
+        assertXPath(pXmlDoc, sXPath, "length", OUString::number(length));
+        assertXPath(pXmlDoc, sXPath, "x", OUString::number(x));
+        assertXPath(pXmlDoc, sXPath, "y", OUString::number(y));
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, tdf143258_testTbRlLayout)
+{
+    // This tests a 1-column and a 2-column text boxes' layout
+
+    const OUString sText[] = {
+        u"tb-rl text within a small text box"_ustr, // Box 1
+        u"tb-rl text within a small 2-column text box"_ustr, // Box 2
+    };
+
+    // sentence#, index, length, x, y
+    const std::tuple<int, int, int, int, int> strings[] = {
+        // Box 1
+        { 0, 0, 11, 5351, 3250 },
+        { 0, 11, 9, 4642, 3250 },
+        { 0, 20, 6, 3933, 3250 },
+        { 0, 26, 8, 3224, 3250 },
+        // Box 2 column 1
+        { 1, 0, 6, 5351, 7250 },
+        { 1, 6, 5, 4642, 7250 },
+        { 1, 11, 7, 3933, 7250 },
+        { 1, 18, 8, 3224, 7250 },
+        // Box 2 column 2
+        { 1, 26, 2, 5351, 9600 },
+        { 1, 28, 7, 4642, 9600 },
+        { 1, 35, 5, 3933, 9600 },
+        { 1, 40, 3, 3224, 9600 },
+    };
+
+    createSdDrawDoc("odg/tb-rl-textbox.odg");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/font", SAL_N_ELEMENTS(strings));
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray", SAL_N_ELEMENTS(strings));
+    for (size_t i = 0; i < SAL_N_ELEMENTS(strings); ++i)
+    {
+        const auto & [ sentence, index, length, x, y ] = strings[i];
+        OString sXPath = "/metafile/push[1]/push[1]/font[" + OString::number(i + 1) + "]";
+        assertXPath(pXmlDoc, sXPath, "orientation", u"-900");
+        assertXPath(pXmlDoc, sXPath, "vertical", u"true");
+        sXPath = "/metafile/push[1]/push[1]/textarray[" + OString::number(i + 1) + "]";
+        assertXPathContent(pXmlDoc, sXPath + "/text", sText[sentence]);
+        assertXPath(pXmlDoc, sXPath, "index", OUString::number(index));
+        assertXPath(pXmlDoc, sXPath, "length", OUString::number(length));
+
+        assertXPath(pXmlDoc, sXPath, "x", OUString::number(x));
+        assertXPath(pXmlDoc, sXPath, "y", OUString::number(y));
+    }
+}
+
+// A test that tests some parts of numbered list behaviour
+// it's really the numbering we're interested in here
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, numberedList)
+{
+    const OUString sText[] = {
+        u"1."_ustr,
+        u"Outer, one"_ustr,
+        u"2."_ustr,
+        u"Outer, two"_ustr,
+        u"a."_ustr,
+        u"Second level, a"_ustr,
+        u"b."_ustr,
+        u"Second level, b"_ustr,
+        u"Blank second level"_ustr,
+        u"a."_ustr,
+        u"Second level restart, a"_ustr,
+        u"b."_ustr,
+        u"Second level restart, b"_ustr,
+        u"3."_ustr,
+        u"Outer, three"_ustr,
+        u"4."_ustr,
+        u"Outer, four"_ustr,
+    };
+
+    createSdImpressDoc("pptx/NumberedList-12ab-ab-34.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+    const OString sXPathBase = "/metafile/push[1]/push[1]/textarray["_ostr;
+
+    for (size_t i = 0; i < std::size(sText); i++)
+    {
+        assertXPathContent(pXmlDoc, sXPathBase + OString::number(i + 1) + "]/text", sText[i]);
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf173712)
+{
+    // Sixteen text boxes with numbered lists; the expected numbers are those PowerPoint shows
+    createSdImpressDoc("pptx/tdf173712.pptx");
+
+    // Without the fix in place, e.g. every item of A (startAt="2" on each) was numbered "2."
+    CPPUNIT_ASSERT_EQUAL(
+        u"2.A1 3.A2 4.A3 5.A4 " // startAt="2" on every item
+        "1.B1 2.B2 5.B3 6.B4 " // no startAt, then startAt="5"
+        "2.C1 3.C2 4.C3 5.C4 " // startAt="2", then startAt="4"
+        "1.D1 2.D2 3.D3 4.D4 " // no startAt, then startAt="1"
+        "2.E1 3.E2 E3 2.E4 3.E5 " // plain paragraph between
+        "2.F1 3.F2 F3 2.F4 3.F5 " // buNone paragraph between
+        "1.G1 2.G2 I.G3 II.G4 " // arabicPeriod, then romanUcPeriod
+        "3.H1 4.H2 a.H3 b.H4 5.H5 a.H6 6.H7 " // nested, outer startAt="3"
+        "1.I1 2.I2 3.I3 2.I4 2.I5 3.I6 " // nested, inner startAt="2"
+        "2.J1 3.J2 J3 4.J4 5.J5 " // unnumbered lvl="1" paragraph between
+        "1.K1 a.K2 b.K3 K4 a.K5 2.K6 " // unnumbered paragraph inside the inner list
+        "2.L1 2.L2 3.L3 2.L4 3.L5 " // startAt="2" on both levels
+        "2.M1 3.M2 M3 2.M4 3.M5 " // paragraph without a:pPr between
+        "2.N1 3.N2 1.N3 2.N4 " // startAt="2", then no startAt
+        "5.O1 6.O2 2.O3 3.O4 " // startAt="5", then startAt="2"
+        "1.R1 2.R2 R3 1.R4 2.R5 "_ustr, // paragraph without a:pPr, no startAt
+        getNumberedItems());
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf173712_listStyle)
+{
+    // a:lstStyle has <a:buAutoNum type="arabicPeriod" startAt="2"/> for level 1, but no startAt in Z
+    createSdImpressDoc("pptx/tdf173712-liststyle.pptx");
+
+    // Without the fix in place, every item was numbered "2."
+    CPPUNIT_ASSERT_EQUAL(
+        u"2.U1 3.U2 4.U3 5.U4 " // no a:pPr
+        "2.V1 3.V2 4.V3 5.V4 " // a:pPr without a bullet
+        "2.W1 3.W2 4.W3 5.W4 " // own buAutoNum with startAt="2" too
+        "2.Y1 3.Y2 4.Y3 5.Y4 " // from the list style, own, own, from the list style
+        "1.Z1 2.Z2 Z3 1.Z4 2.Z5 "_ustr, // no startAt, buNone paragraph between
+        getNumberedItems());
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf146731)
+{
+    createSdImpressDoc("pptx/tdf146731.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[3]/polyline[1]", "width", u"187");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[4]/polyline[1]", "width", u"187");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[5]/polyline[1]", "width", u"187");
+
+    // Without the fix in place, this test would have failed with
+    // - Expected: 30
+    // - Actual  : 187
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[6]/polyline[1]", "width", u"30");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[7]/polyline[1]", "width", u"187");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf135843_InsideHBorders)
+{
+    createSdImpressDoc("pptx/tdf135843_insideH.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Without the fix, the test fails with:
+    //- Expected: 34
+    //- Actual  : 36
+    // We shouldn't see two vertical borders inside the table on ui.
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push", 34);
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testBnc480256)
+{
+    createSdImpressDoc("pptx/bnc480256-2.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Without the fix, the test fails with:
+    //- Expected: #ff0000
+    //- Actual  : #ffffff
+    // We should see the red vertical border inside the table.
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[8]/linecolor[1]", "color", u"#ff0000");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testFitToFrameTextFitting)
+{
+    // This test checks that the text fitting is working correctly when
+    // the textbox is set to "fit to frame" by stretching the text to or
+    // near the textbox boundary. The problem is especially complicated
+    // when the font size is set to a higher number (like 999)
+    //
+    // The text fitting behaviour when "fit by frame" is enabled is to
+    // always fit the text into the text box (without forcing the text
+    // into new line) by shrinking or expanding the text horizontally
+    // and vertically.
+
+    createSdDrawDoc("odg/FitToFrameText.odg");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]", "x", u"0");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]", "y", u"400");
+#if !defined _WIN32 || USE_HEADLESS_CODE // FIXME: Windows seems to differ in text layouting
+    assertXPathDoubleValue(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]/dxarray", "first",
+                           114.087, 0.001);
+    assertXPathDoubleValue(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]/dxarray", "last",
+                           6983.573, 0.001);
+#else
+    assertXPathDoubleValue(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]/dxarray", "first",
+                           113.64, 0.001);
+    assertXPathDoubleValue(pXmlDoc, "/metafile/push[1]/push[1]/textarray[1]/dxarray", "last",
+                           6956.219, 0.001);
+#endif
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf156955)
+{
+    createSdImpressDoc("odp/tdf156955.odp");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Make sure text box has the right size - without the fix it was 2759.
+    assertXPath(pXmlDoc, "/metafile/push/push/textarray[3]", "y", u"3183");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf148966)
+{
+    // In an ODF document from an older version, a link without coext:wrap-as-text keeps the field
+    // wrapping.
+    {
+        // OOXML: the link wraps like ordinary text.
+        createSdImpressDoc("pptx/tdf148966.pptx");
+        xmlDocUniquePtr pXmlDoc = parseLayout();
+        // The text sits higher than in the ODF documents, which keep the extra line height below
+        // the baseline.
+        assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"6218");
+    }
+    {
+        // Field layout; the flag drops the line break after the link.
+        createSdImpressDoc("odp/tdf148966-withflag.odp");
+        xmlDocUniquePtr pXmlDoc = parseLayout();
+        assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"6262");
+    }
+    {
+        // Field layout: the line break after the link makes an empty row.
+        createSdImpressDoc("odp/tdf148966-withoutflag.odp");
+        xmlDocUniquePtr pXmlDoc = parseLayout();
+        assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"8124");
+    }
+    {
+        // The same document with coext:wrap-as-text="true" on the link.
+        createSdImpressDoc("odp/tdf148966-wrap-as-text.odp");
+        xmlDocUniquePtr pXmlDoc = parseLayout();
+        assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"6262");
+    }
+    {
+        // The same document with LegacyHyperlinksWraps off in its settings.
+        createSdImpressDoc("odp/tdf148966-hyperlinks-as-text.odp");
+        xmlDocUniquePtr pXmlDoc = parseLayout();
+        assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"6262");
+    }
+    {
+        // LegacyHyperlinksWraps off, and coext:wrap-as-text="false" on the link.
+        createSdImpressDoc("odp/tdf148966-legacy-link.odp");
+        xmlDocUniquePtr pXmlDoc = parseLayout();
+        assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"8124");
+    }
+}
+
+namespace
+{
+constexpr OString aLegacyHyperlinksWrapsPath
+    = "/office:document-settings/office:settings/"
+      "config:config-item-set[@config:name='ooo:configuration-settings']/"
+      "config:config-item[@config:name='LegacyHyperlinksWraps']"_ostr;
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testHyperlinkWrapOldOdfSaved)
+{
+    // An old document keeps the field wrapping after a save and reload, and a link added to it
+    // wraps as text.
+    createSdImpressDoc("odp/tdf148966-withoutflag.odp");
+
+    // Add the link on a new second slide, so the first slide keeps its layout.
+    cpo::uno::Reference<css::drawing::XDrawPagesSupplier> xPagesSupplier(
+        mxComponent, cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::drawing::XDrawPage> xPage
+        = xPagesSupplier->getDrawPages()->insertNewByIndex(0);
+    cpo::uno::Reference<css::lang::XMultiServiceFactory> xFactory(mxComponent,
+                                                                  cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::drawing::XShape> xShape(
+        xFactory->createInstance(u"com.sun.star.drawing.TextShape"_ustr),
+        cpo::uno::UNO_QUERY_THROW);
+    xPage->add(xShape);
+    cpo::uno::Reference<css::text::XText> xText(xShape, cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::text::XTextContent> xField(
+        xFactory->createInstance(u"com.sun.star.text.TextField.URL"_ustr),
+        cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::beans::XPropertySet> xFieldProps(xField, cpo::uno::UNO_QUERY_THROW);
+    xFieldProps->setPropertyValue(u"URL"_ustr, cpo::uno::Any(u"https://example.com/"_ustr));
+    xFieldProps->setPropertyValue(u"Representation"_ustr, cpo::uno::Any(u"example"_ustr));
+    xText->insertTextContent(xText->getEnd(), xField, false);
+
+    saveAndReload(TestFilter::ODP);
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"8124");
+    xmlDocUniquePtr pSettings = parseExport(u"settings.xml"_ustr);
+    assertXPathContent(pSettings, aLegacyHyperlinksWrapsPath, u"true");
+    xmlDocUniquePtr pContent = parseExport(u"content.xml"_ustr);
+    assertXPath(pContent, "//text:a", 2);
+    assertXPath(pContent, "//text:a[not(@coext:wrap-as-text)]", 1);
+    assertXPath(pContent, "//text:a[@coext:wrap-as-text='true']", 1);
+
+    // The added link still wraps as text.
+    cpo::uno::Reference<css::beans::XPropertySet> xReloadedField(
+        getTextFieldFromPage(0, 0, 0, 1), cpo::uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT(!xReloadedField->getPropertyValue(u"LegacyWrap"_ustr).get<bool>());
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testHyperlinkWrapNewOdfSaved)
+{
+    // A new document keeps its layout after a save and reload. Only the legacy link has
+    // coext:wrap-as-text.
+    createSdImpressDoc("odp/tdf148966-hyperlinks-as-text.odp");
+    saveAndReload(TestFilter::ODP);
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"6262");
+    xmlDocUniquePtr pSettings = parseExport(u"settings.xml"_ustr);
+    assertXPathContent(pSettings, aLegacyHyperlinksWrapsPath, u"false");
+    xmlDocUniquePtr pContent = parseExport(u"content.xml"_ustr);
+    assertXPathNoAttribute(pContent, "//text:a", "wrap-as-text");
+
+    createSdImpressDoc("odp/tdf148966-legacy-link.odp");
+    saveAndReload(TestFilter::ODP);
+    pXmlDoc = parseLayout();
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"8124");
+    pSettings = parseExport(u"settings.xml"_ustr);
+    assertXPathContent(pSettings, aLegacyHyperlinksWrapsPath, u"false");
+    pContent = parseExport(u"content.xml"_ustr);
+    assertXPath(pContent, "//text:a", "wrap-as-text", u"false");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testHyperlinkWrapOoxmlSaved)
+{
+    // A link from OOXML wraps as text, also after a save to ODF and reload.
+    createSdImpressDoc("pptx/tdf148966.pptx");
+    saveAndReload(TestFilter::ODP);
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "y", u"6218");
+    xmlDocUniquePtr pSettings = parseExport(u"settings.xml"_ustr);
+    assertXPathContent(pSettings, aLegacyHyperlinksWrapsPath, u"false");
+    xmlDocUniquePtr pContent = parseExport(u"content.xml"_ustr);
+    assertXPathNoAttribute(pContent, "//text:a", "wrap-as-text");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTableVerticalText)
+{
+    createSdImpressDoc("pptx/tcPr-vert-roundtrip.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Without the accompanying fix, would fail with:
+    // - Expected: -900
+    // - Actual  : 0
+    // - In <>, attribute 'orientation' of '//font[1]' incorrect value.
+    // i.e. table cell text that was supposed to be vertical (rotated 90
+    // degrees) was not vertical.
+    assertXPath(pXmlDoc, "//font[1]", "orientation", u"-900");
+    assertXPath(pXmlDoc, "//font[2]", "orientation", u"900");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf112594)
+{
+    createSdImpressDoc("odp/Tdf112594.fodp");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Test that a NNBSP is grouped with the Mongolian characters after it, so
+    // we have two text arrays, one covering the digits, and the other with the rest.
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "index", u"0");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]", "length", u"2");
+    assertXPathContent(pXmlDoc, "/metafile/push[1]/push[1]/textarray[3]/text", u"11\u202f\u1824");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[4]", "index", u"2");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray[4]", "length", u"2");
+    assertXPathContent(pXmlDoc, "/metafile/push[1]/push[1]/textarray[4]/text", u"11\u202f\u1824");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf152906_AdjustToContour)
+{
+    // Test that the text adjusts to contour properly
+
+    static constexpr OUString sText
+        = u"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vestibulum consequat mi quis "
+          "pretium semper. Proin luctus orci ac neque venenatis, quis commodo dolor posuere. "
+          "Curabitur dignissim sapien quis cursus egestas. Donec blandit auctor arcu, nec "
+          "pellentesque eros molestie eget. In consectetur aliquam hendrerit. Sed cursus mauris "
+          "vitae ligula pellentesque, non pellentesque urna aliquet. Fusce placerat mauris enim, "
+          "nec rutrum purus semper vel. Praesent tincidunt neque eu pellentesque pharetra. Fusce "
+          "pellentesque est orci."_ustr;
+
+    // index, length, x, y
+    const std::tuple<int, int, int, int> strings[] = {
+        { 0, 6, 9600, 8639 }, //                        Lorem
+        { 6, 22, 7570, 9347 }, //               ipsum dolor sit amet,
+        { 28, 29, 6776, 10055 }, //         consectetur adipiscing elit.
+        { 57, 29, 6299, 10763 }, //         Vestibulum consequat mi quis
+        { 86, 37, 5453, 11471 }, //     pretium semper. Proin luctus orci ac
+        { 123, 36, 5134, 12179 }, //     neque venenatis, quis commodo dolor
+        { 159, 41, 4764, 12887 }, //  posuere. Curabitur dignissim sapien quis
+        { 200, 43, 4481, 13595 }, // cursus egestas. Donec blandit auctor arcu,
+        { 243, 40, 4975, 14303 }, //   nec pellentesque eros molestie eget. In
+        { 283, 42, 4552, 15011 }, //  consectetur aliquam hendrerit. Sed cursus
+        { 325, 38, 5363, 15719 }, //    mauris vitae ligula pellentesque, non
+        { 363, 42, 4693, 16427 }, //  pellentesque urna aliquet. Fusce placerat
+        { 405, 37, 5047, 17135 }, //    mauris enim, nec rutrum purus semper
+        { 442, 33, 5963, 17843 }, //      vel. Praesent tincidunt neque eu
+        { 475, 29, 6387, 18551 }, //        pellentesque pharetra. Fusce
+        { 504, 22, 7499, 19259 }, //           pellentesque est orci.
+    };
+
+    createSdDrawDoc("odg/adjust-to-contour.fodg");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/textarray", std::size(strings));
+    for (size_t i = 0; i < std::size(strings); ++i)
+    {
+        const auto & [ index, length, x, y ] = strings[i];
+        OString sXPath = "/metafile/push[1]/push[1]/textarray[" + OString::number(i + 1) + "]";
+        assertXPathContent(pXmlDoc, sXPath + "/text", sText);
+        assertXPath(pXmlDoc, sXPath, "index", OUString::number(index));
+        assertXPath(pXmlDoc, sXPath, "length", OUString::number(length));
+        assertXPath(pXmlDoc, sXPath, "x", OUString::number(x));
+        assertXPath(pXmlDoc, sXPath, "y", OUString::number(y));
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf164622)
+{
+    createSdImpressDoc("pptx/tdf164622.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    // Without the fix, the test fails with:
+    // - Expected: 8998
+    // - Actual  : 892
+    // - In <>, attribute 'y' of '/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[4]'
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[1]",
+                "x", u"7543");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[1]",
+                "y", u"879");
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[2]",
+                "x", u"20453");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[2]",
+                "y", u"879");
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[3]",
+                "x", u"20453");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[3]",
+                "y", u"8998");
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[4]",
+                "x", u"7543");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[4]",
+                "y", u"8998");
+
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[5]",
+                "x", u"7543");
+    assertXPath(pXmlDoc, "/metafile/push[1]/push[1]/push[2]/push[1]/clipregion/polygon/point[5]",
+                "y", u"879");
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf168010)
+{
+    // Test UseTrailingEmptyLinesInLayout compatibility option.
+    // The test documents have an auto-shrink text "textbox\n\n"; the box itself is positioned
+    // identically in all cases; the text is aligned to bottom.
+    // When "UseTrailingEmptyLinesInLayout" is set, "textbox" string is placed higher, than when
+    // the setting is not set (y value ~6700 vs. ~7978).
+
+    // The existing ODPs have a standard draw:text-box. It produces three textarray elements,
+    // in order from bottom to top. We need the topmost, third.
+
+    // 1. UseTrailingEmptyLinesInLayout must be enabled in an existing ODP with respective option
+    // in settings.xml
+    loadFromFile(u"odp/trailing-paragraphs-compat.odp");
+    {
+        CPPUNIT_ASSERT(
+            getDoc()->GetCompatibilityFlag(SdrCompatibilityFlag::UseTrailingEmptyLinesInLayout));
+
+        xmlDocUniquePtr pXml = parseLayout();
+        sal_Int32 y = getXPath(pXml, "/metafile['1']/push/push/textarray[3]", "y").toInt32();
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(6700, y, 100); // could be 6641 or 6760
+        assertXPathContent(pXml, "/metafile['1']/push/push/textarray[3]/text", u"textbox");
+    }
+
+    // 2. It must stay enabled after ODP round-trip
+    saveAndReload(TestFilter::ODP);
+    {
+        CPPUNIT_ASSERT(
+            getDoc()->GetCompatibilityFlag(SdrCompatibilityFlag::UseTrailingEmptyLinesInLayout));
+
+        xmlDocUniquePtr pXml = parseLayout();
+        sal_Int32 y = getXPath(pXml, "/metafile['2']/push/push/textarray[3]", "y").toInt32();
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(6700, y, 100);
+        assertXPathContent(pXml, "/metafile['2']/push/push/textarray[3]/text", u"textbox");
+    }
+
+    // 3. It must be disabled in an existing ODP without that option in settings.xml
+    loadFromFile(u"odp/trailing-paragraphs.odp");
+    {
+        CPPUNIT_ASSERT(
+            !getDoc()->GetCompatibilityFlag(SdrCompatibilityFlag::UseTrailingEmptyLinesInLayout));
+
+        xmlDocUniquePtr pXml = parseLayout();
+        sal_Int32 y = getXPath(pXml, "/metafile['3']/push/push/textarray[3]", "y").toInt32();
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(7978, y, 100);
+        assertXPathContent(pXml, "/metafile['3']/push/push/textarray[3]/text", u"textbox");
+    }
+
+    // 4. It must stay disabled after ODP round-trip
+    saveAndReload(TestFilter::ODP);
+    {
+        CPPUNIT_ASSERT(
+            !getDoc()->GetCompatibilityFlag(SdrCompatibilityFlag::UseTrailingEmptyLinesInLayout));
+
+        xmlDocUniquePtr pXml = parseLayout();
+        sal_Int32 y = getXPath(pXml, "/metafile['4']/push/push/textarray[3]", "y").toInt32();
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(7978, y, 100);
+        assertXPathContent(pXml, "/metafile['4']/push/push/textarray[3]/text", u"textbox");
+    }
+
+    // Now test PPTX and its round-trip. The text there imports as draw:custom-shape; it generates
+    // a single textarray element.
+
+    // 5. It must be enabled for PPTX documents unconditionally. The empty lines get the stored
+    // spacing reduction too, and the reference program draws "textbox" at this height.
+    loadFromFile(u"pptx/trailing-paragraphs.pptx");
+    {
+        CPPUNIT_ASSERT(
+            getDoc()->GetCompatibilityFlag(SdrCompatibilityFlag::UseTrailingEmptyLinesInLayout));
+
+        xmlDocUniquePtr pXml = parseLayout();
+        sal_Int32 y = getXPath(pXml, "/metafile['5']/push/push/textarray", "y").toInt32();
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(6800, y, 100);
+        assertXPathContent(pXml, "/metafile['5']/push/push/textarray/text", u"textbox");
+    }
+
+    // 6. Check PPTX round-trip
+    saveAndReload(TestFilter::PPTX);
+    {
+        CPPUNIT_ASSERT(
+            getDoc()->GetCompatibilityFlag(SdrCompatibilityFlag::UseTrailingEmptyLinesInLayout));
+
+        xmlDocUniquePtr pXml = parseLayout();
+        sal_Int32 y = getXPath(pXml, "/metafile['6']/push/push/textarray", "y").toInt32();
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(6800, y, 100);
+        assertXPathContent(pXml, "/metafile['6']/push/push/textarray/text", u"textbox");
+    }
+
+    // For some reason, saving PPTX to ODT in step 7 below produces negative fo:padding-top, which
+    // fails validation; that is unrelated, so disable validation for now.
+    skipValidation();
+
+    // 7. It must round-trip to ODP
+    saveAndReload(TestFilter::ODP);
+    {
+        CPPUNIT_ASSERT(
+            getDoc()->GetCompatibilityFlag(SdrCompatibilityFlag::UseTrailingEmptyLinesInLayout));
+
+        xmlDocUniquePtr pXml = parseLayout();
+        sal_Int32 y = getXPath(pXml, "/metafile['7']/push/push/textarray", "y").toInt32();
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(6800, y, 100);
+        assertXPathContent(pXml, "/metafile['7']/push/push/textarray/text", u"textbox");
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testTdf128206)
+{
+    createSdImpressDoc("pptx/tdf128206.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    if (comphelper::COKit::isActive())
+    {
+        // The Kit scales the font instead of the map mode, so the translation is in the text
+        // position, and the two deltas add up
+        assertXPath(pXmlDoc, "//push[@flags='PushMapMode']", 0);
+        assertXPathDoubleValue(pXmlDoc, "//textarray", "x", 14416.0 - 11031.0, 6.0);
+        assertXPathDoubleValue(pXmlDoc, "//textarray", "y", 1658.0 + 3617.0, 6.0);
+        return;
+    }
+
+    // translation
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']", 1);
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "mapunit", u"MapRelative");
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "x", 14391.0, 3.0);
+    // Without the fix, this failed with
+    // - Expected: 1658
+    // - Actual  : 1415872
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "y", 1658.0, 3.0);
+    // no scaling
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "scalex", u"(1/1)");
+    assertXPath(pXmlDoc, "//push[@flags='PushMapMode']/mapmode", "scaley", u"(1/1)");
+
+    // text position
+    // Without the fix, this failed with
+    // - Expected: -11019
+    // - Actual  : -718138
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/textarray", "x", -11019.0, 3.0);
+    // Without the fix, this failed with
+    // - Expected: 3605
+    // - Actual  : -703490
+    assertXPathDoubleValue(pXmlDoc, "//push[@flags='PushMapMode']/textarray", "y", 3605.0, 3.0);
+}
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testBulletOnTextBaseline)
+{
+    // Three bulleted paragraphs with double line spacing. Each bullet sits on the baseline of the
+    // text it belongs to.
+    createSdImpressDoc("pptx/TextFittingBulletBaseline.pptx");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    const int nTextArrays = countXPathNodes(pXmlDoc, "//textarray");
+    int nBullets = 0;
+    for (int i = 1; i < nTextArrays; ++i)
+    {
+        const OString sPath = "(//textarray)[" + OString::number(i) + "]";
+        if (getXPathContent(pXmlDoc, sPath + "/text") != u"\u2022")
+            continue;
+        ++nBullets;
+        const OString sTextPath = "(//textarray)[" + OString::number(i + 1) + "]";
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(getXPath(pXmlDoc, sTextPath, "y").toDouble(),
+                                     getXPath(pXmlDoc, sPath, "y").toDouble(), 5.0);
+    }
+    CPPUNIT_ASSERT_EQUAL(3, nBullets);
+}
+
+
+CPPUNIT_TEST_FIXTURE(SdLayoutTest, testJumpingBullet)
+{
+    createSdImpressDoc("odp/jumping_bullet.odp");
+    xmlDocUniquePtr pXmlDoc = parseLayout();
+
+    const OString aBase = "/metafile/push[1]/push[1]/textarray"_ostr;
+    // bullet of paragraph H and bullet of the trailing empty paragraph
+    sal_Int32 nBullet4 = getXPath(pXmlDoc, aBase + "[4]", "y").toInt32();
+    sal_Int32 nBullet6 = getXPath(pXmlDoc, aBase + "[6]", "y").toInt32();
+    sal_Int32 nBullet8 = getXPath(pXmlDoc, aBase + "[8]", "y").toInt32();
+    sal_Int32 nBullet10 = getXPath(pXmlDoc, aBase + "[10]", "y").toInt32();
+
+    // the empty paragraph's bullet must use the same line pitch as the others
+    CPPUNIT_ASSERT_EQUAL(nBullet6 - nBullet4, nBullet10 - nBullet8);
+}
+
+CPPUNIT_PLUGIN_IMPLEMENT();
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

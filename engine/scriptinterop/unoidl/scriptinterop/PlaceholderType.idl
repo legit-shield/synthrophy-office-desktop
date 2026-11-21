@@ -1,0 +1,51 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** CLIP_ART and DIAGRAM are never reported, since Collabora Online presentations have no
+    such placeholders.
+
+    @gas PlaceholderType
+ */
+enum PlaceholderType
+{
+    /** A placeholder kind that this API does not support, such as a handout page
+        placeholder.
+     */
+    UNSUPPORTED,
+    /** Not a placeholder. */
+    NONE,
+    /** A body text placeholder, including the notes text on a notes page. */
+    BODY,
+    CHART,
+    CLIP_ART,
+    /** The title of a page on the title layout. */
+    CENTERED_TITLE,
+    DIAGRAM,
+    DATE_AND_TIME,
+    FOOTER,
+    HEADER,
+    MEDIA,
+    OBJECT,
+    PICTURE,
+    SLIDE_NUMBER,
+    SUBTITLE,
+    TABLE,
+    /** The title on any layout but the title layout. */
+    TITLE,
+    /** The slide image on a notes page. */
+    SLIDE_IMAGE
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

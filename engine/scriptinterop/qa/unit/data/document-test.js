@@ -1,0 +1,1134 @@
+/* -*- fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+// GAS doesn't have console.assert:
+if (!globalThis.cool) {
+    console.assert = console.assert || (cond => { if (!cond) throw new Error('failed: ' + cond); });
+}
+
+function test() {
+    const body = DocumentApp.getActiveDocument().getBody();
+    console.assert(body.getType() === DocumentApp.ElementType.BODY_SECTION);
+    console.assert(String(body.getType()) === 'BODY_SECTION');
+    console.assert(JSON.stringify(body.getType()) === '"BODY_SECTION"');
+    console.assert(body.getText().length > 0);
+    console.assert(body.getNumChildren() === 6);
+    // The page is US Letter, measured in points:
+    console.assert(body.getPageWidth() === 612);
+    console.assert(body.getPageHeight() === 792);
+    console.assert(body.getMarginLeft() === 72);
+    console.assert(body.getMarginTop() === 72);
+    // The document's language is null or one of GAS's language codes (which can vary for GAS, which
+    // keeps the document between runs, together with any language set on it):
+    {
+        const language = DocumentApp.getActiveDocument().getLanguage();
+        console.assert(language === null || /^[a-z]{2,3}(_[A-Z0-9]+)?$/.test(language));
+        if (globalThis.cool) {
+            console.assert(language === 'en');
+        }
+    }
+
+    // Paragraph 0 is a bold "Bold", italic "Italic" and plain "Plain" concatenated, followed by an
+    // image anchored to a character with text wrap, which is a positioned image and no child:
+    const p0 = body.getChild(0);
+    console.assert(p0.getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(p0.getText() === 'BoldItalicPlain');
+    console.assert(p0.isLeftToRight() === true);
+    console.assert(p0.getParent().getType() === DocumentApp.ElementType.BODY_SECTION);
+    console.assert(p0.copy().getText() === 'BoldItalicPlain');
+    console.assert(p0.getPositionedImages().length === 1);
+    console.assert(p0.getNumChildren() === 1);
+    console.assert(p0.getChild(0).getType() === DocumentApp.ElementType.TEXT);
+    console.assert(p0.getChild(0).getText() === 'BoldItalicPlain');
+    console.assert(p0.getChild(0).getParent().getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(p0.getHeading() === DocumentApp.ParagraphHeading.NORMAL);
+    console.assert(p0.getAlignment() === null);
+    console.assert(p0.getIndentStart() === null);
+    console.assert(p0.getPreviousSibling() === null);
+    console.assert(p0.getNextSibling().getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(p0.getNextSibling().getText() === 'UnderStrikeSuperPlain');
+    const t0 = p0.editAsText();
+    console.assert(t0.getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(t0.getText() === 'BoldItalicPlain');
+    console.assert(t0.getParent().getType() === DocumentApp.ElementType.BODY_SECTION);
+    console.assert(t0.isBold(0) === true);
+    console.assert(t0.isBold(4) === null);
+    console.assert(t0.isItalic(0) === null);
+    console.assert(t0.isItalic(4) === true);
+    console.assert(t0.isUnderline(0) === null);
+    console.assert(t0.isStrikethrough(0) === null);
+    console.assert(t0.getTextAlignment(0) === null);
+    console.assert(t0.getLinkUrl(0) === null);
+    console.assert(t0.getFontFamily(0).length > 0);
+    const idx = t0.getTextAttributeIndices();
+    console.assert(idx.length >= 1);
+    console.assert(idx[0] === 0);
+
+    // Paragraph 1 is an underlined, struck, superscript and plain run:
+    const t1 = body.getChild(1).editAsText();
+    console.assert(t1.getText() === 'UnderStrikeSuperPlain');
+    console.assert(t1.isUnderline(0) === true);
+    console.assert(t1.isUnderline(5) === null);
+    console.assert(t1.isStrikethrough(5) === true);
+    console.assert(t1.isStrikethrough(11) === null);
+    console.assert(t1.getTextAlignment(11) === DocumentApp.TextAlignment.SUPERSCRIPT);
+    console.assert(t1.getTextAlignment(16) === null);
+
+    // Paragraph 2 concatenates a plain "Third" run and a hyperlinked "Link" run:
+    const t2 = body.getChild(2).editAsText();
+    console.assert(t2.getText() === 'ThirdLink');
+    console.assert(t2.getLinkUrl(0) === null);
+    console.assert(t2.getLinkUrl(5) === 'https://example.com');
+
+    // Child 3 is a 2x2 table with cells A1, B1, A2, B2:
+    const table = body.getChild(3);
+    console.assert(table.getType() === DocumentApp.ElementType.TABLE);
+    console.assert(table.getNumRows() === 2);
+    console.assert(table.getNumChildren() === 2);
+    console.assert(table.getChild(0).getType() === DocumentApp.ElementType.TABLE_ROW);
+    console.assert(table.getParent().getType() === DocumentApp.ElementType.BODY_SECTION);
+    console.assert(table.getPreviousSibling().getText() === body.getChild(2).getText());
+    console.assert(table.getNextSibling().getText() === 'Trailing');
+    console.assert(body.getChild(2).getNextSibling().getType() === DocumentApp.ElementType.TABLE);
+    const row0 = table.getRow(0);
+    console.assert(row0.getNumCells() === 2);
+    console.assert(row0.getNumChildren() === 2);
+    console.assert(row0.getParent().getType() === DocumentApp.ElementType.TABLE);
+    const cell00 = row0.getCell(0);
+    console.assert(cell00.getType() === DocumentApp.ElementType.TABLE_CELL);
+    console.assert(cell00.getText() === 'A1');
+    console.assert(cell00.getNumChildren() >= 1);
+    console.assert(cell00.getChild(0).getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(cell00.getParent().getType() === DocumentApp.ElementType.TABLE_ROW);
+    console.assert(cell00.getRowSpan() === 1);
+    console.assert(cell00.getColSpan() === 1);
+    console.assert(cell00.getChild(0).getParent().getType() === DocumentApp.ElementType.TABLE_CELL);
+    console.assert(body.copy().getNumChildren() === body.getNumChildren());
+    console.assert(row0.getCell(1).getText() === 'B1');
+    console.assert(table.getRow(1).getCell(0).getText() === 'A2');
+    console.assert(table.getRow(1).getCell(1).getText() === 'B2');
+    console.assert(row0.getText() === 'A1\nB1');
+    console.assert(table.getText() === 'A1\nB1\nA2\nB2');
+    // As in GAS, a container has a text view, whose offsets run across its paragraphs and the
+    // separators between them, and a separator has the attributes of the preceding character:
+    const rowText = row0.editAsText();
+    console.assert(rowText.getType() === DocumentApp.ElementType.TABLE_ROW);
+    console.assert(rowText.getText() === 'A1\nB1');
+    console.assert(row0.asText().getText() === 'A1\nB1');
+    console.assert(rowText.getParent().getType() === DocumentApp.ElementType.TABLE);
+    console.assert(table.editAsText().getText() === table.getText());
+    console.assert(body.editAsText().getText() === body.getText());
+    rowText.setBold(false).setBold(3, 4, true);
+    console.assert(rowText.isBold(2) === false);
+    console.assert(rowText.isBold(3) === true);
+    console.assert(row0.getCell(1).editAsText().isBold(0) === true);
+    console.assert(cell00.editAsText().isBold(1) === false);
+    let indexMessage = null;
+    try {
+        rowText.isBold(5);
+    } catch (e) {
+        indexMessage = e.message;
+    }
+    console.assert(indexMessage === 'Index (5) must be less than the content length (5).');
+
+    console.assert(body.getChildIndex(p0) === 0);
+    console.assert(body.getChildIndex(body.getChild(1)) === 1);
+    console.assert(body.getChildIndex(table) === 3);
+    console.assert(p0.getChildIndex(p0.getChild(0)) === 0);
+    console.assert(table.getChildIndex(table.getRow(1)) === 1);
+    console.assert(row0.getChildIndex(row0.getCell(1)) === 1);
+    console.assert(cell00.getChildIndex(cell00.getChild(0)) === 0);
+    // The Text child of p0 is not a child of the body, even though it stands for the same document
+    // paragraph as p0:
+    let threw = false;
+    try {
+        body.getChildIndex(p0.getChild(0));
+    } catch (e) {
+        threw = true;
+    }
+    console.assert(threw);
+
+    // Cell B2 and paragraph 4 each anchor a footnote, whose only paragraph is "Cellnote" and
+    // "Note", and the references to them are no part of the text:
+    console.assert(body.getText().indexOf('A2\nB2\nTrailing') !== -1);
+    console.assert(body.getChild(4).getText() === 'Trailing');
+    let pastFootnote = false;
+    try {
+        DocumentApp.getActiveDocument().newPosition(body.getChild(4).getChild(0), 9);
+    } catch (e) {
+        pastFootnote = true;
+    }
+    console.assert(pastFootnote);
+    const trailingIndices = body.getChild(4).getChild(0).asText().getTextAttributeIndices();
+    console.assert(trailingIndices.length === 1 && trailingIndices[0] === 0);
+    const fns = DocumentApp.getActiveDocument().getFootnotes();
+    console.assert(fns.length === 2);
+    console.assert(fns[0].getFootnoteContents().getText() === 'Cellnote');
+    console.assert(fns[1].getType() === DocumentApp.ElementType.FOOTNOTE);
+    const noteContents = fns[1].getFootnoteContents();
+    console.assert(noteContents.getType() === DocumentApp.ElementType.FOOTNOTE_SECTION);
+    console.assert(noteContents.getNumChildren() >= 1);
+    console.assert(noteContents.getChild(0).getText() === 'Note');
+    console.assert(noteContents.getChildIndex(noteContents.getChild(0)) === 0);
+    // As in GAS, the document element holds the body and then the sections of the footnotes:
+    const documentElement = body.getParent();
+    console.assert(documentElement.getType() === DocumentApp.ElementType.DOCUMENT);
+    console.assert(documentElement.getParent() === null);
+    console.assert(documentElement.getNumChildren() === 3);
+    console.assert(documentElement.getChildIndex(body) === 0);
+    console.assert(body.getPreviousSibling() === null);
+    console.assert(body.getNextSibling().getType() === DocumentApp.ElementType.FOOTNOTE_SECTION);
+    console.assert(noteContents.getParent().getType() === DocumentApp.ElementType.DOCUMENT);
+    console.assert(documentElement.getChildIndex(noteContents) === 2);
+    // A paragraph of a footnote, also one found by a search, lies in the footnote's section:
+    const inNote = noteContents.findText('Note');
+    console.assert(
+        inNote.getElement().getParent().getParent().getType()
+            === DocumentApp.ElementType.FOOTNOTE_SECTION);
+    console.assert(
+        DocumentApp.getActiveDocument().newRange().addElementsBetween(
+            noteContents.getChild(0).editAsText(), noteContents.getChild(0)).build()
+            .getRangeElements().length === 1);
+    // Only COOL has the legacy UNO API, through which a footnote section that has already been read
+    // sees the changes made since, as well as those of undo:
+    if (globalThis.cool) {
+        const noteCount = noteContents.getNumChildren();
+        const noteText = cool.getActiveUnoModel().getFootnotes().getByIndex(1);
+        // 0 is com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK:
+        noteText.insertControlCharacter(noteText.getEnd(), 0, false);
+        console.assert(noteContents.getNumChildren() === noteCount + 1);
+        cool.getActiveUnoModel().getUndoManager().undo();
+        console.assert(noteContents.getNumChildren() === noteCount);
+    }
+
+    // As in GAS, an element casts to its own type, a paragraph also to a text that reports the
+    // paragraph's type, and any other cast throws:
+    console.assert(p0.asParagraph().getText() === 'BoldItalicPlain');
+    console.assert(p0.asText().getText() === 'BoldItalicPlain');
+    console.assert(p0.asText().asParagraph().getText() === 'BoldItalicPlain');
+    console.assert(t0.asText().getText() === 'BoldItalicPlain');
+    console.assert(table.asTable().getNumRows() === 2);
+    console.assert(row0.asTableRow().getNumCells() === 2);
+    console.assert(cell00.asTableCell().getText() === 'A1');
+    console.assert(body.asBody().getNumChildren() === body.getNumChildren());
+    console.assert(fns[1].asFootnote().getFootnoteContents().getText() === 'Note');
+    console.assert(noteContents.asFootnoteSection().getText() === 'Note');
+    for (const [element, cast, message] of [
+        [p0, 'asTable', "PARAGRAPH can't be cast to TABLE."],
+        [table, 'asParagraph', "TABLE can't be cast to PARAGRAPH."],
+        [p0, 'asInlineImage', "PARAGRAPH can't be cast to INLINE_IMAGE."],
+        [fns[1], 'asText', "FOOTNOTE can't be cast to TEXT."],
+    ]) {
+        let caught = null;
+        try {
+            element[cast]();
+        } catch (e) {
+            caught = e.message;
+        }
+        console.assert(caught === message);
+    }
+
+    // No user selection on a freshly opened document, so getSelection returns null:
+    console.assert(DocumentApp.getActiveDocument().getSelection() === null);
+
+    // Build a selection spanning all of paragraph 0 plus the first three characters of paragraph 1,
+    // set it on the document, and verify the per-paragraph range split:
+    const doc = DocumentApp.getActiveDocument();
+    const range = doc.newRange()
+        .addElement(body.getChild(0))
+        .addElement(body.getChild(1).editAsText(), 0, 2)
+        .build();
+    const ranges = doc.setSelection(range).getSelection().getRangeElements();
+    console.assert(ranges.length === 2);
+    console.assert(ranges[0].isPartial() === false);
+    console.assert(ranges[0].getStartOffset() === -1);
+    console.assert(ranges[0].getEndOffsetInclusive() === -1);
+    console.assert(ranges[0].getElement().getText() === 'BoldItalicPlain');
+    console.assert(ranges[1].isPartial() === true);
+    console.assert(ranges[1].getStartOffset() === 0);
+    console.assert(ranges[1].getEndOffsetInclusive() === 2);
+    console.assert(ranges[1].getElement().getType() === DocumentApp.ElementType.TEXT);
+    console.assert(ranges[1].getElement().getText() === 'UnderStrikeSuperPlain');
+
+    // Append a paragraph and a list item at the end, which a Text of the body taken before
+    // already shows:
+    const bodyText = body.editAsText();
+    const appended = body.appendParagraph('Appended');
+    console.assert(appended.getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(appended.getText() === 'Appended');
+    console.assert(bodyText.getText() === body.getText());
+    console.assert(bodyText.getText().endsWith('\nAppended'));
+    console.assert(body.getNumChildren() === 7);
+
+    // Exercise the setBold overload group, which a Text of the paragraph taken before already
+    // shows:
+    const appendedText = appended.editAsText();
+    appended.editAsText().setBold(true).setBold(0, 3, false);
+    console.assert(appended.editAsText().isBold(0) === false);
+    console.assert(appended.editAsText().isBold(4) === true);
+    console.assert(appendedText.isBold(4) === true);
+    console.assert(JSON.stringify(appendedText.getTextAttributeIndices()) === '[0,4]');
+
+    // Exercise the foreground color, which is null where it is not set:
+    const coloredText = appended.editAsText();
+    console.assert(coloredText.getForegroundColor() === null);
+    console.assert(coloredText.getForegroundColor(0) === null);
+    coloredText.setForegroundColor('#FF0000');
+    console.assert(coloredText.getForegroundColor() === '#ff0000');
+    coloredText.setForegroundColor(0, 3, '#0000ff');
+    console.assert(coloredText.getForegroundColor() === null);
+    console.assert(coloredText.getForegroundColor(0) === '#0000ff');
+    console.assert(coloredText.getForegroundColor(4) === '#ff0000');
+    {
+        let message = null;
+        try {
+            coloredText.setForegroundColor('red');
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Invalid color value.');
+    }
+    {
+        let message = null;
+        try {
+            coloredText.setForegroundColor('#abc');
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Invalid color value.');
+    }
+    {
+        let message = null;
+        try {
+            coloredText.getForegroundColor(8);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Index (8) must be less than the content length (8).');
+    }
+    {
+        let message = null;
+        try {
+            coloredText.getForegroundColor(-1);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Index (-1) value must be greater or equal to zero.');
+    }
+    {
+        let message = null;
+        try {
+            coloredText.setForegroundColor(0, 8, '#0000ff');
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Index (8) must be less than the content length (8).');
+    }
+    body.editAsText().setForegroundColor('#123456');
+    console.assert(body.editAsText().getForegroundColor() === '#123456');
+    appended.editAsText().setLinkUrl('https://example.com/');
+    console.assert(appended.editAsText().getLinkUrl(0) === 'https://example.com/');
+
+    // A null or undefined value resets an attribute, for the whole text or for a range:
+    const resetText = appended.editAsText();
+    resetText.setBold(true).setBold(null);
+    console.assert(resetText.isBold(0) === null);
+    resetText.setBold(true).setBold(1, 3, null);
+    console.assert(resetText.isBold(0) === true);
+    console.assert(resetText.isBold(2) === null);
+    resetText.setBold(undefined);
+    console.assert(resetText.isBold(0) === null);
+    resetText.setItalic(true).setItalic(null);
+    console.assert(resetText.isItalic(0) === null);
+    resetText.setItalic(true).setItalic(1, 3, null);
+    console.assert(resetText.isItalic(0) === true);
+    console.assert(resetText.isItalic(2) === null);
+    resetText.setItalic(undefined);
+    console.assert(resetText.isItalic(0) === null);
+    resetText.setUnderline(true).setUnderline(null);
+    console.assert(resetText.isUnderline(0) === null);
+    resetText.setUnderline(true).setUnderline(1, 3, null);
+    console.assert(resetText.isUnderline(0) === true);
+    console.assert(resetText.isUnderline(2) === null);
+    resetText.setUnderline(undefined);
+    console.assert(resetText.isUnderline(0) === null);
+    resetText.setStrikethrough(true).setStrikethrough(null);
+    console.assert(resetText.isStrikethrough(0) === null);
+    resetText.setStrikethrough(true).setStrikethrough(1, 3, null);
+    console.assert(resetText.isStrikethrough(0) === true);
+    console.assert(resetText.isStrikethrough(2) === null);
+    resetText.setStrikethrough(undefined);
+    console.assert(resetText.isStrikethrough(0) === null);
+    resetText.setFontFamily('Georgia').setFontFamily(null);
+    console.assert(resetText.getFontFamily(0) === null);
+    resetText.setFontFamily('Georgia').setFontFamily(1, 3, null);
+    console.assert(resetText.getFontFamily(0) === 'Georgia');
+    console.assert(resetText.getFontFamily(2) === null);
+    resetText.setFontFamily(undefined);
+    console.assert(resetText.getFontFamily(0) === null);
+    resetText.setForegroundColor('#ff0000').setForegroundColor(null);
+    console.assert(resetText.getForegroundColor(0) === null);
+    resetText.setForegroundColor('#ff0000').setForegroundColor(1, 3, null);
+    console.assert(resetText.getForegroundColor(0) === '#ff0000');
+    console.assert(resetText.getForegroundColor(2) === null);
+    resetText.setForegroundColor(undefined);
+    console.assert(resetText.getForegroundColor(0) === null);
+    resetText.setLinkUrl('https://example.com/').setLinkUrl(null);
+    console.assert(resetText.getLinkUrl(0) === null);
+    resetText.setLinkUrl('https://example.com/').setLinkUrl(1, 3, null);
+    console.assert(resetText.getLinkUrl(0) === 'https://example.com/');
+    console.assert(resetText.getLinkUrl(2) === null);
+    resetText.setLinkUrl(undefined);
+    console.assert(resetText.getLinkUrl(0) === null);
+    {
+        let message = null;
+        try {
+            resetText.setTextAlignment(null);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Argument cannot be null: textAlignment');
+    }
+    {
+        let message = null;
+        try {
+            resetText.setTextAlignment(1, 3, null);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Argument cannot be null: textAlignment');
+    }
+    {
+        let message = null;
+        try {
+            resetText.setTextAlignment(undefined);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Argument cannot be null: textAlignment');
+    }
+
+    // Exercise the Text mutation methods; each returns Text so the calls chain:
+    appended.editAsText().setText('foo').appendText('bar').insertText(3, '-');
+    console.assert(appended.getText() === 'foo-bar');
+    appended.editAsText().deleteText(3, 3);
+    console.assert(appended.getText() === 'foobar');
+    appended.editAsText().setText('');
+    console.assert(appended.getText() === '');
+
+    // Offsets beyond what fits in 16 bits reach the right character:
+    appended.editAsText().setText('a'.repeat(70000)).insertText(66000, 'X');
+    console.assert(appended.getText().indexOf('X') === 66000);
+    const far = doc.newPosition(appended.getChild(0), 66001);
+    console.assert(far.getSurroundingTextOffset() === 66001);
+    appended.editAsText().setText('');
+
+    // A negative offset, or a range that ends before it starts, is rejected:
+    const throws = (f) => { try { f(); } catch (e) { return true; } return false; };
+    appended.editAsText().setText('foobar');
+    console.assert(throws(() => appended.editAsText().insertText(-1, 'x')));
+    console.assert(throws(() => appended.editAsText().setBold(5, 3, true)));
+    console.assert(throws(() => appended.editAsText().deleteText(-1, 0)));
+    console.assert(appended.getText() === 'foobar');
+    appended.editAsText().setText('');
+
+    const listItem = body.appendListItem('Item');
+    console.assert(listItem.getType() === DocumentApp.ElementType.LIST_ITEM);
+    console.assert(listItem.getText() === 'Item');
+    console.assert(listItem.getNestingLevel() === 0);
+    console.assert(listItem.getGlyphType() === DocumentApp.GlyphType.NUMBER);
+    console.assert(typeof listItem.getListId() === 'string');
+    console.assert(body.getNumChildren() === 8);
+
+    // clear empties the paragraph text without removing the paragraph from the body:
+    const cleared = body.appendParagraph('Doomed');
+    console.assert(body.getNumChildren() === 9);
+    console.assert(cleared.getText() === 'Doomed');
+    console.assert(cleared.getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(cleared.clear().getText() === '');
+    console.assert(body.getNumChildren() === 9);
+
+    // GAS refuses to remove the section's last paragraph, so append a guard first, then remove
+    // cleared (which is no longer the last):
+    body.appendParagraph('Guard');
+    console.assert(body.getNumChildren() === 10);
+    cleared.removeFromParent();
+    console.assert(body.getNumChildren() === 9);
+
+    // Removing a whole added paragraph via its Text view works too, again with a guard so what
+    // we remove is not the last paragraph:
+    const viaText = body.appendParagraph('AlsoDoomed');
+    body.appendParagraph('Guard');
+    console.assert(body.getNumChildren() === 11);
+    viaText.editAsText().removeFromParent();
+    console.assert(body.getNumChildren() === 10);
+
+    // A table cell's clear empties the cell's text:
+    const tab = body.getChild(3);
+    console.assert(tab.getType() === DocumentApp.ElementType.TABLE);
+    const cell = tab.getChild(0).getChild(0);
+    console.assert(cell.getType() === DocumentApp.ElementType.TABLE_CELL);
+    console.assert(cell.getText().length > 0);
+    console.assert(cell.clear().getText() === '');
+
+    // Removing a table row shrinks the surrounding table:
+    console.assert(tab.getNumChildren() === 2);
+    console.assert(
+        tab.getChild(0).removeFromParent().getType() === DocumentApp.ElementType.TABLE_ROW);
+    console.assert(tab.getNumChildren() === 1);
+
+    // Paragraph 5 anchors a 100x60-pixel inline image at child index 1 (child index 0 is the
+    // whole-paragraph Text):
+    const image = body.getChild(5).getChild(1).asInlineImage();
+    console.assert(image !== null);
+    console.assert(image.getWidth() === 100);
+    console.assert(image.getHeight() === 60);
+    console.assert(image.getAltTitle() === null);
+    console.assert(image.getAltDescription() === null);
+
+    // Insert a 20x10 red PNG at the cursor, then verify the setters chain and round-trip:
+    const pngHex
+        = '89504e470d0a1a0a0000000d49484452000000140000000a08020000003b37e9b100'
+        + '00001549444154789c63f8cfc04036225fe7a8e611a319003144c73974da8b110000'
+        + '000049454e44ae426082';
+    const pngBytes = [];
+    for (let i = 0; i < pngHex.length; i += 2) {
+        pngBytes.push(parseInt(pngHex.substr(i, 2), 16));
+    }
+    const blob = Utilities.newBlob(pngBytes, 'image/png');
+    // appendImage places the image at the end of the body, unlike cursor.insertInlineImage
+    // which needs a visible cursor and returns null when there is none:
+    const inserted = body.appendImage(blob);
+    console.assert(inserted !== null);
+    console.assert(inserted.getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    // GAS stores image geometry in points at 72 DPI, so pixel values that are multiples of 4
+    // round-trip exactly through the 96/72 conversion:
+    inserted.setAltTitle('title').setAltDescription('desc').setWidth(80).setHeight(40);
+    console.assert(inserted.getAltTitle() === 'title');
+    console.assert(inserted.getAltDescription() === 'desc');
+    console.assert(inserted.getWidth() === 80);
+    console.assert(inserted.getHeight() === 40);
+
+    // An inline image in the middle of the text takes up no offset of its own:
+    const withImage = body.appendParagraph('foobar');
+    console.assert(doc.newPosition(withImage.getChild(0), 3).insertInlineImage(blob) !== null);
+    withImage.editAsText().insertText(4, 'X');
+    console.assert(withImage.editAsText().getText() === 'foobXar');
+    // The image splits the text into a child text before it and one after it:
+    console.assert(withImage.getNumChildren() === 3);
+    console.assert(withImage.getChild(0).getType() === DocumentApp.ElementType.TEXT);
+    console.assert(withImage.getChild(0).asText().getText() === 'foo');
+    console.assert(withImage.getChild(1).getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(withImage.getChild(2).asText().getText() === 'bXar');
+    console.assert(withImage.getChildIndex(withImage.getChild(2)) === 2);
+    console.assert(
+        withImage.getChild(0).getNextSibling().getType()
+            === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(
+        withImage.getChild(2).getPreviousSibling().getType()
+            === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(withImage.getChild(2).getNextSibling() === null);
+    // Text inserted at the offset after the image goes into the text after it, and the text of the
+    // paragraph has the paragraph's siblings:
+    withImage.editAsText().insertText(3, 'Y');
+    console.assert(withImage.getChild(2).asText().getText() === 'YbXar');
+    withImage.editAsText().deleteText(3, 3);
+    console.assert(withImage.getChild(2).asText().getText() === 'bXar');
+    console.assert(withImage.getNumChildren() === 3);
+    console.assert(
+        withImage.editAsText().getPreviousSibling().getText()
+            === withImage.getPreviousSibling().getText());
+    // A position at the end of a child text is the position after it in its paragraph, and one in
+    // the text of the paragraph is one in the child text there:
+    const afterFoo = doc.newPosition(withImage.getChild(0), 3);
+    console.assert(afterFoo.getElement().getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(afterFoo.getOffset() === 1);
+    const inBXar = doc.newPosition(withImage.editAsText(), 4);
+    console.assert(inBXar.getElement().getType() === DocumentApp.ElementType.TEXT);
+    console.assert(inBXar.getElement().asText().getText() === 'bXar');
+    console.assert(inBXar.getOffset() === 1);
+    // A search finds a match in one child text, never across the image:
+    const found = withImage.findText('bX');
+    console.assert(found.getElement().asText().getText() === 'bXar');
+    console.assert(found.isPartial());
+    console.assert(found.getStartOffset() === 0);
+    console.assert(found.getEndOffsetInclusive() === 1);
+    console.assert(withImage.findText('o.*b') === null);
+    {
+        let invalid = false;
+        try {
+            withImage.findText('(');
+        } catch (e) {
+            invalid = true;
+        }
+        console.assert(invalid);
+    }
+    const matches = [];
+    for (let r = withImage.findText('[oa]'); r !== null; r = withImage.findText('[oa]', r)) {
+        matches.push(r.getElement().asText().getText() + r.getStartOffset());
+    }
+    console.assert(matches.join() === 'foo1,foo2,bXar2');
+    console.assert(withImage.getChild(2).findText('a').getStartOffset() === 2);
+    console.assert(
+        withImage.editAsText().findText('ar').getElement().asText().getText() === 'bXar');
+    // A search of the body finds a match in a child text:
+    const inBody = body.findText('bXa');
+    console.assert(inBody.getElement().asText().getText() === 'bXar');
+    console.assert(inBody.getStartOffset() === 0);
+    console.assert(body.findText('bXa', inBody) === null);
+    // A child text has no text before it to merge with:
+    {
+        let message = null;
+        try {
+            withImage.getChild(2).merge();
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Element must be preceded by an element of the same type.');
+    }
+    // Bold text across the image has one attribute index, as the image changes no attribute:
+    withImage.editAsText().setBold(1, 4, true);
+    console.assert(JSON.stringify(withImage.editAsText().getTextAttributeIndices()) === '[0,1,5]');
+    withImage.editAsText().setBold(1, 4, null);
+    // Text set directly to not bold has an attribute index of its own:
+    const notBold = body.appendParagraph('abcd').editAsText();
+    notBold.setBold(0, 1, false);
+    console.assert(JSON.stringify(notBold.getTextAttributeIndices()) === '[0,2]');
+    // Formatting a part of a child text that runs past its end is an error:
+    {
+        let message = null;
+        try {
+            withImage.getChild(0).setBold(0, 5, true);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Index (5) must be less than the content length (3).');
+    }
+    {
+        let threw = false;
+        try {
+            withImage.getChild(0).insertText(4, 'Y');
+        } catch (e) {
+            threw = true;
+        }
+        console.assert(threw);
+    }
+    // Reading an attribute at an offset past the end of a child text is an error too:
+    {
+        let message = null;
+        try {
+            withImage.getChild(0).isBold(3);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Index (3) must be less than the content length (3).');
+    }
+    console.assert(throws(() => withImage.getChild(0).getFontFamily(100)));
+    console.assert(throws(() => withImage.getChild(0).getLinkUrl(-1)));
+    // A range over the image is split into the image and the parts of the texts around it:
+    const overImage = doc.newRange().addElement(withImage.editAsText(), 1, 4).build()
+        .getRangeElements();
+    console.assert(overImage.length === 3);
+    console.assert(overImage[0].getElement().asText().getText() === 'foo');
+    console.assert(overImage[0].getStartOffset() === 1);
+    console.assert(overImage[0].getEndOffsetInclusive() === 2);
+    console.assert(
+        overImage[1].getElement().getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(overImage[2].getElement().asText().getText() === 'bXar');
+    console.assert(overImage[2].getStartOffset() === 0);
+    console.assert(overImage[2].getEndOffsetInclusive() === 1);
+    // The text of a selected range over the image is the one of Writer's selection, as for a
+    // selection that the user makes:
+    if (globalThis.cool) {
+        console.assert(
+            doc.setSelection(doc.newRange().addElement(withImage.editAsText(), 1, 4).build())
+                .getSelection().getText() === 'oobX');
+    }
+    const allOverImageRange = doc.newRange().addElement(withImage.editAsText(), 0, 6).build();
+    doc.setSelection(allOverImageRange);
+    const allOverImage = allOverImageRange.getRangeElements();
+    console.assert(allOverImage.length === 3);
+    console.assert(allOverImage[0].getElement().asText().getText() === 'foo');
+    console.assert(allOverImage[0].getEndOffsetInclusive() === 2);
+    console.assert(
+        allOverImage[1].getElement().getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(allOverImage[2].getElement().asText().getText() === 'bXar');
+    console.assert(allOverImage[2].getEndOffsetInclusive() === 3);
+    // The elements between an image and the end of its paragraph are the image and the text after
+    // it:
+    const fromImage = doc.newRange().addElementsBetween(withImage.getChild(1), withImage).build()
+        .getRangeElements();
+    console.assert(fromImage.length === 2);
+    console.assert(
+        fromImage[0].getElement().getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(fromImage[1].getElement().asText().getText() === 'bXar');
+    console.assert(fromImage[1].getStartOffset() === 0);
+    console.assert(fromImage[1].getEndOffsetInclusive() === 3);
+    // A paragraph that holds only an image can be selected together with the paragraph after it:
+    console.assert(
+        doc.setSelection(
+            doc.newRange().addElement(withImage.getPreviousSibling()).addElement(withImage).build())
+            .getSelection().getRangeElements().length === 2);
+    // A child text that lies wholly between the start and the end is whole:
+    const upToImageRange = doc.newRange()
+        .addElementsBetween(withImage.getPreviousSibling(), withImage.getChild(1)).build();
+    doc.setSelection(upToImageRange);
+    const upToImage = upToImageRange.getRangeElements();
+    console.assert(upToImage.length === 3);
+    console.assert(upToImage[1].getElement().asText().getText() === 'foo');
+    console.assert(!upToImage[1].isPartial());
+    console.assert(upToImage[2].getElement().getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    // An image lies in its paragraph:
+    console.assert(
+        doc.newRange().addElement(withImage.getChild(1)).addElement(withImage).build()
+            .getRangeElements().length === 1);
+    // An image adds no line to the text of a range:
+    if (globalThis.cool) {
+        console.assert(
+            doc.newRange().addElement(withImage).addElement(withImage.getChild(1)).build().getText()
+                === 'foobXar');
+    }
+    // A child text stays the same text when an image is inserted into, or removed from, the text
+    // before it:
+    const heldText = withImage.getChild(2);
+    const earlierImage = doc.newPosition(withImage.getChild(0), 1).insertInlineImage(blob);
+    console.assert(heldText.getText() === 'bXar');
+    earlierImage.removeFromParent();
+    console.assert(heldText.getText() === 'bXar');
+    // A child text next to an image at the start or the end of its paragraph is not all of the
+    // paragraph:
+    const imageFirst = body.appendParagraph('foo');
+    const firstImage = doc.newPosition(imageFirst.getChild(0), 0).insertInlineImage(blob);
+    const withFirstImage = doc.newRange().addElement(firstImage).addElement(imageFirst.getChild(1))
+        .build().getRangeElements();
+    console.assert(withFirstImage.length === 2);
+    console.assert(
+        withFirstImage[0].getElement().getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(withFirstImage[1].getElement().getType() === DocumentApp.ElementType.TEXT);
+    const imageLast = body.appendParagraph('bar');
+    const lastImage = doc.newPosition(imageLast.getChild(0), 3).insertInlineImage(blob);
+    const withLastImage = doc.newRange().addElement(imageLast.getChild(0)).addElement(lastImage)
+        .build().getRangeElements();
+    console.assert(withLastImage.length === 2);
+    console.assert(withLastImage[0].getElement().getType() === DocumentApp.ElementType.TEXT);
+    console.assert(
+        withLastImage[1].getElement().getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    // Writer's own selection of only the text is that text:
+    if (globalThis.cool) {
+        const controller = cool.getActiveUnoModel().getCurrentController();
+        doc.setSelection(doc.newRange().addElement(imageFirst.getChild(1)).build());
+        const writerSelection = controller.getSelection();
+        doc.setCursor(doc.newPosition(body.getChild(0), 0));
+        controller.select(writerSelection);
+        const textOnly = doc.getSelection().getRangeElements();
+        console.assert(textOnly.length === 1);
+        console.assert(textOnly[0].getElement().getType() === DocumentApp.ElementType.TEXT);
+    }
+    // Each appended paragraph's object stays on its own paragraph:
+    const one = body.appendParagraph('One');
+    const two = body.appendParagraph('Two');
+    console.assert(one.getText() === 'One');
+    console.assert(two.getText() === 'Two');
+
+    // The last paragraph of a section cannot be removed:
+    const childCount = body.getNumChildren();
+    console.assert(throws(() => two.removeFromParent()));
+    console.assert(throws(() => two.editAsText().removeFromParent()));
+    console.assert(body.getNumChildren() === childCount);
+
+    // A paragraph takes a heading, and one appended after a heading is a normal one:
+    console.assert(
+        two.setHeading(DocumentApp.ParagraphHeading.HEADING1).getHeading()
+            === DocumentApp.ParagraphHeading.HEADING1);
+    const three = body.appendParagraph('Three');
+    console.assert(three.getHeading() === DocumentApp.ParagraphHeading.NORMAL);
+    two.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+    console.assert(two.getHeading() === DocumentApp.ParagraphHeading.NORMAL);
+
+    // newPosition takes a character offset into a Text element:
+    const text1 = body.getChild(1).getChild(0);
+    console.assert(text1.getType() === DocumentApp.ElementType.TEXT);
+    const inText = doc.newPosition(text1, 5);
+    console.assert(inText.getOffset() === 5);
+    console.assert(inText.getElement().getType() === DocumentApp.ElementType.TEXT);
+    console.assert(inText.getElement().getText() === 'UnderStrikeSuperPlain');
+    let pastText = false;
+    try {
+        doc.newPosition(text1, text1.getText().length + 1);
+    } catch (e) {
+        pastText = true;
+    }
+    console.assert(pastText);
+
+    // For any other element, newPosition takes a child index, where the index equal to the number
+    // of children is the element's end, and the position keeps that element and index (paragraph 5
+    // is "Before" followed by its inline image):
+    const para5 = body.getChild(5);
+    console.assert(para5.getNumChildren() === 2);
+    for (let i = 0; i <= 2; ++i) {
+        const pos = doc.newPosition(para5, i);
+        console.assert(pos.getOffset() === i);
+        console.assert(pos.getElement().getType() === DocumentApp.ElementType.PARAGRAPH);
+        console.assert(pos.getElement().getText() === 'Before');
+    }
+    let pastChildren = false;
+    try {
+        doc.newPosition(para5, 3);
+    } catch (e) {
+        pastChildren = true;
+    }
+    console.assert(pastChildren);
+
+    // After setCursor, the cursor is the given position, with the element and child index it was
+    // made from (GAS reports every getCursor after the first one that is not null in a script
+    // execution against that first cursor's element, with an offset that is not relative to that
+    // element, so this is the only getCursor here that is not null):
+    const cursor = doc.setCursor(doc.newPosition(para5, 1)).getCursor();
+    console.assert(cursor.getElement().getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(cursor.getElement().getText() === 'Before');
+    console.assert(cursor.getOffset() === 1);
+    console.assert(cursor.getSurroundingText().getText() === 'Before');
+    console.assert(cursor.getSurroundingTextOffset() === 6);
+    // Only COOL has formatting for the text typed at the cursor:
+    if (globalThis.cool) {
+        console.assert(cursor.isBold() === false);
+        console.assert(cursor.setBold(true).isBold() === true);
+        console.assert(cursor.setBold(false).isBold() === false);
+        console.assert(cursor.isItalic() === false);
+        console.assert(cursor.setItalic(true).isItalic() === true);
+        console.assert(cursor.setItalic(false).isItalic() === false);
+        console.assert(cursor.isUnderline() === false);
+        console.assert(cursor.setUnderline(true).isUnderline() === true);
+        console.assert(cursor.setUnderline(false).isUnderline() === false);
+        console.assert(cursor.setBold(true).setBold(null).isBold() === false);
+        console.assert(cursor.setItalic(true).setItalic(null).isItalic() === false);
+        console.assert(cursor.setUnderline(true).setUnderline(null).isUnderline() === false);
+        // Inside a word, the setters format the whole word:
+        const before = para5.getChild(0).asText();
+        doc.newPosition(before, 3).setBold(true);
+        console.assert(before.isBold(0) === true);
+        console.assert(before.isBold(5) === true);
+        doc.newPosition(before, 3).setBold(null);
+        console.assert(before.isBold(0) === null);
+        console.assert(before.isBold(5) === null);
+    }
+    // Only COOL has the locales of the text at the cursor:
+    if (globalThis.cool) {
+        console.assert(cursor.getLocale() === 'en-US');
+        console.assert(cursor.getLocaleAsian() === 'zh-CN');
+        console.assert(cursor.getLocaleComplex() === 'hi-IN');
+    }
+
+    // An inline image can be selected on its own, as one whole range element:
+    const imageRanges = doc.setSelection(doc.newRange().addElement(image).build()).getSelection()
+        .getRangeElements();
+    console.assert(imageRanges.length === 1);
+    console.assert(imageRanges[0].isPartial() === false);
+    console.assert(imageRanges[0].getStartOffset() === -1);
+    console.assert(imageRanges[0].getEndOffsetInclusive() === -1);
+    const selected = imageRanges[0].getElement();
+    console.assert(selected.getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(selected.asInlineImage().getWidth() === 100);
+    console.assert(selected.getParent().getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(selected.getParent().asText().getText() === 'Before');
+    console.assert(selected.getParent().getChildIndex(selected) === 1);
+    console.assert(selected.getPreviousSibling().getType() === DocumentApp.ElementType.TEXT);
+    console.assert(selected.getPreviousSibling().asText().getText() === 'Before');
+    console.assert(selected.getNextSibling() === null);
+    console.assert(doc.getSelection().getSelectedElements().length === 1);
+    // While there is a selection, there is no cursor:
+    console.assert(doc.getCursor() === null);
+    // Setting the cursor ends the selection of the image (the cursor itself is not read again here,
+    // see above):
+    console.assert(doc.setCursor(doc.newPosition(para5, 1)).getSelection() === null);
+    // Selections of objects other than text, made through the UNO model of the document:
+    if (globalThis.cool) {
+        const model = cool.getActiveUnoModel();
+        const controller = model.getCurrentController();
+        // GAS documents have no shapes or text frames.  While one is selected, there is neither a
+        // cursor nor a selection, even if the shape contains text:
+        const shape = model.createInstance('com.sun.star.drawing.RectangleShape');
+        model.getDrawPage().add(shape);
+        controller.select(shape);
+        console.assert(doc.getCursor() === null);
+        console.assert(doc.getSelection() === null);
+        shape.setString('Shape');
+        controller.select(shape);
+        console.assert(doc.getCursor() === null);
+        console.assert(doc.getSelection() === null);
+        model.getDrawPage().remove(shape);
+        const frame = model.createInstance('com.sun.star.text.TextFrame');
+        model.getText().insertTextContent(model.getText().getEnd(), frame, false);
+        frame.getText().setString('Frame');
+        controller.select(frame);
+        console.assert(doc.getCursor() === null);
+        console.assert(doc.getSelection() === null);
+        frame.dispose();
+        // A GAS script cannot select a positioned image, as it is no element of a range.  While one
+        // is selected (here a new graphic object, which is anchored to a paragraph), there is
+        // neither a cursor nor a selection:
+        const graphic = model.createInstance('com.sun.star.text.TextGraphicObject');
+        model.getText().insertTextContent(model.getText().getStart(), graphic, false);
+        controller.select(graphic);
+        console.assert(doc.getCursor() === null);
+        console.assert(doc.getSelection() === null);
+        graphic.dispose();
+        // While table cells are selected, there is no cursor, and the selection is the selected
+        // cells:
+        const table = model.createInstance('com.sun.star.text.TextTable');
+        table.initialize(1, 2);
+        model.getText().insertTextContent(model.getText().getEnd(), table, false);
+        controller.select(table.getCellRangeByName('A1:B1'));
+        console.assert(doc.getCursor() === null);
+        const cells = doc.getSelection().getRangeElements();
+        console.assert(cells.length === 2);
+        console.assert(cells[0].getElement().getType() === DocumentApp.ElementType.TABLE_CELL);
+        console.assert(cells[1].getElement().getType() === DocumentApp.ElementType.TABLE_CELL);
+        table.dispose();
+        console.assert(doc.setCursor(doc.newPosition(para5, 1)).getCursor() !== null);
+    }
+
+    // Clearing the body, which still holds a table and a list item here, keeps one empty
+    // paragraph:
+    console.assert(body.clear().getNumChildren() === 1);
+    console.assert(body.getChild(0).getType() === DocumentApp.ElementType.PARAGRAPH);
+    console.assert(
+        body.getChild(0).asParagraph().getHeading() === DocumentApp.ParagraphHeading.NORMAL);
+    console.assert(body.getText() === '');
+
+    // An image goes into the document at its natural size, here 300 by 200 pixels:
+    const png = Utilities.base64Decode(
+        'iVBORw0KGgoAAAANSUhEUgAAASwAAADICAIAAADdvUsCAAABrElEQVR42u3TQQkAAAjAwPUvrTF8eHAJBmsKOCQB'
+        + 'mBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQ'
+        + 'TAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAgmlABM'
+        + 'CCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgm'
+        + 'BEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBBMCJgQT'
+        + 'AiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwIm'
+        + 'BBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAhKACcGEgAnBhIAJ'
+        + '4akFT+KDSJWA/YAAAAAASUVORK5CYII=');
+    const appendedImage = body.appendImage(Utilities.newBlob(png, 'image/png'));
+    // An appended image is in a paragraph of its own, and can be a range of its own:
+    console.assert(appendedImage.getParent().getType() === DocumentApp.ElementType.PARAGRAPH);
+    const imageRange = doc.newRange().addElement(appendedImage).build().getRangeElements();
+    console.assert(imageRange.length === 1);
+    console.assert(
+        imageRange[0].getElement().getType() === DocumentApp.ElementType.INLINE_IMAGE);
+    console.assert(appendedImage.getWidth() === 300);
+    console.assert(appendedImage.getHeight() === 200);
+    const insertedImage = doc.newPosition(body.getChild(0), 0)
+        .insertInlineImage(Utilities.newBlob(png, 'image/png'));
+    console.assert(insertedImage.getWidth() === 300);
+    console.assert(insertedImage.getHeight() === 200);
+
+    // A body and a paragraph that have already been read see the changes made since, also those
+    // made through other objects for the same body or paragraph:
+    const count = body.getNumChildren();
+    const imageParagraph = body.getChild(0).asParagraph();
+    const imageParagraphCount = imageParagraph.getNumChildren();
+    body.appendParagraph('Appended');
+    console.assert(body.getNumChildren() === count + 1);
+    console.assert(body.getChild(count).asParagraph().getText() === 'Appended');
+    console.assert(body.getChild(count - 1).getNextSibling().getText() === 'Appended');
+    const beforeRemoved = body.getChild(count - 2);
+    doc.getBody().getChild(count - 1).removeFromParent();
+    console.assert(beforeRemoved.getNextSibling().getText() === 'Appended');
+    console.assert(body.getNumChildren() === count);
+    console.assert(body.getChild(count - 1).asParagraph().getText() === 'Appended');
+    console.assert(body.getChild(count - 2).getNextSibling().getText() === 'Appended');
+    console.assert(
+        body.getChild(count - 1).getPreviousSibling().getText()
+        === body.getChild(count - 2).getText());
+    const secondImage = doc.newPosition(doc.getBody().getChild(0), 0)
+        .insertInlineImage(Utilities.newBlob(png, 'image/png'));
+    console.assert(imageParagraph.getNumChildren() === imageParagraphCount + 1);
+    secondImage.removeFromParent();
+    console.assert(imageParagraph.getNumChildren() === imageParagraphCount);
+    // Only COOL has the legacy UNO API, whose changes are seen too, as are those of undo:
+    if (globalThis.cool) {
+        const unoText = cool.getActiveUnoModel().getText();
+        // 0 is com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK:
+        unoText.insertControlCharacter(unoText.getEnd(), 0, false);
+        console.assert(body.getNumChildren() === count + 1);
+        console.assert(body.getChild(count).asParagraph().getText() === '');
+        cool.getActiveUnoModel().getUndoManager().undo();
+        console.assert(body.getNumChildren() === count);
+    }
+
+    // A positioned image starts at the top left of its paragraph, with the text wrapped around it,
+    // and is no child of the paragraph:
+    const positionedParagraph = body.appendParagraph('Positioned');
+    const positioned = positionedParagraph.addPositionedImage(Utilities.newBlob(png, 'image/png'));
+    console.assert(positioned.getLeftOffset() === 0);
+    console.assert(positioned.getTopOffset() === 0);
+    console.assert(positioned.getLayout() === DocumentApp.PositionedLayout.WRAP_TEXT);
+    console.assert(positioned.getParagraph().getText() === 'Positioned');
+    console.assert(positionedParagraph.getNumChildren() === 1);
+    console.assert(positionedParagraph.getPositionedImages().length === 1);
+    console.assert(
+        positionedParagraph.getPositionedImage(positioned.getId()).getId() === positioned.getId());
+    positioned.setLeftOffset(36).setTopOffset(-18).setWidth(200).setHeight(100);
+    console.assert(positioned.getLeftOffset() === 36);
+    console.assert(positioned.getTopOffset() === -18);
+    console.assert(positioned.getWidth() === 200);
+    console.assert(positioned.getHeight() === 100);
+    console.assert(
+        positioned.setLayout(DocumentApp.PositionedLayout.ABOVE_TEXT).getLayout()
+        === DocumentApp.PositionedLayout.ABOVE_TEXT);
+    console.assert(
+        positioned.setLayout(DocumentApp.PositionedLayout.BREAK_BOTH).getLayout()
+        === DocumentApp.PositionedLayout.BREAK_BOTH);
+    console.assert(
+        positioned.setLayout(DocumentApp.PositionedLayout.BREAK_LEFT).getLayout()
+        === DocumentApp.PositionedLayout.BREAK_LEFT);
+    console.assert(
+        positioned.setLayout(DocumentApp.PositionedLayout.BREAK_RIGHT).getLayout()
+        === DocumentApp.PositionedLayout.BREAK_RIGHT);
+    console.assert(positionedParagraph.removePositionedImage(positioned.getId()) === true);
+    console.assert(positionedParagraph.getPositionedImages().length === 0);
+    // Removing an image that is not there throws, rather than returning false:
+    let removedTwice = false;
+    try {
+        positionedParagraph.removePositionedImage(positioned.getId());
+    } catch (e) {
+        removedTwice = true;
+    }
+    console.assert(removedTwice);
+    // Only COOL takes an SVG image, and lets a script choose an image's ID:
+    if (globalThis.cool) {
+        const svg = positionedParagraph.addPositionedImage(Utilities.newBlob(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="72pt" height="36pt"'
+                + ' viewBox="0 0 72 36"><rect width="72" height="36" fill="red"/></svg>',
+            'image/svg+xml'));
+        console.assert(svg.setId('canvas').getId() === 'canvas');
+        console.assert(positionedParagraph.getPositionedImage('canvas').getWidth() === 96);
+        console.assert(positionedParagraph.getPositionedImage('canvas').getHeight() === 48);
+        console.assert(positionedParagraph.removePositionedImage('canvas') === true);
+    }
+    // Only COOL can anchor an image to a page, which takes it from its paragraph to the body:
+    if (globalThis.cool) {
+        const anchored = positionedParagraph.addPositionedImage(
+            Utilities.newBlob(png, 'image/png'));
+        console.assert(anchored.getPageAnchor() === null);
+        anchored.setId('page').setPageAnchor(1).setLeftOffset(36).setTopOffset(72);
+        console.assert(anchored.getPageAnchor() === 1);
+        console.assert(anchored.getLeftOffset() === 36);
+        console.assert(anchored.getTopOffset() === 72);
+        console.assert(positionedParagraph.getPositionedImages().length === 0);
+        console.assert(body.getPositionedImages().length === 1);
+        console.assert(body.getPositionedImages()[0].getId() === 'page');
+        {
+            let message = null;
+            try {
+                anchored.getParagraph();
+            } catch (e) {
+                message = e.message;
+            }
+            console.assert(message === 'getParagraph: the image is anchored to a page');
+        }
+        console.assert(body.removePositionedImage('page') === true);
+        console.assert(body.getPositionedImages().length === 0);
+        let removedFromBodyTwice = false;
+        try {
+            body.removePositionedImage('page');
+        } catch (e) {
+            removedFromBodyTwice = true;
+        }
+        console.assert(removedFromBodyTwice);
+    }
+
+    // Document properties are strings that a missing key reads as null:
+    const docProps = PropertiesService.getDocumentProperties();
+    docProps.deleteAllProperties();
+    console.assert(docProps.getProperty('k') === null);
+    docProps.setProperty('k', 'v').setProperties({ a: '1', b: 2 });
+    console.assert(docProps.getProperty('k') === 'v');
+    console.assert(docProps.getProperty('b') === '2.0');
+    console.assert(docProps.setProperty('n', 2.5).getProperty('n') === '2.5');
+    docProps.deleteProperty('n');
+    console.assert(JSON.stringify(docProps.getKeys().sort()) === '["a","b","k"]');
+    if (globalThis.cool) {
+        console.assert(
+            cool.getActiveUnoModel().getDocumentProperties().getUserDefinedProperties()
+                .getPropertyValue('scriptinterop_test') === '{"k":"v","a":"1","b":"2.0"}');
+    }
+    docProps.deleteProperty('a');
+    docProps.setProperties({ c: '3' }, true);
+    console.assert(JSON.stringify(docProps.getProperties()) === '{"c":"3"}');
+
+    // A number is stored the way GAS writes it:
+    console.assert(docProps.setProperty('number', -3).getProperty('number') === '-3.0');
+    console.assert(docProps.setProperty('number', 9999999).getProperty('number') === '9999999.0');
+    console.assert(docProps.setProperty('number', 10000000).getProperty('number') === '1.0E7');
+    console.assert(
+        docProps.setProperty('number', 12345678).getProperty('number') === '1.2345678E7');
+    console.assert(
+        docProps.setProperty('number', 123456789012).getProperty('number') === '1.23456789012E11');
+    console.assert(docProps.setProperty('number', 1e21).getProperty('number') === '1.0E21');
+    console.assert(docProps.setProperty('number', 0.001).getProperty('number') === '0.001');
+    console.assert(docProps.setProperty('number', 0.0001).getProperty('number') === '1.0E-4');
+    console.assert(docProps.setProperty('number', 1e-7).getProperty('number') === '1.0E-7');
+    console.assert(
+        docProps.setProperty('number', 1 / 3).getProperty('number') === '0.3333333333333333');
+    console.assert(docProps.setProperty('number', -0).getProperty('number') === '-0.0');
+    console.assert(docProps.setProperty('number', NaN).getProperty('number') === 'NaN');
+    console.assert(docProps.setProperty('number', Infinity).getProperty('number') === 'Infinity');
+    console.assert(docProps.setProperty('number', true).getProperty('number') === 'true');
+    {
+        let message = null;
+        try {
+            docProps.setProperty('number', null);
+        } catch (e) {
+            message = e.message;
+        }
+        console.assert(message === 'Invalid argument: value');
+    }
+
+    // A property whose type a user changed to a number in the properties dialog holds no
+    // properties, and setting one replaces it:
+    if (globalThis.cool) {
+        const custom = cool.getActiveUnoModel().getDocumentProperties().getUserDefinedProperties();
+        custom.removeProperty('scriptinterop_test');
+        custom.addProperty('scriptinterop_test', 128, 42);
+        console.assert(docProps.getKeys().length === 0);
+        console.assert(docProps.setProperty('k', 'v').getProperty('k') === 'v');
+    }
+
+    docProps.deleteAllProperties();
+    console.assert(docProps.getKeys().length === 0);
+
+    // The text of a paragraph merges with the paragraph before it:
+    body.appendParagraph('Mer');
+    const merged = body.appendParagraph('ged').editAsText().merge();
+    console.assert(merged.getText() === 'Merged');
+    console.assert(body.getChild(body.getNumChildren() - 1).getText() === 'Merged');
+    body.appendParagraph('');
+    const intoEmpty = body.appendParagraph('Tail').editAsText().merge();
+    console.assert(intoEmpty.getText() === 'Tail');
+    console.assert(body.getChild(body.getNumChildren() - 1).getText() === 'Tail');
+
+    // Texts with offsets around a whole paragraph that holds an image are one Writer selection:
+    if (globalThis.cool) {
+        const first = body.appendParagraph('abc');
+        const middle = body.appendParagraph('foobar');
+        doc.newPosition(middle.getChild(0), 3).insertInlineImage(blob);
+        const last = body.appendParagraph('xyz');
+        doc.setSelection(
+            doc.newRange().addElementsBetween(first.editAsText(), 1, last.editAsText(), 1).build());
+        console.assert(
+            cool.getActiveUnoModel().getCurrentController().getSelection().getCount() === 1);
+    }
+
+    // The text of the body has attributes at the line end after an empty paragraph:
+    body.appendParagraph('');
+    body.appendParagraph('z');
+    console.assert(!throws(() => bodyText.isBold(bodyText.getText().length - 2)));
+    console.assert(!throws(() => bodyText.getForegroundColor(bodyText.getText().length - 2)));
+}

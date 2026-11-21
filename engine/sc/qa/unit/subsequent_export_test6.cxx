@@ -1,0 +1,1703 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+// Tests for JSON filter options in CSV import/export (convert-to API)
+
+#include "helper/qahelper.hxx"
+#include <scitems.hxx>
+#include <editeng/brushitem.hxx>
+
+#include <dbdata.hxx>
+#include <docsh.hxx>
+#include <formulacell.hxx>
+#include <tablestyle.hxx>
+#include <attrib.hxx>
+#include <validat.hxx>
+#include <document.hxx>
+#include <typedstrdata.hxx>
+#include <rangenam.hxx>
+#include <token.hxx>
+#include <tokenarray.hxx>
+#include <patattr.hxx>
+
+#include <svtools/sfxecode.hxx>
+#include <svl/intitem.hxx>
+#include <sfx2/docfile.hxx>
+#include <comphelper/sequence.hxx>
+#include <comphelper/processfactory.hxx>
+#include <com/sun/star/awt/XControlModel.hpp>
+#include <com/sun/star/drawing/XControlShape.hpp>
+#include <com/sun/star/drawing/XDrawPageSupplier.hpp>
+#include <com/sun/star/drawing/XShapes.hpp>
+#include <com/sun/star/lang/XMultiServiceFactory.hpp>
+#include <com/sun/star/sheet/XSpreadsheetDocument.hpp>
+#include <com/sun/star/beans/XPropertySet.hpp>
+#include <com/sun/star/sheet/XSpreadsheet.hpp>
+#include <com/sun/star/table/BorderLine2.hpp>
+#include <com/sun/star/table/BorderLineStyle.hpp>
+#include <com/sun/star/table/TableBorder2.hpp>
+#include <com/sun/star/util/XMergeable.hpp>
+
+using namespace ::com::sun::star;
+
+class ScExportTest6 : public ScModelTestBase
+{
+public:
+    ScExportTest6()
+        : ScModelTestBase(u"sc/qa/unit/data"_ustr)
+    {
+    }
+
+protected:
+    OString readExportedFile()
+    {
+        SvMemoryStream aMemoryStream;
+        SvFileStream aStream(maTempFile.GetURL(), StreamMode::READ);
+        aStream.ReadStream(aMemoryStream);
+        const char* pData = static_cast<const char*>(aMemoryStream.GetData());
+        int offset = 0;
+        // Skip BOM if present
+        if (aMemoryStream.GetSize() > 2 && pData[0] == '\xEF' && pData[1] == '\xBB'
+            && pData[2] == '\xBF')
+            offset = 3;
+        return OString(pData + offset, aMemoryStream.GetSize() - offset);
+    }
+};
+
+// --- CSV Export Tests ---
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonFieldSeparator)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"A"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"B"_ustr);
+    pDoc->SetString(ScAddress(2, 0, 0), u"C"_ustr);
+
+    setFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\"\\t\"}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    CPPUNIT_ASSERT_MESSAGE("Tab separator should be used", aData.indexOf("A\tB\tC") >= 0);
+}
+
+// A shape whose line comes from the style reference of its theme keeps the colour that reference
+// arrives at. The reference shades a theme colour, and what the shape wrote named the theme colour
+// alone, so the outline came back in the colour before the shade.
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testShapeLineKeepsTheShadeItIsGiven)
+{
+    createScDoc("xlsx/tdf135828_Shape_Rect.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pDrawing = parseExport(u"xl/drawings/drawing1.xml"_ustr);
+    CPPUNIT_ASSERT(pDrawing);
+    assertXPath(pDrawing, "//a:ln/a:solidFill/a:schemeClr", "val", u"accent1");
+    assertXPath(pDrawing, "//a:ln/a:solidFill/a:schemeClr/a:shade", "val", u"50000");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonTextDelimiter)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    // Text containing the separator character (comma) requires quoting
+    pDoc->SetString(ScAddress(0, 0, 0), u"hello,world"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"plain"_ustr);
+
+    // Use single quote as text delimiter
+    setFilterOptions(u"{\"TextDelimiter\":{\"type\":\"string\",\"value\":\"'\"},"
+                     "\"QuoteAllText\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    // Fields should be quoted with single quotes
+    CPPUNIT_ASSERT_MESSAGE("Single quote delimiter expected", aData.indexOf("'hello,world'") >= 0);
+    CPPUNIT_ASSERT_MESSAGE("QuoteAllText should quote plain text too",
+                           aData.indexOf("'plain'") >= 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonSaveAsShown)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetValue(ScAddress(0, 0, 0), 1.23456789);
+
+    // SaveAsShown=false means the full precision value is exported
+    setFilterOptions(u"{\"SaveAsShown\":{\"type\":\"boolean\",\"value\":false}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    // Should contain the full precision number
+    CPPUNIT_ASSERT_MESSAGE("Full precision expected", aData.indexOf("1.23456789") >= 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonSaveFormulas)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetValue(ScAddress(0, 0, 0), 10.0);
+    pDoc->SetValue(ScAddress(1, 0, 0), 20.0);
+    pDoc->SetString(ScAddress(2, 0, 0), u"=A1+B1"_ustr);
+
+    setFilterOptions(u"{\"SaveFormulas\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    // The formula should appear in the output, not the computed value 30
+    CPPUNIT_ASSERT_MESSAGE("Formula should be exported", aData.indexOf("=A1+B1") >= 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonSaveNumberAsSuch)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetValue(ScAddress(0, 0, 0), 42.0);
+
+    // SaveNumberAsSuch=true (default) saves numbers without quoting
+    setFilterOptions(u"{\"SaveNumberAsSuch\":{\"type\":\"boolean\",\"value\":true},"
+                     "\"QuoteAllText\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    // Number should NOT be quoted even when QuoteAllText is true
+    CPPUNIT_ASSERT_MESSAGE("Number should not be quoted", aData.indexOf("\"42\"") < 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonIncludeBOM)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"test"_ustr);
+
+    setFilterOptions(u"{\"IncludeBOM\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    save(TestFilter::CSV);
+
+    SvFileStream aStream(maTempFile.GetURL(), StreamMode::READ);
+    char buf[3] = {};
+    aStream.ReadBytes(buf, 3);
+    // UTF-8 BOM: EF BB BF
+    CPPUNIT_ASSERT_EQUAL('\xEF', buf[0]);
+    CPPUNIT_ASSERT_EQUAL('\xBB', buf[1]);
+    CPPUNIT_ASSERT_EQUAL('\xBF', buf[2]);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonNoBOM)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"test"_ustr);
+
+    setFilterOptions(u"{\"IncludeBOM\":{\"type\":\"boolean\",\"value\":false}}"_ustr);
+    save(TestFilter::CSV);
+
+    SvFileStream aStream(maTempFile.GetURL(), StreamMode::READ);
+    char buf[4] = {};
+    aStream.ReadBytes(buf, 4);
+    // Should start with "test", not BOM
+    CPPUNIT_ASSERT_EQUAL("test"_ostr, OString(buf, 4));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonSheet)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->InsertTab(1, u"Second"_ustr);
+    pDoc->SetString(ScAddress(0, 0, 0), u"first_sheet"_ustr);
+    pDoc->SetString(ScAddress(0, 0, 1), u"second_sheet"_ustr);
+
+    // Export the second sheet by number (1-based)
+    setFilterOptions(u"{\"Sheet\":{\"type\":\"long\",\"value\":2}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    CPPUNIT_ASSERT_MESSAGE("Should contain second sheet data", aData.indexOf("second_sheet") >= 0);
+    CPPUNIT_ASSERT_MESSAGE("Should not contain first sheet data", aData.indexOf("first_sheet") < 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonSheetByName)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->InsertTab(1, u"MySheet"_ustr);
+    pDoc->SetString(ScAddress(0, 0, 0), u"first_sheet"_ustr);
+    pDoc->SetString(ScAddress(0, 0, 1), u"named_sheet"_ustr);
+
+    // Export sheet by name
+    setFilterOptions(u"{\"Sheet\":{\"type\":\"string\",\"value\":\"MySheet\"}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    CPPUNIT_ASSERT_MESSAGE("Should contain named sheet data", aData.indexOf("named_sheet") >= 0);
+    CPPUNIT_ASSERT_MESSAGE("Should not contain first sheet data", aData.indexOf("first_sheet") < 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonDefaults)
+{
+    // When JSON is used but no options specified, defaults should apply:
+    // UTF-8, comma separator, double-quote delimiter
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"hello"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"world"_ustr);
+
+    // Empty JSON object - all defaults
+    setFilterOptions(u"{}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    CPPUNIT_ASSERT_MESSAGE("Comma separator by default", aData.indexOf("hello,world") >= 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonMultipleOptions)
+{
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"text"_ustr);
+    pDoc->SetValue(ScAddress(1, 0, 0), 42.0);
+    pDoc->SetString(ScAddress(2, 0, 0), u"=B1*2"_ustr);
+
+    setFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\";\"},"
+                     "\"SaveFormulas\":{\"type\":\"boolean\",\"value\":true},"
+                     "\"IncludeBOM\":{\"type\":\"boolean\",\"value\":false}}"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    CPPUNIT_ASSERT_MESSAGE("Semicolon separator expected", aData.indexOf(';') >= 0);
+    CPPUNIT_ASSERT_MESSAGE("Formula should be present", aData.indexOf("=B1*2") >= 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvExportJsonLegacyFallback)
+{
+    // Non-JSON filter options should still work (legacy format)
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"A"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"B"_ustr);
+
+    // Legacy format: field_sep, text_sep, charset
+    setFilterOptions(u"9,34,UTF-8"_ustr);
+    save(TestFilter::CSV);
+    OString aData = readExportedFile();
+    CPPUNIT_ASSERT_MESSAGE("Tab separator (legacy format)", aData.indexOf("A\tB") >= 0);
+}
+
+// --- CSV Import Tests ---
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonFieldSeparator)
+{
+    // Create a document, export with semicolons, then reimport with JSON options
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"Col1"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"Col2"_ustr);
+    pDoc->SetString(ScAddress(2, 0, 0), u"Col3"_ustr);
+    pDoc->SetValue(ScAddress(0, 1, 0), 10.0);
+    pDoc->SetValue(ScAddress(1, 1, 0), 20.0);
+    pDoc->SetValue(ScAddress(2, 1, 0), 30.0);
+
+    // Export with semicolon separator
+    setFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\";\"}}"_ustr);
+    save(TestFilter::CSV);
+
+    // Now reimport with JSON options specifying semicolon
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\";\"}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    CPPUNIT_ASSERT_EQUAL(u"Col1"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Col2"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Col3"_ustr, pDoc->GetString(ScAddress(2, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(10.0, pDoc->GetValue(ScAddress(0, 1, 0)));
+    CPPUNIT_ASSERT_EQUAL(20.0, pDoc->GetValue(ScAddress(1, 1, 0)));
+    CPPUNIT_ASSERT_EQUAL(30.0, pDoc->GetValue(ScAddress(2, 1, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonStartRow)
+{
+    // Create a CSV with header rows we want to skip
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"Header1"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"Header2"_ustr);
+    pDoc->SetString(ScAddress(0, 1, 0), u"SubHeader1"_ustr);
+    pDoc->SetString(ScAddress(1, 1, 0), u"SubHeader2"_ustr);
+    pDoc->SetString(ScAddress(0, 2, 0), u"Data1"_ustr);
+    pDoc->SetValue(ScAddress(1, 2, 0), 100.0);
+
+    setFilterOptions(u"{}"_ustr);
+    save(TestFilter::CSV);
+
+    // Reimport starting from row 3 (skip two header rows)
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"StartRow\":{\"type\":\"long\",\"value\":3}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    // First row should be "Data1", not "Header1"
+    CPPUNIT_ASSERT_EQUAL(u"Data1"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(100.0, pDoc->GetValue(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonQuotedFieldAsText)
+{
+    // Write a CSV file with a quoted number
+    utl::TempFileNamed aTempFile;
+    aTempFile.EnableKillingFile();
+    {
+        SvFileStream aStream(aTempFile.GetURL(), StreamMode::WRITE);
+        // "12345" is a number wrapped in quotes
+        aStream.WriteOString("\"12345\",plain\n");
+        aStream.Flush();
+    }
+
+    // Import with QuotedFieldAsText=true - quoted numbers should become text
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"QuotedFieldAsText\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    loadFromURL(aTempFile.GetURL());
+    ScDocument* pDoc = getScDoc();
+
+    // The quoted number should be imported as text, not number
+    CPPUNIT_ASSERT_MESSAGE("Should be text, not number", pDoc->HasStringData(0, 0, 0));
+    CPPUNIT_ASSERT_EQUAL(u"12345"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonDetectSpecialNumber)
+{
+    // Create CSV with a date-like string
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"text"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"12/31/2025"_ustr);
+
+    // Export without quoting to get raw text in CSV
+    setFilterOptions(u"{}"_ustr);
+    save(TestFilter::CSV);
+
+    // Import with DetectSpecialNumber=false - date should be kept as text
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(
+        u"{\"DetectSpecialNumber\":{\"type\":\"boolean\",\"value\":false}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    CPPUNIT_ASSERT_EQUAL(u"text"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    // With DetectSpecialNumber=false, the date string should stay as text
+    CPPUNIT_ASSERT_MESSAGE("Date should be imported as text", pDoc->HasStringData(1, 0, 0));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonEvaluateFormulas)
+{
+    // Create CSV with a formula
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetValue(ScAddress(0, 0, 0), 10.0);
+    pDoc->SetString(ScAddress(1, 0, 0), u"=A1*2"_ustr);
+
+    // Export formulas as text
+    setFilterOptions(u"{\"SaveFormulas\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    save(TestFilter::CSV);
+
+    // Import with EvaluateFormulas=false - formula should be text
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"EvaluateFormulas\":{\"type\":\"boolean\",\"value\":false}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    // The formula text should be imported as a string, not evaluated
+    CPPUNIT_ASSERT_MESSAGE("Formula should be imported as text", pDoc->HasStringData(1, 0, 0));
+    CPPUNIT_ASSERT_EQUAL(u"=A1*2"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonEvaluateFormulasTrue)
+{
+    // Create CSV with a formula
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetValue(ScAddress(0, 0, 0), 10.0);
+    pDoc->SetString(ScAddress(1, 0, 0), u"=A1*2"_ustr);
+
+    // Export formulas
+    setFilterOptions(u"{\"SaveFormulas\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    save(TestFilter::CSV);
+
+    // Import with EvaluateFormulas=true - formula should be evaluated
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"EvaluateFormulas\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    // The formula should be evaluated
+    CPPUNIT_ASSERT_EQUAL(10.0, pDoc->GetValue(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(20.0, pDoc->GetValue(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonRemoveSpace)
+{
+    // Write a CSV file with spaces around values manually
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"  hello  "_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"  world  "_ustr);
+
+    setFilterOptions(u"{}"_ustr);
+    save(TestFilter::CSV);
+
+    // Import with RemoveSpace=true
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"RemoveSpace\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    // Spaces should be trimmed
+    CPPUNIT_ASSERT_EQUAL(u"hello"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"world"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonColumnFormat)
+{
+    // Write a CSV file with values that could be interpreted as numbers
+    utl::TempFileNamed aTempFile;
+    aTempFile.EnableKillingFile();
+    {
+        SvFileStream aStream(aTempFile.GetURL(), StreamMode::WRITE);
+        // "00123" has leading zeros - only preserved with Text format
+        aStream.WriteOString("00123,text,456\n");
+        aStream.Flush();
+    }
+
+    // Import with column formats: col 1 as Text (2), col 2 as Standard (1), col 3 as Text (2)
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(
+        u"{\"ColumnFormat\":{\"type\":\"string\",\"value\":\"1/2/2/1/3/2\"}}"_ustr);
+    loadFromURL(aTempFile.GetURL());
+    ScDocument* pDoc = getScDoc();
+
+    // Column 1 (format=Text): "00123" should be kept as text with leading zeros
+    CPPUNIT_ASSERT_MESSAGE("Col1 should be text (ColumnFormat=2)", pDoc->HasStringData(0, 0, 0));
+    CPPUNIT_ASSERT_EQUAL(u"00123"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+
+    // Column 2 (format=Standard): "text" stays text
+    CPPUNIT_ASSERT_EQUAL(u"text"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+
+    // Column 3 (format=Text): "456" should be text, not number
+    CPPUNIT_ASSERT_MESSAGE("Col3 should be text (ColumnFormat=2)", pDoc->HasStringData(2, 0, 0));
+    CPPUNIT_ASSERT_EQUAL(u"456"_ustr, pDoc->GetString(ScAddress(2, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonColumnFormatSkip)
+{
+    // Write a CSV file to test Skip column format
+    utl::TempFileNamed aTempFile;
+    aTempFile.EnableKillingFile();
+    {
+        SvFileStream aStream(aTempFile.GetURL(), StreamMode::WRITE);
+        aStream.WriteOString("keep1,skip_me,keep2\n");
+        aStream.Flush();
+    }
+
+    // Import: col 1=Standard, col 2=Skip(9), col 3=Standard
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(
+        u"{\"ColumnFormat\":{\"type\":\"string\",\"value\":\"1/1/2/9/3/1\"}}"_ustr);
+    loadFromURL(aTempFile.GetURL());
+    ScDocument* pDoc = getScDoc();
+
+    CPPUNIT_ASSERT_EQUAL(u"keep1"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    // Column 2 was skipped, so "keep2" should be in column B (index 1)
+    CPPUNIT_ASSERT_EQUAL(u"keep2"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonMergeDelimiters)
+{
+    // Create CSV with multiple consecutive separators
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"A"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"B"_ustr);
+
+    // Export with tab separator
+    setFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\"\\t\"}}"_ustr);
+    save(TestFilter::CSV);
+
+    // Manually we can't easily create double-tabs via export, but we can
+    // test that MergeDelimiters option is accepted without error
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\"\\t\"},"
+                           "\"MergeDelimiters\":{\"type\":\"boolean\",\"value\":true}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    CPPUNIT_ASSERT_EQUAL(u"A"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"B"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonFixedWidth)
+{
+    // Write a fixed-width text file manually
+    utl::TempFileNamed aTempFile;
+    aTempFile.EnableKillingFile();
+    {
+        SvFileStream aStream(aTempFile.GetURL(), StreamMode::WRITE);
+        // Fixed width: col1=5chars, col2=5chars, col3=rest
+        OString aLine("ABCDE12345Hello\n"_ostr);
+        aStream.WriteOString(aLine);
+        aStream.Flush();
+    }
+
+    // Import as fixed-width with column positions at 0, 5, 10
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(
+        u"{\"FixedWidth\":{\"type\":\"boolean\",\"value\":true},"
+        "\"ColumnFormat\":{\"type\":\"string\",\"value\":\"0/1/5/1/10/1\"}}"_ustr);
+    loadFromURL(aTempFile.GetURL());
+    ScDocument* pDoc = getScDoc();
+
+    CPPUNIT_ASSERT_EQUAL(u"ABCDE"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(12345.0, pDoc->GetValue(ScAddress(1, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Hello"_ustr, pDoc->GetString(ScAddress(2, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonFixedWidthTextFormat)
+{
+    // Write a fixed-width text file with numbers that should be kept as text
+    utl::TempFileNamed aTempFile;
+    aTempFile.EnableKillingFile();
+    {
+        SvFileStream aStream(aTempFile.GetURL(), StreamMode::WRITE);
+        // Fixed width: col1=5chars (zip code), col2=10chars (phone)
+        OString aLine("0712305551234567\n"_ostr);
+        aStream.WriteOString(aLine);
+        aStream.Flush();
+    }
+
+    // Import as fixed-width: col1 as Text(2), col2 as Text(2)
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"FixedWidth\":{\"type\":\"boolean\",\"value\":true},"
+                           "\"ColumnFormat\":{\"type\":\"string\",\"value\":\"0/2/5/2\"}}"_ustr);
+    loadFromURL(aTempFile.GetURL());
+    ScDocument* pDoc = getScDoc();
+
+    // Should preserve leading zeros as text
+    CPPUNIT_ASSERT_MESSAGE("Zip code should be text", pDoc->HasStringData(0, 0, 0));
+    CPPUNIT_ASSERT_EQUAL(u"07123"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_MESSAGE("Phone should be text", pDoc->HasStringData(1, 0, 0));
+    CPPUNIT_ASSERT_EQUAL(u"05551234567"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportJsonLegacyFallback)
+{
+    // Non-JSON import filter options should still work (legacy format)
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"X"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"Y"_ustr);
+
+    // Export with tabs
+    setFilterOptions(u"9,34,UTF-8"_ustr);
+    save(TestFilter::CSV);
+
+    // Reimport with legacy options (tab separator)
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"9,34,UTF-8"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    CPPUNIT_ASSERT_EQUAL(u"X"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Y"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportExportJsonRoundTrip)
+{
+    // Full round-trip: create doc, export with JSON options, reimport with JSON options
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    pDoc->SetString(ScAddress(0, 0, 0), u"Name"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"Value"_ustr);
+    pDoc->SetString(ScAddress(2, 0, 0), u"Note"_ustr);
+    pDoc->SetString(ScAddress(0, 1, 0), u"Item;One"_ustr); // contains semicolon
+    pDoc->SetValue(ScAddress(1, 1, 0), 3.14);
+    pDoc->SetString(ScAddress(2, 1, 0), u"a \"quoted\" note"_ustr); // contains quotes
+
+    // Export with semicolon separator
+    setFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\";\"},"
+                     "\"IncludeBOM\":{\"type\":\"boolean\",\"value\":false}}"_ustr);
+    save(TestFilter::CSV);
+
+    // Reimport with matching options
+    setImportFilterName(TestFilter::CSV);
+    setImportFilterOptions(u"{\"FieldSeparator\":{\"type\":\"string\",\"value\":\";\"}}"_ustr);
+    loadFromURL(maTempFile.GetURL());
+    pDoc = getScDoc();
+
+    CPPUNIT_ASSERT_EQUAL(u"Name"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Value"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Note"_ustr, pDoc->GetString(ScAddress(2, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Item;One"_ustr, pDoc->GetString(ScAddress(0, 1, 0)));
+    CPPUNIT_ASSERT_EQUAL(3.14, pDoc->GetValue(ScAddress(1, 1, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"a \"quoted\" note"_ustr, pDoc->GetString(ScAddress(2, 1, 0)));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCsvImportEmptyFilterOptions)
+{
+    // Write a comma-separated CSV file
+    utl::TempFileNamed aTempFile;
+    aTempFile.EnableKillingFile();
+    {
+        SvFileStream aStream(aTempFile.GetURL(), StreamMode::WRITE);
+        aStream.WriteOString("Name,Value,Note\nAlpha,100,first\nBeta,200,second\n");
+        aStream.Flush();
+    }
+
+    // Load with explicitly empty FilterOptions (simulates convert-to API without
+    // infilterOptions). Before the fix, ReadFromString("") left the default semicolon
+    // separator and set bOptInit=true, preventing the comma/UTF-8 fallback defaults.
+    std::vector<css::beans::PropertyValue> aFilterOptions;
+    css::beans::PropertyValue aFilterName;
+    aFilterName.Name = u"FilterName"_ustr;
+    aFilterName.Value <<= u"Text - txt - csv (StarCalc)"_ustr;
+    aFilterOptions.push_back(aFilterName);
+    css::beans::PropertyValue aFilterOpts;
+    aFilterOpts.Name = u"FilterOptions"_ustr;
+    aFilterOpts.Value <<= OUString();
+    aFilterOptions.push_back(aFilterOpts);
+    loadWithParams(aTempFile.GetURL(), comphelper::containerToSequence(aFilterOptions));
+
+    ScDocument* pDoc = getScDoc();
+
+    // With the fix, commas are detected as field separators (fallback defaults apply).
+    // Without the fix, each line is imported as a single cell.
+    CPPUNIT_ASSERT_EQUAL(u"Name"_ustr, pDoc->GetString(ScAddress(0, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Value"_ustr, pDoc->GetString(ScAddress(1, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Note"_ustr, pDoc->GetString(ScAddress(2, 0, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Alpha"_ustr, pDoc->GetString(ScAddress(0, 1, 0)));
+    CPPUNIT_ASSERT_EQUAL(100.0, pDoc->GetValue(ScAddress(1, 1, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"first"_ustr, pDoc->GetString(ScAddress(2, 1, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"Beta"_ustr, pDoc->GetString(ScAddress(0, 2, 0)));
+    CPPUNIT_ASSERT_EQUAL(200.0, pDoc->GetValue(ScAddress(1, 2, 0)));
+    CPPUNIT_ASSERT_EQUAL(u"second"_ustr, pDoc->GetString(ScAddress(2, 2, 0)));
+}
+
+// A shape with no text still keeps the size its text would take. The export left out the text
+// body of such a shape, so the shape came back at the size a reader assumes rather than the one
+// the file gave it.
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testEmptyShapeKeepsTheTextSizeItIsGiven)
+{
+    createScDoc("xlsx/hiddenShape.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pDrawing = parseExport(u"xl/drawings/drawing1.xml"_ustr);
+    CPPUNIT_ASSERT(pDrawing);
+    assertXPath(pDrawing, "//xdr:txBody/a:p/a:endParaRPr", "sz", u"1100");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testMissingPathExternal)
+{
+    createScDoc("xlsx/MissingPathExternal.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pExternalRel
+        = parseExport(u"xl/externalLinks/_rels/externalLink1.xml.rels"_ustr);
+    CPPUNIT_ASSERT(pExternalRel);
+
+    assertXPath(
+        pExternalRel, "/rels:Relationships/rels:Relationship", "Type",
+        u"http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlPathMissing");
+    assertXPath(pExternalRel, "/rels:Relationships/rels:Relationship", "Target", u"Tabelle1");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testShapeKeepsTheWayItFollowsTheCells)
+{
+    createScDoc("xlsx/chart_hyperlink.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pDrawing = parseExport(u"xl/drawings/drawing1.xml"_ustr);
+    CPPUNIT_ASSERT(pDrawing);
+    assertXPath(pDrawing, "/xdr:wsDr/xdr:twoCellAnchor[1]", "editAs", u"twoCell");
+
+    createScDoc("xlsx/tdf161365.xlsx");
+    save(TestFilter::XLSX);
+
+    pDrawing = parseExport(u"xl/drawings/drawing1.xml"_ustr);
+    CPPUNIT_ASSERT(pDrawing);
+    assertXPath(pDrawing, "(//xdr:twoCellAnchor)[1]", "editAs", u"absolute");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testXlStartupExternalXLS)
+{
+    createScDoc("xls/XlStartupExternal.xls");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pExternalRel
+        = parseExport(u"xl/externalLinks/_rels/externalLink1.xml.rels"_ustr);
+    CPPUNIT_ASSERT(pExternalRel);
+
+    assertXPath(
+        pExternalRel, "/rels:Relationships/rels:Relationship", "Type",
+        u"http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlStartup");
+    assertXPath(pExternalRel, "/rels:Relationships/rels:Relationship", "Target", u"personal.xls");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testXlStartupExternalXLSX)
+{
+    createScDoc("xlsx/XlStartupExternal.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pExternalRel
+        = parseExport(u"xl/externalLinks/_rels/externalLink1.xml.rels"_ustr);
+    CPPUNIT_ASSERT(pExternalRel);
+
+    assertXPath(
+        pExternalRel, "/rels:Relationships/rels:Relationship", "Type",
+        u"http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlStartup");
+    assertXPath(pExternalRel, "/rels:Relationships/rels:Relationship", "Target", u"personal.xls");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testChartExternalRefCache)
+{
+    // In this test, the chart series read a range in another workbook, but
+    // no formula cell
+    // reads anything there. Verify that the cached values of that range
+    // still get written out
+    createScDoc("xlsx/ExternalRefChart.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pExtLink = parseExport(u"xl/externalLinks/externalLink1.xml"_ustr);
+    CPPUNIT_ASSERT(pExtLink);
+
+    static constexpr char aRowPath[]
+        = "/x:externalLink/x:externalBook/x:sheetDataSet/x:sheetData/x:row";
+    assertXPath(pExtLink, aRowPath, 3);
+    assertXPathContent(pExtLink, OString::Concat(aRowPath) + "[1]/x:cell/x:v", u"10");
+    assertXPathContent(pExtLink, OString::Concat(aRowPath) + "[2]/x:cell/x:v", u"20");
+    assertXPathContent(pExtLink, OString::Concat(aRowPath) + "[3]/x:cell/x:v", u"30");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testShapeMacroExtRef)
+{
+    createScDoc("xlsx/shape-macro-ext-ref.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pDrawing = parseExport(u"xl/drawings/drawing1.xml"_ustr);
+    CPPUNIT_ASSERT(pDrawing);
+    assertXPath(pDrawing, "//xdr:sp", "macro", u"[1]!Importieren");
+
+    xmlDocUniquePtr pExtLink = parseExport(u"xl/externalLinks/externalLink1.xml"_ustr);
+    CPPUNIT_ASSERT(pExtLink);
+    assertXPath(pExtLink, "/x:externalLink/x:externalBook/x:definedNames/x:definedName", "name",
+                u"Importieren");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testEveryFormControlSurvivesTheSave)
+{
+    createScDoc("xlsx/tdf111980_radioButtons.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet1.xml"_ustr);
+    CPPUNIT_ASSERT(pSheet);
+    // five option buttons, a group box and five controls that live in a part of their own
+    assertXPath(pSheet, "//x:controls/*", 11);
+    assertXPath(pSheet, "//x:controls//x:control[@name='Group Box 7']", 1);
+
+    xmlDocUniquePtr pVml = parseExport(u"xl/drawings/vmlDrawing1.vml"_ustr);
+    CPPUNIT_ASSERT(pVml);
+    assertXPath(pVml, "//v:shape/xx:ClientData[@ObjectType='Radio']", 5);
+    assertXPath(pVml, "//v:shape/xx:ClientData[@ObjectType='GBox']", 1);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testListKeepsTheFlatLookItStates)
+{
+    // The sheet holds one list, and the document says it is drawn flat rather than raised.
+    createScDoc("xlsx/list-with-a-flat-look.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pVml = parseExport(u"xl/drawings/vmlDrawing1.vml"_ustr);
+    CPPUNIT_ASSERT(pVml);
+    assertXPath(pVml, "//v:shape/xx:ClientData[@ObjectType='List']/xx:NoThreeD2", 1);
+
+    xmlDocUniquePtr pControl = parseExport(u"xl/ctrlProps/ctrlProps2.xml"_ustr);
+    CPPUNIT_ASSERT(pControl);
+    assertXPath(pControl, "/x14:formControlPr", "noThreeD2", u"1");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testQueryTableHeaders)
+{
+    createScDoc("xlsx/TableEmptyHeaders.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pTable = parseExport(u"xl/tables/table1.xml"_ustr);
+    CPPUNIT_ASSERT(pTable);
+
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[1]", "name", u"Column1");
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[2]", "name", u"Column2");
+}
+
+// --- Table Style OOXML Export Tests ---
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testMergedRangeKeepsTheFormatOfItsCells)
+{
+    createScDoc("xlsx/cell-anchored-hidden-shapes.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet1.xml"_ustr);
+    CPPUNIT_ASSERT(pSheet);
+
+    // row 10 is the range A10:H10, whose base cell is written with a format of its own
+    const OUString aBaseStyle = getXPath(pSheet, "//x:row[@r='10']/x:c[@r='A10']", "s");
+    const OUString aCoveredStyle = getXPath(pSheet, "//x:row[@r='10']/x:c[@r='H10']", "s");
+    CPPUNIT_ASSERT(!aBaseStyle.isEmpty());
+    CPPUNIT_ASSERT_MESSAGE("a covered cell must keep its own format",
+                           aBaseStyle != aCoveredStyle);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testTableStyleDefaultExportXLSX)
+{
+    // Open xlsx with default table style (TableStyleMedium2), save as xlsx, verify roundtrip
+    createScDoc("xlsx/TableStyleTest.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pTable = parseExport(u"xl/tables/table1.xml"_ustr);
+    CPPUNIT_ASSERT(pTable);
+
+    // Table style name should survive roundtrip
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", "name", u"TableStyleMedium2");
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", "showRowStripes", u"1");
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", "showColumnStripes", u"0");
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", "showFirstColumn", u"0");
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", "showLastColumn", u"0");
+
+    // Verify table range includes total row
+    assertXPath(pTable, "/x:table", "ref", u"A1:C10");
+    assertXPath(pTable, "/x:table", "totalsRowCount", u"1");
+    // totalsRowShown is unnecessary and should not be exported
+    assertXPathNoAttribute(pTable, "/x:table", "totalsRowShown");
+
+    // The autoFilter must exclude the totals row (row 10)
+    assertXPath(pTable, "/x:table/x:autoFilter", "ref", u"A1:C9");
+
+    // Verify column definitions
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[1]", "name", u"A");
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[3]", "name", u"C");
+
+    // Total row: Column A should have "Total" label
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[1]", "totalsRowLabel", u"Total");
+
+    // Total row: Column B should have custom function (COUNTIF)
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[2]", "totalsRowFunction", u"custom");
+    assertXPathContent(pTable, "/x:table/x:tableColumns/x:tableColumn[2]/x:totalsRowFormula",
+                       u"COUNTIF(Table2[B],\">5\")");
+
+    // Total row: Column C should have average function
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[3]", "totalsRowFunction",
+                u"average");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testTableTotalsRowSubtotalFamilyXLSX)
+{
+    createScDoc("xlsx/table-totals-subtotal-9.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pTable = parseExport(u"xl/tables/table1.xml"_ustr);
+    CPPUNIT_ASSERT(pTable);
+
+    assertXPath(pTable, "/x:table/x:tableColumns/x:tableColumn[3]", "totalsRowFunction",
+                u"custom");
+    assertXPathContent(pTable, "/x:table/x:tableColumns/x:tableColumn[3]/x:totalsRowFormula",
+                       u"SUBTOTAL(9,Table1[sdafsdaf])");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testDefaultTableStyleExportXLSX)
+{
+    // The per-document default table style (used for newly inserted tables) is
+    // exported on the workbook tableStyles element as defaultTableStyle.
+    createScDoc("xlsx/TableStyleTest.xlsx");
+    getScDoc()->GetTableStyles()->SetDefaultStyleName(u"TableStyleMedium5"_ustr);
+
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pStyles = parseExport(u"xl/styles.xml"_ustr);
+    CPPUNIT_ASSERT(pStyles);
+    assertXPath(pStyles, "/x:styleSheet/x:tableStyles", "defaultTableStyle", u"TableStyleMedium5");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testDefaultTableStyleReloadXLSX)
+{
+    // The default table style survives a save and reload.
+    createScDoc("xlsx/TableStyleTest.xlsx");
+    getScDoc()->GetTableStyles()->SetDefaultStyleName(u"TableStyleMedium5"_ustr);
+
+    saveAndReload(TestFilter::XLSX);
+
+    CPPUNIT_ASSERT_EQUAL(u"TableStyleMedium5"_ustr,
+                         getScDoc()->GetTableStyles()->GetDefaultStyleName());
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testTableStyleCustomExportXLSX)
+{
+    // Open xlsx with custom table style, save as xlsx, verify roundtrip
+    createScDoc("xlsx/Book1_custom.xlsx");
+    save(TestFilter::XLSX);
+
+    // Verify table style info
+    xmlDocUniquePtr pTable = parseExport(u"xl/tables/table1.xml"_ustr);
+    CPPUNIT_ASSERT(pTable);
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", "name", u"Custom_Styles1");
+
+    // Verify custom style is exported in styles.xml
+    xmlDocUniquePtr pStyles = parseExport(u"xl/styles.xml"_ustr);
+    CPPUNIT_ASSERT(pStyles);
+
+    // Custom table style should exist with correct name and 7 elements
+    assertXPath(pStyles, "/x:styleSheet/x:tableStyles/x:tableStyle", "name", u"Custom_Styles1");
+    assertXPath(pStyles, "/x:styleSheet/x:tableStyles/x:tableStyle", "count", u"7");
+
+    // Verify all 7 table style elements are exported
+    const char* const sStylePath = "/x:styleSheet/x:tableStyles/x:tableStyle";
+    assertXPath(pStyles, OString::Concat(sStylePath) + "/x:tableStyleElement[@type='wholeTable']");
+    assertXPath(pStyles, OString::Concat(sStylePath) + "/x:tableStyleElement[@type='headerRow']");
+    assertXPath(pStyles, OString::Concat(sStylePath) + "/x:tableStyleElement[@type='totalRow']");
+    assertXPath(pStyles, OString::Concat(sStylePath) + "/x:tableStyleElement[@type='firstColumn']");
+    assertXPath(pStyles, OString::Concat(sStylePath) + "/x:tableStyleElement[@type='lastColumn']");
+    assertXPath(pStyles,
+                OString::Concat(sStylePath) + "/x:tableStyleElement[@type='firstRowStripe']");
+    assertXPath(pStyles,
+                OString::Concat(sStylePath) + "/x:tableStyleElement[@type='firstColumnStripe']");
+
+    // Verify DXFs exist for the custom style elements
+    OUString sDxfCount = getXPath(pStyles, "/x:styleSheet/x:dxfs", "count");
+    CPPUNIT_ASSERT(sDxfCount.toInt32() >= 7);
+
+    // Verify each table style element has a valid dxfId attribute
+    // (DXF order may change during roundtrip, so we check by element type)
+    OString sWholeTable = OString::Concat(sStylePath) + "/x:tableStyleElement[@type='wholeTable']";
+    OString sHeaderRow = OString::Concat(sStylePath) + "/x:tableStyleElement[@type='headerRow']";
+    OString sTotalRow = OString::Concat(sStylePath) + "/x:tableStyleElement[@type='totalRow']";
+
+    // Each element should have a dxfId pointing to a valid DXF
+    sal_Int32 nWholeTableDxfId = getXPath(pStyles, sWholeTable, "dxfId").toInt32();
+    sal_Int32 nHeaderRowDxfId = getXPath(pStyles, sHeaderRow, "dxfId").toInt32();
+    sal_Int32 nTotalRowDxfId = getXPath(pStyles, sTotalRow, "dxfId").toInt32();
+
+    CPPUNIT_ASSERT(nWholeTableDxfId >= 0);
+    CPPUNIT_ASSERT(nHeaderRowDxfId >= 0);
+    CPPUNIT_ASSERT(nTotalRowDxfId >= 0);
+
+    // All dxfIds should be different (each element has its own DXF)
+    CPPUNIT_ASSERT(nWholeTableDxfId != nHeaderRowDxfId);
+    CPPUNIT_ASSERT(nWholeTableDxfId != nTotalRowDxfId);
+    CPPUNIT_ASSERT(nHeaderRowDxfId != nTotalRowDxfId);
+
+    // Verify totalRow DXF has double top border (use 1-based index: dxfId + 1)
+    OString sTotalRowDxf
+        = "/x:styleSheet/x:dxfs/x:dxf[" + OString::number(nTotalRowDxfId + 1) + "]";
+    assertXPath(pStyles, sTotalRowDxf + "/x:border/x:top", "style", u"double");
+
+    // Verify wholeTable DXF has thin borders
+    OString sWholeTableDxf
+        = "/x:styleSheet/x:dxfs/x:dxf[" + OString::number(nWholeTableDxfId + 1) + "]";
+    assertXPath(pStyles, sWholeTableDxf + "/x:border/x:left", "style", u"thin");
+    assertXPath(pStyles, sWholeTableDxf + "/x:border/x:top", "style", u"thin");
+
+    // Verify firstRowStripe DXF has a fill with theme color
+    OString sFirstRowStripe
+        = OString::Concat(sStylePath) + "/x:tableStyleElement[@type='firstRowStripe']";
+    sal_Int32 nFirstRowStripeDxfId = getXPath(pStyles, sFirstRowStripe, "dxfId").toInt32();
+    CPPUNIT_ASSERT(nFirstRowStripeDxfId >= 0);
+    OString sFirstRowStripeDxf
+        = "/x:styleSheet/x:dxfs/x:dxf[" + OString::number(nFirstRowStripeDxfId + 1) + "]";
+    assertXPath(pStyles, sFirstRowStripeDxf + "/x:fill/x:patternFill/x:bgColor", "theme", u"9");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testActiveXControlsSurviveTheSave)
+{
+    createScDoc("xlsx/tdf111980_radioButtons.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet1.xml"_ustr);
+    CPPUNIT_ASSERT(pSheet);
+    assertXPath(pSheet, "//x:controls/x:control[@name='OptionButton1']", 1);
+    assertXPath(pSheet, "//x:controls/x:control[@name='OptionButton5']", 1);
+
+    // the part the sheet points at, and the shape that carries the position of the control
+    CPPUNIT_ASSERT(parseExport(u"xl/activeX/activeX1.xml"_ustr));
+    CPPUNIT_ASSERT(parseExport(u"xl/drawings/vmlDrawing1.vml"_ustr));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testTableStyleInnerBordersExportXLSX)
+{
+    createScDoc("xlsx/tableStyleInnerBorders.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pStyles = parseExport(u"xl/styles.xml"_ustr);
+    CPPUNIT_ASSERT(pStyles);
+
+    assertXPath(pStyles, "/x:styleSheet/x:tableStyles/x:tableStyle", "name", u"Customtablestyle");
+
+    // Locate the wholeTable element's DXF (the DXF order may change on roundtrip).
+    sal_Int32 nWholeTableDxfId
+        = getXPath(
+              pStyles,
+              "/x:styleSheet/x:tableStyles/x:tableStyle/x:tableStyleElement[@type='wholeTable']",
+              "dxfId")
+              .toInt32();
+    CPPUNIT_ASSERT(nWholeTableDxfId >= 0);
+
+    OString sBorder
+        = "/x:styleSheet/x:dxfs/x:dxf[" + OString::number(nWholeTableDxfId + 1) + "]/x:border";
+
+    // The outer borders already exported correctly before the fix.
+    assertXPath(pStyles, sBorder + "/x:left", "style", u"thin");
+    assertXPath(pStyles, sBorder + "/x:top", "style", u"thin");
+
+    // The inner vertical/horizontal borders must now be exported too (with their
+    // theme color), instead of being silently lost.
+    assertXPath(pStyles, sBorder + "/x:vertical", "style", u"thin");
+    assertXPath(pStyles, sBorder + "/x:vertical/x:color", "theme", u"8");
+    assertXPath(pStyles, sBorder + "/x:horizontal", "style", u"thin");
+    assertXPath(pStyles, sBorder + "/x:horizontal/x:color", "theme", u"8");
+
+    sal_Int32 nHeaderRowDxfId
+        = getXPath(
+              pStyles,
+              "/x:styleSheet/x:tableStyles/x:tableStyle/x:tableStyleElement[@type='headerRow']",
+              "dxfId")
+              .toInt32();
+    CPPUNIT_ASSERT(nHeaderRowDxfId >= 0);
+    OString sHdrBorder
+        = "/x:styleSheet/x:dxfs/x:dxf[" + OString::number(nHeaderRowDxfId + 1) + "]/x:border";
+    assertXPath(pStyles, sHdrBorder + "/x:bottom", "style", u"medium");
+    assertXPath(pStyles, sHdrBorder + "/x:left", 0);
+    assertXPath(pStyles, sHdrBorder + "/x:right", 0);
+    assertXPath(pStyles, sHdrBorder + "/x:top", 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testTableStyleCustomRoundtripXLSX)
+{
+    // Open xlsx with custom table style, save and reload, verify in-memory state
+    createScDoc("xlsx/Book1_custom.xlsx");
+    saveAndReload(TestFilter::XLSX);
+
+    ScDocument* pDoc = getScDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    // Verify custom table style exists in the document
+    ScTableStyles* pStyles = pDoc->GetTableStyles();
+    CPPUNIT_ASSERT(pStyles);
+    CPPUNIT_ASSERT(pStyles->GetTableStyle(u"Custom_Styles1"_ustr) != nullptr);
+
+    // Verify DB range has the custom style applied
+    ScDBData* pDBData = pDoc->GetDBAtArea(0, 0, 0, 3, 10);
+    CPPUNIT_ASSERT(pDBData);
+    const ScTableStyleParam* pParam = pDBData->GetTableStyleInfo();
+    CPPUNIT_ASSERT(pParam);
+    CPPUNIT_ASSERT_EQUAL(u"Custom_Styles1"_ustr, pParam->maStyleID);
+
+    // Verify table style options survived roundtrip
+    CPPUNIT_ASSERT(pParam->mbRowStripes);
+    CPPUNIT_ASSERT(!pParam->mbColumnStripes);
+    CPPUNIT_ASSERT(!pParam->mbFirstColumn);
+    CPPUNIT_ASSERT(!pParam->mbLastColumn);
+
+    // Verify header and total row flags
+    CPPUNIT_ASSERT(pDBData->HasHeader());
+    CPPUNIT_ASSERT(pDBData->HasTotals());
+
+    // Verify data survived roundtrip
+    CPPUNIT_ASSERT_EQUAL(u"Names"_ustr, pDoc->GetString(ScAddress(0, 0, 0))); // header
+    CPPUNIT_ASSERT_EQUAL(u"Summary"_ustr, pDoc->GetString(ScAddress(0, 10, 0))); // total label
+    CPPUNIT_ASSERT_EQUAL(382.0, pDoc->GetValue(ScAddress(3, 10, 0))); // SUM of Age column
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testErrorExternalsInDataValidation)
+{
+    createScDoc("xlsx/invalid_ext_data_validation.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pDoc = parseExport(u"xl/worksheets/sheet2.xml"_ustr);
+    CPPUNIT_ASSERT(pDoc);
+
+    assertXPathContent(pDoc, "/x:worksheet/x:dataValidations/x:dataValidation[2]/x:formula1",
+                       u"[2]Hilfsblatt!#REF!");
+
+    xmlDocUniquePtr pDocXml = parseExport(u"xl/externalLinks/externalLink2.xml"_ustr);
+    CPPUNIT_ASSERT(pDocXml);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testValidationListNameThroughTableRef)
+{
+    // A list validation pointing at a name whose body is a table reference used to
+    // come up empty; the dropdown must list the referenced table column instead.
+
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    pDoc->SetString(ScAddress(1, 1, 0), u"Apple"_ustr);
+    pDoc->SetString(ScAddress(1, 2, 0), u"Banana"_ustr);
+    pDoc->SetString(ScAddress(1, 3, 0), u"Cherry"_ustr);
+
+    std::unique_ptr<ScDBData> pDB(new ScDBData(u"MyTable"_ustr, 0, 1, 1, 1, 3, true, false));
+    ScDBData* pDBRaw = pDB.get();
+    CPPUNIT_ASSERT(pDoc->GetDBCollection()->getNamedDBs().insert(std::move(pDB)));
+
+    ScTokenArray aNameTokens(*pDoc);
+    aNameTokens.AddTableRef(pDBRaw->GetIndex());
+    auto pName
+        = std::make_unique<ScRangeData>(*pDoc, u"MyName"_ustr, aNameTokens, ScAddress(0, 0, 0));
+    ScRangeData* pNameRaw = pName.get();
+    CPPUNIT_ASSERT(pDoc->GetRangeName().insert(std::move(pName)));
+
+    ScTokenArray aValidationTokens(*pDoc);
+    aValidationTokens.AddRangeName(pNameRaw->GetIndex(), -1);
+
+    ScValidationData aValidationData(SC_VALID_LIST, ScConditionMode::Equal, &aValidationTokens,
+                                     nullptr, *pDoc, ScAddress(0, 0, 0));
+    const sal_uInt32 nValidationKey = pDoc->AddValidationEntry(aValidationData);
+    CPPUNIT_ASSERT(nValidationKey != 0);
+
+    ScPatternAttr aPattern(pDoc->getCellAttributeHelper());
+    aPattern.GetItemSetWritable().Put(SfxUInt32Item(ATTR_VALIDDATA, nValidationKey));
+    pDoc->ApplyPattern(3, 3, 0, aPattern);
+
+    const ScValidationData* pData = pDoc->GetValidationEntry(nValidationKey);
+    CPPUNIT_ASSERT(pData);
+    std::vector<ScTypedStrData> aStrings;
+    CPPUNIT_ASSERT(pData->FillSelectionList(aStrings, ScAddress(3, 3, 0)));
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aStrings.size());
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testValidationListNameThroughTableRefWithHeader)
+{
+    // A list validation pointing at a name that wraps a table reference must show
+    // the table's data rows, even when the table has a header row and holds
+    // numbers: the dropdown lists the data values in order, starting at the first.
+
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    pDoc->SetString(ScAddress(1, 0, 0), u"Score"_ustr);
+    pDoc->SetValue(ScAddress(1, 1, 0), 10.0);
+    pDoc->SetValue(ScAddress(1, 2, 0), 20.0);
+    pDoc->SetValue(ScAddress(1, 3, 0), 30.0);
+
+    // Header row plus three data rows; the data part the reference resolves to
+    // starts one row below the header.
+    std::unique_ptr<ScDBData> pDB(new ScDBData(u"MyTable"_ustr, 0, 1, 0, 1, 3, true, true));
+    ScDBData* pDBRaw = pDB.get();
+    CPPUNIT_ASSERT(pDoc->GetDBCollection()->getNamedDBs().insert(std::move(pDB)));
+
+    ScTokenArray aNameTokens(*pDoc);
+    aNameTokens.AddTableRef(pDBRaw->GetIndex());
+    auto pName
+        = std::make_unique<ScRangeData>(*pDoc, u"MyName"_ustr, aNameTokens, ScAddress(0, 0, 0));
+    ScRangeData* pNameRaw = pName.get();
+    CPPUNIT_ASSERT(pDoc->GetRangeName().insert(std::move(pName)));
+
+    ScTokenArray aValidationTokens(*pDoc);
+    aValidationTokens.AddRangeName(pNameRaw->GetIndex(), -1);
+
+    ScValidationData aValidationData(SC_VALID_LIST, ScConditionMode::Equal, &aValidationTokens,
+                                     nullptr, *pDoc, ScAddress(0, 0, 0));
+    const sal_uInt32 nValidationKey = pDoc->AddValidationEntry(aValidationData);
+    CPPUNIT_ASSERT(nValidationKey != 0);
+
+    ScPatternAttr aPattern(pDoc->getCellAttributeHelper());
+    aPattern.GetItemSetWritable().Put(SfxUInt32Item(ATTR_VALIDDATA, nValidationKey));
+    pDoc->ApplyPattern(3, 3, 0, aPattern);
+
+    const ScValidationData* pData = pDoc->GetValidationEntry(nValidationKey);
+    CPPUNIT_ASSERT(pData);
+    std::vector<ScTypedStrData> aStrings;
+    CPPUNIT_ASSERT(pData->FillSelectionList(aStrings, ScAddress(3, 3, 0)));
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aStrings.size());
+    CPPUNIT_ASSERT_EQUAL(u"10"_ustr, aStrings[0].GetString());
+    CPPUNIT_ASSERT_EQUAL(u"20"_ustr, aStrings[1].GetString());
+    CPPUNIT_ASSERT_EQUAL(u"30"_ustr, aStrings[2].GetString());
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testValidationListNameThroughTableRefColumn)
+{
+    // A name whose body is a column-qualified table reference like MyTable[Score]
+    // must list only that column's data rows, not the first column and not the
+    // header. Such a reference compiles to several tokens, which used to leave the
+    // dropdown empty.
+
+    createScDoc();
+    ScDocument* pDoc = getScDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    pDoc->SetString(ScAddress(0, 0, 0), u"Name"_ustr);
+    pDoc->SetString(ScAddress(1, 0, 0), u"Score"_ustr);
+    pDoc->SetString(ScAddress(0, 1, 0), u"x"_ustr);
+    pDoc->SetValue(ScAddress(1, 1, 0), 10.0);
+    pDoc->SetString(ScAddress(0, 2, 0), u"y"_ustr);
+    pDoc->SetValue(ScAddress(1, 2, 0), 20.0);
+    pDoc->SetString(ScAddress(0, 3, 0), u"z"_ustr);
+    pDoc->SetValue(ScAddress(1, 3, 0), 30.0);
+
+    // Two-column table A1:B4 with a header row.
+    std::unique_ptr<ScDBData> pDB(new ScDBData(u"MyTable"_ustr, 0, 0, 0, 1, 3, true, true));
+    CPPUNIT_ASSERT(pDoc->GetDBCollection()->getNamedDBs().insert(std::move(pDB)));
+
+    // Base the name outside the table so the column resolves to the data rows,
+    // not an intersecting single cell.
+    auto pName = std::make_unique<ScRangeData>(*pDoc, u"MyName"_ustr, u"MyTable[[Score]]"_ustr,
+                                               ScAddress(0, 5, 0), ScRangeData::Type::Name,
+                                               formula::FormulaGrammar::GRAM_NATIVE);
+    // A column-qualified reference is more than one token.
+    CPPUNIT_ASSERT(pName->GetCode()->GetLen() > 1);
+    ScRangeData* pNameRaw = pName.get();
+    CPPUNIT_ASSERT(pDoc->GetRangeName().insert(std::move(pName)));
+
+    ScTokenArray aValidationTokens(*pDoc);
+    aValidationTokens.AddRangeName(pNameRaw->GetIndex(), -1);
+
+    ScValidationData aValidationData(SC_VALID_LIST, ScConditionMode::Equal, &aValidationTokens,
+                                     nullptr, *pDoc, ScAddress(0, 0, 0));
+    const sal_uInt32 nValidationKey = pDoc->AddValidationEntry(aValidationData);
+    CPPUNIT_ASSERT(nValidationKey != 0);
+
+    ScPatternAttr aPattern(pDoc->getCellAttributeHelper());
+    aPattern.GetItemSetWritable().Put(SfxUInt32Item(ATTR_VALIDDATA, nValidationKey));
+    pDoc->ApplyPattern(3, 3, 0, aPattern);
+
+    const ScValidationData* pData = pDoc->GetValidationEntry(nValidationKey);
+    CPPUNIT_ASSERT(pData);
+    std::vector<ScTypedStrData> aStrings;
+    CPPUNIT_ASSERT(pData->FillSelectionList(aStrings, ScAddress(3, 3, 0)));
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aStrings.size());
+    CPPUNIT_ASSERT_EQUAL(u"10"_ustr, aStrings[0].GetString());
+    CPPUNIT_ASSERT_EQUAL(u"20"_ustr, aStrings[1].GetString());
+    CPPUNIT_ASSERT_EQUAL(u"30"_ustr, aStrings[2].GetString());
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testPivotTablesWriteRowColumnItems)
+{
+    createScDoc("xlsx/forum-mso-de-104083.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pTable = parseExport(u"xl/pivotTables/pivotTable1.xml"_ustr);
+    CPPUNIT_ASSERT(pTable);
+
+    OString sPath1 = "/x:pivotTableDefinition/x:colItems/x:i[4]"_ostr;
+
+    /*
+        earlier
+        <i t="default">
+            <x v="-1"/>
+            <x v="1"/>
+        </i>
+
+        now
+        <i t="default" r="1">
+            <x v="1"/>
+        </i>
+     */
+    assertXPath(pTable, sPath1, "t", u"default");
+    assertXPath(pTable, sPath1, "r", u"1");
+    assertXPathChildren(pTable, sPath1, 1);
+    assertXPath(pTable, sPath1 + "/x:x", "v", u"1");
+
+    /*
+        earlier
+        <i r="1"> // r = 1 means repeat the years and use the item at index 9 of quarters field, but quarters has only 6 items
+            <x v="9"/>
+        </i>
+
+        now
+        <i r="2">
+            <x v="9"/>
+        </i>
+     */
+    assertXPath(pTable, "/x:pivotTableDefinition/x:colItems/x:i[3]", "r", u"2");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testBuiltInDefaultTableStyleNotExportedXLSX)
+{
+    createScDoc("xlsx/TableStyleTest.xlsx");
+    getScDoc()->GetTableStyles()->SetDefaultStyleName(u"TableStyleMedium2"_ustr);
+
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pStyles = parseExport(u"xl/styles.xml"_ustr);
+    CPPUNIT_ASSERT(pStyles);
+    assertXPathNoAttribute(pStyles, "/x:styleSheet/x:tableStyles", "defaultTableStyle");
+}
+
+namespace
+{
+// The background colour a style sets on its whole-table region, or COL_AUTO
+// when the region has none.
+Color wholeTableBackground(const ScTableStyle* pStyle)
+{
+    const std::map<ScTableStyleElement, const ScPatternAttr*> aPatterns = pStyle->GetSetPatterns();
+    const auto it = aPatterns.find(ScTableStyleElement::WholeTable);
+    if (it == aPatterns.end())
+        return COL_AUTO;
+    const SvxBrushItem* pBrush = it->second->GetItemSet().GetItemIfSet(ATTR_BACKGROUND, false);
+    return pBrush ? pBrush->GetColor() : COL_AUTO;
+}
+
+std::unique_ptr<ScTableStyle> makeBackgroundStyle(ScDocument& rDoc, const OUString& rName,
+                                                  const OUString& rUIName, const Color& rColor)
+{
+    auto pPattern = std::make_unique<ScPatternAttr>(rDoc.getCellAttributeHelper());
+    pPattern->GetItemSetWritable().Put(SvxBrushItem(rColor, ATTR_BACKGROUND));
+    auto pStyle = std::make_unique<ScTableStyle>(rName, std::optional<OUString>(rUIName));
+    pStyle->SetPattern(ScTableStyleElement::WholeTable, std::move(pPattern));
+    return pStyle;
+}
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCustomTableStyleUnappliedReloadXLSX)
+{
+    // A custom table style survives a save and reload even when no table uses
+    // it, so a user can create a style before applying it to anything.
+    createScDoc("xlsx/TableStyleTest.xlsx");
+
+    ScDocument* pDoc = getScDoc();
+    ScTableStyles* pStyles = pDoc->GetTableStyles();
+    CPPUNIT_ASSERT(pStyles);
+
+    auto pPattern = std::make_unique<ScPatternAttr>(pDoc->getCellAttributeHelper());
+    pPattern->GetItemSetWritable().Put(SvxBrushItem(COL_LIGHTRED, ATTR_BACKGROUND));
+    auto pStyle = std::make_unique<ScTableStyle>(u"TableStyleCustom1"_ustr,
+                                                 std::optional<OUString>(u"My Custom Style"_ustr));
+    pStyle->SetPattern(ScTableStyleElement::WholeTable, std::move(pPattern));
+    pStyles->AddTableStyle(std::move(pStyle));
+
+    saveAndReload(TestFilter::XLSX);
+
+    const ScTableStyle* pReloaded
+        = getScDoc()->GetTableStyles()->GetTableStyle(u"TableStyleCustom1"_ustr);
+    CPPUNIT_ASSERT(pReloaded);
+    const std::map<ScTableStyleElement, const ScPatternAttr*> aPatterns
+        = pReloaded->GetSetPatterns();
+    const auto it = aPatterns.find(ScTableStyleElement::WholeTable);
+    CPPUNIT_ASSERT(it != aPatterns.end());
+    const SvxBrushItem* pBrush = it->second->GetItemSet().GetItemIfSet(ATTR_BACKGROUND, false);
+    CPPUNIT_ASSERT(pBrush);
+    CPPUNIT_ASSERT_EQUAL(COL_LIGHTRED, pBrush->GetColor());
+
+    // OOXML tableStyle has no display-name, so the friendly name degrades to the
+    // programmatic name across an xlsx round-trip.
+    CPPUNIT_ASSERT_EQUAL(u"TableStyleCustom1"_ustr, pReloaded->GetUIName());
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testCustomTableStyleNoDuplicateExportXLSX)
+{
+    // An unapplied custom style is written to xl/styles.xml exactly once (a
+    // duplicate name makes the file invalid), and its element is present.
+    createScDoc("xlsx/TableStyleTest.xlsx");
+
+    ScDocument* pDoc = getScDoc();
+    ScTableStyles* pStyles = pDoc->GetTableStyles();
+    CPPUNIT_ASSERT(pStyles);
+
+    auto pPattern = std::make_unique<ScPatternAttr>(pDoc->getCellAttributeHelper());
+    pPattern->GetItemSetWritable().Put(SvxBrushItem(COL_LIGHTRED, ATTR_BACKGROUND));
+    auto pStyle = std::make_unique<ScTableStyle>(u"TableStyleCustom1"_ustr,
+                                                 std::optional<OUString>(u"My Custom Style"_ustr));
+    pStyle->SetPattern(ScTableStyleElement::WholeTable, std::move(pPattern));
+    pStyles->AddTableStyle(std::move(pStyle));
+
+    save(TestFilter::XLSX);
+    xmlDocUniquePtr pStylesXml = parseExport(u"xl/styles.xml"_ustr);
+    CPPUNIT_ASSERT(pStylesXml);
+    const char* const sCustom
+        = "/x:styleSheet/x:tableStyles/x:tableStyle[@name='TableStyleCustom1']";
+    assertXPath(pStylesXml, sCustom, 1);
+    assertXPath(pStylesXml, OString::Concat(sCustom) + "/x:tableStyleElement[@type='wholeTable']",
+                1);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testTableStyleExportNoopXLSX)
+{
+    // A document with no custom styles must not gain any tableStyle entries on
+    // export: the built-in styles are standard OOXML and are never written out.
+    createScDoc();
+
+    save(TestFilter::XLSX);
+    xmlDocUniquePtr pStylesXml = parseExport(u"xl/styles.xml"_ustr);
+    CPPUNIT_ASSERT(pStylesXml);
+    assertXPath(pStylesXml, "/x:styleSheet/x:tableStyles/x:tableStyle", 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testClearedTableStyleKeepsOptionsXLSX)
+{
+    // A table whose style was cleared keeps its other table options, which travel on the same
+    // element as the style name.
+    createScDoc("xlsx/TableStyleTest.xlsx");
+    ScDocument* pDoc = getScDoc();
+    ScDBCollection::NamedDBs& rDBs = pDoc->GetDBCollection()->getNamedDBs();
+    CPPUNIT_ASSERT(!rDBs.empty());
+
+    ScTableStyleParam aParam;
+    aParam.maStyleID = u"None"_ustr;
+    aParam.mbRowStripes = true;
+    rDBs.begin()->get()->SetTableStyleInfo(aParam);
+
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pTable = parseExport(u"xl/tables/table1.xml"_ustr);
+    CPPUNIT_ASSERT(pTable);
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", 1);
+    assertXPath(pTable, "/x:table/x:tableStyleInfo", "showRowStripes", u"1");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testMultipleCustomTableStylesReloadXLSX)
+{
+    // More than one custom style created together all survive an xlsx reload.
+    createScDoc("xlsx/TableStyleTest.xlsx");
+    ScDocument* pDoc = getScDoc();
+    ScTableStyles* pStyles = pDoc->GetTableStyles();
+    CPPUNIT_ASSERT(pStyles);
+
+    pStyles->AddTableStyle(
+        makeBackgroundStyle(*pDoc, u"TableStyleCustom1"_ustr, u"First"_ustr, COL_LIGHTRED));
+    pStyles->AddTableStyle(
+        makeBackgroundStyle(*pDoc, u"TableStyleCustom2"_ustr, u"Second"_ustr, COL_LIGHTBLUE));
+
+    saveAndReload(TestFilter::XLSX);
+
+    const ScTableStyles* pReloaded = getScDoc()->GetTableStyles();
+    const ScTableStyle* pOne = pReloaded->GetTableStyle(u"TableStyleCustom1"_ustr);
+    const ScTableStyle* pTwo = pReloaded->GetTableStyle(u"TableStyleCustom2"_ustr);
+    CPPUNIT_ASSERT(pOne);
+    CPPUNIT_ASSERT(pTwo);
+    CPPUNIT_ASSERT_EQUAL(COL_LIGHTRED, wholeTableBackground(pOne));
+    CPPUNIT_ASSERT_EQUAL(COL_LIGHTBLUE, wholeTableBackground(pTwo));
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testNamedRangeErrorReferenceXLSX)
+{
+    // Col_C has the target Sheet1!#REF!. The save keeps that target, and keeps Col_C as one
+    // name for the whole document rather than a copy in each sheet.
+    createScDoc("xlsx/named-range-error-reference.xlsx");
+
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pWorkbook = parseExport(u"xl/workbook.xml"_ustr);
+    CPPUNIT_ASSERT(pWorkbook);
+    assertXPath(pWorkbook, "/x:workbook/x:definedNames/x:definedName[@name='Col_C']", 1);
+    assertXPathContent(pWorkbook, "/x:workbook/x:definedNames/x:definedName[@name='Col_C']",
+                       u"Sheet1!#REF!");
+    assertXPathNoAttribute(pWorkbook, "/x:workbook/x:definedNames/x:definedName[@name='Col_C']",
+                           "localSheetId");
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testSheetCodeName)
+{
+    createScDoc("xlsx/MissingPathExternal.xlsx");
+
+    OUString aCodeName;
+    CPPUNIT_ASSERT(getScDoc()->GetCodeName(0, aCodeName));
+    CPPUNIT_ASSERT_EQUAL(u"Tabelle4"_ustr, aCodeName);
+
+    saveAndReload(TestFilter::XLSX);
+
+    OUString aReloadedCodeName;
+    CPPUNIT_ASSERT(getScDoc()->GetCodeName(0, aReloadedCodeName));
+    CPPUNIT_ASSERT_EQUAL(aCodeName, aReloadedCodeName);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testSheetWithoutCodeName)
+{
+    // A sheet that the document gives no code name to is written without one, whatever its tab
+    // says, because the name on the tab is free to read as a sentence and to be taken by another
+    // sheet once this one is renamed.
+    createScDoc();
+    getScDoc()->InsertTab(1, u"My Sheet"_ustr);
+
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet2.xml"_ustr);
+    CPPUNIT_ASSERT(pSheet);
+    assertXPath(pSheet, "/x:worksheet/x:sheetPr[@codeName]", 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testSheetWithoutCodeNameThroughODS)
+{
+    // A sheet that the document gives no code name to does not pick one up on the way through
+    // ODS, where the name it was made with would otherwise be written and read back as a name
+    // the document gave it.
+    createScDoc();
+    getScDoc()->InsertTab(1, u"My Sheet"_ustr);
+
+    saveAndReload(TestFilter::ODS);
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet2.xml"_ustr);
+    CPPUNIT_ASSERT(pSheet);
+    assertXPath(pSheet, "/x:worksheet/x:sheetPr[@codeName]", 0);
+}
+
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testWorkbookCodeName)
+{
+    createScDoc("xlsx/MissingPathExternal.xlsx");
+    CPPUNIT_ASSERT_EQUAL(u"DieseArbeitsmappe"_ustr, getScDoc()->GetCodeName());
+
+    saveAndReload(TestFilter::XLSX);
+
+    CPPUNIT_ASSERT_EQUAL(u"DieseArbeitsmappe"_ustr, getScDoc()->GetCodeName());
+
+    createScDoc("xlsx/CalcThemeTest.xlsx");
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pWorkbook = parseExport(u"xl/workbook.xml"_ustr);
+    assertXPathNoAttribute(pWorkbook, "/x:workbook/x:workbookPr", "codeName");
+}
+
+// Every control of a sheet is named by a shape identifier only it has.
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testControlShapeIdsStayApart)
+{
+    // Given a sheet holding ActiveX controls, with thirty form controls added beside them:
+    createScDoc("xlsx/tdf111980_radioButtons.xlsx");
+    cpo::uno::Reference<css::sheet::XSpreadsheetDocument> xDoc(mxComponent,
+                                                               cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::container::XIndexAccess> xSheets(xDoc->getSheets(),
+                                                              cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::drawing::XDrawPageSupplier> xSupplier(xSheets->getByIndex(0),
+                                                                   cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::drawing::XShapes> xPage(xSupplier->getDrawPage(),
+                                                     cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::lang::XMultiServiceFactory> xFactory(mxComponent,
+                                                                  cpo::uno::UNO_QUERY_THROW);
+    for (sal_Int32 i = 0; i < 30; ++i)
+    {
+        cpo::uno::Reference<css::drawing::XControlShape> xShape(
+            xFactory->createInstance(u"com.sun.star.drawing.ControlShape"_ustr),
+            cpo::uno::UNO_QUERY_THROW);
+        cpo::uno::Reference<css::awt::XControlModel> xModel(
+            comphelper::getProcessServiceFactory()->createInstance(
+                u"com.sun.star.form.component.CheckBox"_ustr),
+            cpo::uno::UNO_QUERY_THROW);
+        xShape->setControl(xModel);
+        xShape->setPosition(css::awt::Point(10000, 1000 + i * 600));
+        xShape->setSize(css::awt::Size(2000, 500));
+        xPage->add(xShape);
+    }
+
+    save(TestFilter::XLSX);
+
+    // Without the fix in place, the form controls were numbered from 1001 and the ActiveX
+    // controls from 1025, so the twenty fifth form control and the first ActiveX control were
+    // given the same number.
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet1.xml"_ustr);
+    CPPUNIT_ASSERT(pSheet);
+    const int nControls = countXPathNodes(pSheet, "//x:control");
+    for (int i = 1; i <= nControls; ++i)
+    {
+        const OString aId
+            = getXPath(pSheet, "(//x:control)[" + OString::number(i) + "]", "shapeId").toUtf8();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE(aId.getStr(), 1,
+                                     countXPathNodes(pSheet, "//x:control[@shapeId='" + aId + "']"));
+    }
+}
+
+// A cell given a box border and then merged with its neighbours: Calc draws the box around the whole
+// range, so the cell on the right edge of the range must state the right border.
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testBorderThenMergeKeepsItsRightEdge)
+{
+    createScDoc();
+    cpo::uno::Reference<css::sheet::XSpreadsheetDocument> xDoc(mxComponent,
+                                                               cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::container::XIndexAccess> xSheets(xDoc->getSheets(),
+                                                              cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::sheet::XSpreadsheet> xSheet(xSheets->getByIndex(0),
+                                                         cpo::uno::UNO_QUERY_THROW);
+
+    css::table::BorderLine2 aLine;
+    aLine.OuterLineWidth = 50;
+    aLine.LineWidth = 50;
+    aLine.LineStyle = css::table::BorderLineStyle::SOLID;
+    css::table::TableBorder2 aBorder;
+    aBorder.TopLine = aLine;
+    aBorder.IsTopLineValid = true;
+    aBorder.BottomLine = aLine;
+    aBorder.IsBottomLineValid = true;
+    aBorder.LeftLine = aLine;
+    aBorder.IsLeftLineValid = true;
+    aBorder.RightLine = aLine;
+    aBorder.IsRightLineValid = true;
+    cpo::uno::Reference<css::beans::XPropertySet>(xSheet->getCellRangeByName(u"A1"_ustr),
+                                                  cpo::uno::UNO_QUERY_THROW)
+        ->setPropertyValue(u"TableBorder2"_ustr, cpo::uno::Any(aBorder));
+    cpo::uno::Reference<css::util::XMergeable>(xSheet->getCellRangeByName(u"A1:C1"_ustr),
+                                               cpo::uno::UNO_QUERY_THROW)
+        ->merge(true);
+
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet1.xml"_ustr);
+    sal_Int32 nStyle = 0;
+    if (countXPathNodes(pSheet, "//x:c[@r='C1'][@s]"))
+        nStyle = getXPath(pSheet, "//x:c[@r='C1']", "s").toInt32();
+    xmlDocUniquePtr pStyles = parseExport(u"xl/styles.xml"_ustr);
+    const sal_Int32 nBorder
+        = getXPath(pStyles, "/x:styleSheet/x:cellXfs/x:xf[" + OString::number(nStyle + 1) + "]",
+                   "borderId")
+              .toInt32();
+    assertXPath(pStyles,
+                "/x:styleSheet/x:borders/x:border[" + OString::number(nBorder + 1)
+                    + "]/x:right[@style]",
+                1);
+}
+
+// Two cells side by side, each given a box border and then merged with the cell below it: the
+// covered cells of the bottom row lie next to each other with one format, and each must state the
+// bottom edge of its range.
+CPPUNIT_TEST_FIXTURE(ScExportTest6, testSideBySideMergesKeepTheirBottomEdge)
+{
+    createScDoc();
+    cpo::uno::Reference<css::sheet::XSpreadsheetDocument> xDoc(mxComponent,
+                                                               cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::container::XIndexAccess> xSheets(xDoc->getSheets(),
+                                                              cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::sheet::XSpreadsheet> xSheet(xSheets->getByIndex(0),
+                                                         cpo::uno::UNO_QUERY_THROW);
+
+    css::table::BorderLine2 aLine;
+    aLine.OuterLineWidth = 50;
+    aLine.LineWidth = 50;
+    aLine.LineStyle = css::table::BorderLineStyle::SOLID;
+    css::table::TableBorder2 aBorder;
+    aBorder.TopLine = aLine;
+    aBorder.IsTopLineValid = true;
+    aBorder.BottomLine = aLine;
+    aBorder.IsBottomLineValid = true;
+    aBorder.LeftLine = aLine;
+    aBorder.IsLeftLineValid = true;
+    aBorder.RightLine = aLine;
+    aBorder.IsRightLineValid = true;
+    for (const OUString& rCell : { u"A1"_ustr, u"B1"_ustr })
+        cpo::uno::Reference<css::beans::XPropertySet>(xSheet->getCellRangeByName(rCell),
+                                                      cpo::uno::UNO_QUERY_THROW)
+            ->setPropertyValue(u"TableBorder2"_ustr, cpo::uno::Any(aBorder));
+    for (const OUString& rRange : { u"A1:A2"_ustr, u"B1:B2"_ustr })
+        cpo::uno::Reference<css::util::XMergeable>(xSheet->getCellRangeByName(rRange),
+                                                   cpo::uno::UNO_QUERY_THROW)
+            ->merge(true);
+
+    save(TestFilter::XLSX);
+
+    xmlDocUniquePtr pSheet = parseExport(u"xl/worksheets/sheet1.xml"_ustr);
+    xmlDocUniquePtr pStyles = parseExport(u"xl/styles.xml"_ustr);
+    for (const char* pCell : { "A2", "B2" })
+    {
+        const OString aCell = OString::Concat("//x:c[@r='") + pCell + "']";
+        sal_Int32 nStyle = 0;
+        if (countXPathNodes(pSheet, aCell + "[@s]"))
+            nStyle = getXPath(pSheet, aCell, "s").toInt32();
+        const sal_Int32 nBorder
+            = getXPath(pStyles,
+                       "/x:styleSheet/x:cellXfs/x:xf[" + OString::number(nStyle + 1) + "]",
+                       "borderId")
+                  .toInt32();
+        CPPUNIT_ASSERT_EQUAL_MESSAGE(pCell, 1,
+                                     countXPathNodes(pStyles, "/x:styleSheet/x:borders/x:border["
+                                                                  + OString::number(nBorder + 1)
+                                                                  + "]/x:bottom[@style]"));
+    }
+}
+
+CPPUNIT_PLUGIN_IMPLEMENT();
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

@@ -1,0 +1,92 @@
+# -*- Mode: makefile-gmake; tab-width: 4; indent-tabs-mode: t -*-
+#*************************************************************************
+#
+# This file is part of the Collabora Office project.
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+#*************************************************************************
+
+$(eval $(call gb_CppunitTest_CppunitTest,desktop_lib))
+
+$(eval $(call gb_CppunitTest_add_exception_objects,desktop_lib, \
+	desktop/qa/desktop_lib/kitclipboard \
+	desktop/qa/desktop_lib/test_desktop_lib \
+	desktop/qa/desktop_lib/test_l10ntranslate \
+))
+
+$(eval $(call gb_CppunitTest_use_libraries,desktop_lib, \
+	basegfx \
+	comphelper \
+	cppu \
+	cppuhelper \
+	editeng \
+	i18nlangtag \
+	lng \
+	sal \
+	sc \
+	sfx \
+	sofficeapp \
+	subsequenttest \
+    svt \
+	svxcore \
+	sw \
+	test \
+	unotest \
+	utl \
+	tl \
+	vcl \
+	$(if $(filter -fsanitize=vptr,$(gb_CXX)),svl) \
+))
+
+$(eval $(call gb_CppunitTest_use_externals,desktop_lib, \
+    boost_headers \
+    cairo \
+))
+ifeq ($(TLS),NSS)
+$(eval $(call gb_CppunitTest_use_externals,desktop_lib,\
+       plc4 \
+       nss3 \
+))
+endif
+
+$(eval $(call gb_CppunitTest_set_include,desktop_lib,\
+    -I$(SRCDIR)/desktop/inc \
+    $$(INCLUDE) \
+))
+
+$(eval $(call gb_CppunitTest_use_sdk_api,desktop_lib))
+
+$(eval $(call gb_CppunitTest_use_ure,desktop_lib))
+
+$(eval $(call gb_CppunitTest_use_vcl,desktop_lib))
+
+$(eval $(call gb_CppunitTest_use_rdb,desktop_lib,services))
+
+$(eval $(call gb_CppunitTest_use_configuration,desktop_lib))
+
+# The layer the kit adds the shared preset paths to, declared as in the product.
+$(eval $(call gb_CppunitTest__use_configuration,desktop_lib,sharedext,$(WORKDIR)/desktop-no-such-layer.ini))
+
+$(eval $(call gb_CppunitTest_use_custom_headers,desktop_lib,\
+    officecfg/registry \
+))
+
+$(eval $(call gb_CppunitTest_use_more_fonts,desktop_lib))
+
+$(eval $(call gb_CppunitTest_use_packages,desktop_lib, \
+    scripting_scriptbindinglib \
+))
+
+$(eval $(call gb_CppunitTest_use_uiconfigs,desktop_lib, \
+    cui \
+    modules/swriter \
+))
+
+$(eval $(call gb_CppunitTest_use_packages,desktop_lib, \
+    postprocess_images \
+))
+
+# vim: set noet sw=4 ts=4:

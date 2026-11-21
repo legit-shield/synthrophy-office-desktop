@@ -1,0 +1,54 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+interface XAffineTransform;
+
+/** Builds an affine transform from its six values.
+
+    Get one with newAffineTransformBuilder, which starts from the identity transform: scale 1,
+    shear 0, translation 0. See XAffineTransform for how the values map a point. The setters
+    return this builder, for chaining.
+
+    @gas AffineTransformBuilder
+ */
+interface XAffineTransformBuilder : XBase
+{
+    /** The builder stays usable after this call. Transforms built earlier keep their
+        values.
+
+        @gas AffineTransformBuilder.build
+     */
+    XAffineTransform build();
+
+    /** @gas AffineTransformBuilder.setScaleX */
+    XAffineTransformBuilder setScaleX([in] double scaleX);
+
+    /** @gas AffineTransformBuilder.setScaleY */
+    XAffineTransformBuilder setScaleY([in] double scaleY);
+
+    /** @gas AffineTransformBuilder.setShearX */
+    XAffineTransformBuilder setShearX([in] double shearX);
+
+    /** @gas AffineTransformBuilder.setShearY */
+    XAffineTransformBuilder setShearY([in] double shearY);
+
+    /** @gas AffineTransformBuilder.setTranslateX */
+    XAffineTransformBuilder setTranslateX([in] double translateX);
+
+    /** @gas AffineTransformBuilder.setTranslateY */
+    XAffineTransformBuilder setTranslateY([in] double translateY);
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

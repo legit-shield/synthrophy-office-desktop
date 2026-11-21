@@ -1,0 +1,227 @@
+/* global describe expect it cy before require */
+
+const helper = require('../../common/helper');
+const a11yHelper = require('../../common/a11y_helper');
+
+describe(['tagdesktop'], 'Writer comments for the reader', { testIsolation: false }, function () {
+	let win;
+
+	// the text the details of a mark point at, which a reader gives on demand; NVDA reads only the
+	// first of several targets, and none hidden
+	function detailsText(mark) {
+		const ids = (mark.getAttribute('aria-details') || '').split(' ').filter(Boolean);
+		expect(ids, 'the targets').to.have.length(1);
+		const target = win.document.getElementById(ids[0]);
+		expect(target, 'the target').to.not.equal(null);
+		expect(target.checkVisibility({ visibilityProperty: true }), 'the target shown').to.equal(true);
+		expect(target.closest('[aria-hidden="true"]'), 'the target hidden').to.equal(null);
+		expect(target.getAttribute('role'), 'the role of the target').to.equal('comment');
+		return target.innerText.replace(/\s+/g, ' ').trim();
+	}
+
+	function expectComment(selector, text, details) {
+		cy.cGet(selector + ' [role="mark"]').should(function ($marks) {
+			expect($marks, 'the marks').to.have.length(1);
+			expect($marks.attr('aria-roledescription'), 'the role read').to.equal('Comment');
+			expect($marks.text(), 'the commented text').to.equal(text);
+			expect(detailsText($marks[0]), 'the details').to.equal(details);
+		});
+		// the accessibility tree follows the DOM later
+		cy.waitUntil(function () {
+			return a11yHelper.getAXNodesWithin(selector).then(function (nodes) {
+				return nodes.filter(function (node) {
+					return !node.ignored && node.role === 'mark';
+				}).length === 1;
+			});
+		});
+	}
+
+	before(function () {
+		helper.setupAndLoadDocument('writer/a11y_comment.fodt');
+
+		cy.getFrameWindow().then(function (frameWindow) {
+			win = frameWindow;
+		});
+
+		cy.then(function () {
+			win.app.map.setAccessibilityState(true);
+			return helper.processToIdle(win);
+		});
+
+		helper.typeIntoDocument('{ctrl}{home}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+	});
+
+	it('a comment is marked at its anchor, with its author and text as its details', function () {
+		expectComment('#clipboard-area', '\ufffc', 'Alice Check this word.');
+		cy.then(function () {
+			expect(win.app.map._textInput.getPlainTextContent(), 'the editable text')
+				.to.equal('Before \ufffcafter.');
+		});
+	});
+
+	it('a range comment of a paragraph around the caret marks its range', function () {
+		expectComment('#a11y-context-after > :first-child', 'marked range\ufffc', 'Bob About the marked words.');
+	});
+
+	it('a comment hidden in the panel keeps its details', function () {
+		cy.then(function () {
+			win.app.map.showComments(false);
+		});
+		expectComment('#clipboard-area', '\ufffc', 'Alice Check this word.');
+		// a paragraph reached with comments switched off has them too
+		helper.typeIntoDocument('{downarrow}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		expectComment('#clipboard-area', 'marked range\ufffc', 'Bob About the marked words.');
+		helper.typeIntoDocument('{uparrow}');
+		cy.then(function () {
+			win.app.map.showComments(true);
+			return helper.processToIdle(win);
+		});
+		expectComment('#clipboard-area', '\ufffc', 'Alice Check this word.');
+	});
+
+	it('a comment inside a commented range is a mark in its mark', function () {
+		helper.typeIntoDocument('{downarrow}{downarrow}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.cGet('#clipboard-area [role="mark"]').should(function ($marks) {
+			expect($marks, 'the marks').to.have.length(2);
+			expect($marks.eq(0).text(), 'the outer range').to.equal('outer \ufffcwords\ufffc');
+			expect($marks.eq(1).text(), 'the inner comment').to.equal('\ufffc');
+			expect($marks[0].contains($marks[1]), 'the inner mark in the outer one').to.equal(true);
+			expect(detailsText($marks[0]), 'the outer details').to.equal('Carol About the outer words.');
+			expect(detailsText($marks[1]), 'the inner details').to.equal('Dave About this one.');
+			// one copy per comment shown, none left from the paragraphs before
+			const ids = new Set(Array.from(win.document.querySelectorAll('[data-comment-id]'),
+				function (mark) { return mark.dataset.commentId; }));
+			expect(win.document.querySelectorAll('[id^="a11y-comment-"]').length, 'the copies')
+				.to.equal(ids.size);
+			expect(win.app.map._textInput.getPlainTextContent(), 'the editable text')
+				.to.equal('Some outer \ufffcwords\ufffc end.');
+		});
+	});
+
+	it('Ctrl+Alt+PageDown and PageUp give the comment they reach', function () {
+		helper.typeIntoDocument('{ctrl}{home}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+
+		cy.realPress(['Control', 'Alt', 'PageDown']);
+		cy.cGet('#a11y-jump-status').should('have.text', 'Comment by Alice: Check this word.');
+		cy.realPress(['Control', 'Alt', 'PageDown']);
+		cy.cGet('#a11y-jump-status').should('have.text', 'Comment by Bob: About the marked words.');
+		cy.realPress(['Control', 'Alt', 'PageUp']);
+		cy.cGet('#a11y-jump-status').should('have.text', 'Comment by Alice: Check this word.');
+	});
+
+	it('Ctrl+Alt+PageDown gives the comment it reaches on a slow connection', function () {
+		helper.typeIntoDocument('{ctrl}{home}');
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.then(function () {
+			win.document.getElementById('a11y-jump-status').textContent = '';
+			const textInput = win.app.map._textInput;
+			const updateCursorPosition = textInput._updateCursorPosition;
+			// the caret update arrives late
+			textInput._updateCursorPosition = function (pos) {
+				setTimeout(updateCursorPosition.bind(this, pos), 2500);
+			};
+		});
+
+		cy.realPress(['Control', 'Alt', 'PageDown']);
+		cy.cGet('#a11y-jump-status', { timeout: 10000 })
+			.should('have.text', 'Comment by Alice: Check this word.');
+		cy.then(function () {
+			delete win.app.map._textInput._updateCursorPosition;
+		});
+	});
+
+	it('a pointer press after a jump that moved nothing ends its claim', function () {
+		// no comment comes before the start
+		helper.typeIntoDocument('{ctrl}{home}');
+		cy.then(function () {
+			win.document.getElementById('a11y-jump-status').textContent = '';
+			return helper.processToIdle(win);
+		});
+		cy.realPress(['Control', 'Alt', 'PageUp']);
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+
+		// a press that moves no caret, as on the ruler, then a move onto the anchor by Alice
+		cy.then(function () {
+			win.document.body.dispatchEvent(new win.PointerEvent('pointerdown', { bubbles: true }));
+			win.app.map.sendUnoCommand('.uno:GoRight', { Count: { type: 'long', value: 7 } });
+			return helper.processToIdle(win);
+		});
+		cy.then(function () {
+			expect(win.app.map._textInput._getLastCursorPosition(), 'the caret').to.equal(7);
+		});
+		// longer than the status takes to change, and checked once, as it empties itself later
+		cy.wait(500);
+		cy.then(function () {
+			expect(win.document.getElementById('a11y-jump-status').textContent, 'the status')
+				.to.equal('');
+		});
+	});
+
+	it('the empty status is no line of its own, and stays a live region', function () {
+		cy.then(function () {
+			win.document.getElementById('a11y-jump-status').textContent = '';
+		});
+		cy.waitUntil(function () {
+			return a11yHelper.getAXNodesWithin('#a11y-jump-status').then(function (nodes) {
+				return nodes.length === 1;
+			});
+		});
+		a11yHelper.getAXNodesWithin('#a11y-jump-status').then(function (nodes) {
+			// a reader skips an empty generic node, but not a status
+			expect(nodes[0].ignored, 'in the tree').to.equal(false);
+			expect(nodes[0].role, 'the role').to.equal('generic');
+			expect(nodes[0].properties.live, 'the live region').to.equal('polite');
+			expect(nodes[0].properties.atomic, 'the atomic flag').to.equal(true);
+		});
+	});
+
+	it('Alt+F12 before an anchor moves the focus to its comment', function () {
+		// "Before " leads to the anchor of the comment by Alice; {ctrl} stays down for the rest
+		// of a string, so the arrows go in a call of their own
+		helper.typeIntoDocument('{ctrl}{home}');
+		helper.typeIntoDocument('{rightarrow}'.repeat(7));
+		cy.then(function () {
+			return helper.processToIdle(win);
+		});
+		cy.realPress(['Alt', 'F12']);
+
+		cy.cGet('div.cool-annotation-menu:focus')
+			.invoke('attr', 'aria-describedby')
+			.then(function (ids) {
+				const [author, text] = ids.split(' ');
+				cy.cGet('#' + author).should('have.text', 'Alice');
+				cy.cGet('#' + text).should('have.text', 'Check this word.');
+			});
+	});
+
+	it('Alt+F12 in a comment moves the focus back to its anchor', function () {
+		// the focus is in the comment by Alice since the previous test
+		cy.cGet('div.cool-annotation-menu:focus').should('exist');
+		cy.realPress(['Alt', 'F12']);
+		cy.cGet('#clipboard-area').should('have.focus');
+
+		// the caret is still at the anchor: the same comment opens again
+		cy.realPress(['Alt', 'F12']);
+		cy.cGet('div.cool-annotation-menu:focus')
+			.invoke('attr', 'aria-describedby')
+			.then(function (ids) {
+				cy.cGet('#' + ids.split(' ')[1]).should('have.text', 'Check this word.');
+			});
+	});
+});

@@ -1,0 +1,643 @@
+/* The largest size of a thumbnail in the slide list, and the size of a thumbnail in the grid
+ * view. The slide previews are requested at these sizes, so a bitmap is shown at its own size.
+ * The values sit on the root element because the frames of a linked presentation move from the
+ * sorter into a panel beside it. */
+:root {
+	--preview-img-max-width: 158px;
+	--preview-img-max-height: 174px;
+	--preview-img-grid-size: 256px;
+}
+
+#slide-sorter {
+	white-space: nowrap;
+	overflow-x: hidden;
+	overflow-y: visible;
+	background: var(--color-background-lighter);
+	flex: 1;
+	min-height: 0;
+	scrollbar-color: var(--scrollbar-color);
+	scrollbar-width: var(--scrollbar-width);
+}
+
+/* The slide list takes the height left above the slide toolbar. */
+#presentation-controls-wrapper {
+	flex-direction: column;
+}
+
+#sidebar-panel {
+	height: 100%
+}
+
+#first-drop-site {
+	padding: 0px;
+}
+
+.preview-frame {
+	white-space: nowrap;
+	display: flex;
+	align-items: flex-start;
+	justify-content: center;
+	padding: 1em 0;
+}
+
+.preview-slide-number {
+	font-family: var(--cool-font);
+	font-size: 12px;
+	color: var(--color-text-light);
+	min-width: 24px;
+	text-align: right;
+	padding-right: 4px;
+	flex-shrink: 0;
+	user-select: none;
+}
+
+.preview-helper {
+	display: inline-block;
+	height: 100%;
+	vertical-align: middle;
+}
+
+/* The inline width and height set on a thumbnail are the size of its bitmap, and the border
+ * sits outside them, so the picture is shown at its own size. A narrow Draw page still takes a
+ * frame almost as wide as a slide, to line up with the document's left edge, and keeps its
+ * proportions centred inside it. */
+.preview-img {
+	min-width: calc(var(--preview-img-max-width) - 4px);
+	vertical-align: middle;
+	max-width: var(--preview-img-max-width);
+	max-height: var(--preview-img-max-height);
+	object-fit: contain;
+	cursor: pointer;
+	border: 3px solid transparent !important;
+	border-radius: var(--border-radius);
+	outline: 3px solid var(--color-border);
+	box-sizing: content-box;
+	margin-left: 10px;
+	margin-right: 10px;
+}
+
+/* The current part the user is on. */
+.preview-img-currentpart {
+	border-color: transparent !important;
+	outline-color: rgba(var(--doc-type), 1);
+}
+
+/* One of (potentially many) selected parts, but not the current. */
+.preview-img-selectedpart {
+	border-color: transparent !important;
+	outline-color: rgba(var(--doc-type), 0.65);
+}
+
+/* Highlight where a slide can be dropped when reordering by drag-and-drop. */
+.preview-img-dropsite {
+	border-bottom: 20px solid var(--color-primary);
+}
+
+.preview-avatars {
+	position: relative;
+	z-index: 2;
+	display: flex;
+	justify-content: flex-end;
+	flex: 0 0 0;
+	min-width: 0;
+	align-self: flex-end;
+	pointer-events: none;
+	inset-inline-end: 2px;
+	bottom: -9px;
+}
+
+.preview-avatars .avatar-img,
+.slide-user-list .avatar-img {
+	flex: 0 0 auto;
+	width: 24px;
+	height: 24px;
+	box-sizing: border-box;
+	object-fit: cover;
+	box-shadow: 0 1px 2px var(--color-box-shadow);
+}
+
+.preview-avatars > * + * {
+	margin-inline-start: -6px;
+}
+
+.preview-avatars .avatar-img {
+	pointer-events: auto;
+	cursor: pointer;
+}
+
+.slide-user-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 8px;
+	white-space: nowrap;
+	font-size: var(--default-font-size);
+}
+
+/* The counter is the last circle in the avatar row, so it keeps their size. */
+.preview-avatars-more {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	width: 24px;
+	height: 24px;
+	border: 2px solid var(--color-primary-dark);
+	border-radius: var(--border-radius-pill);
+	background: var(--color-primary-dark);
+	color: var(--color-primary-text);
+	font-family: var(--cool-font);
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 1;
+	pointer-events: auto;
+	cursor: pointer;
+}
+
+/* Fluid drag-and-drop reordering: while a slide drag is in progress the
+   frames animate size and margin changes, so the remaining slides close
+   the space the dragged slide left and a new insertion gap opens under
+   the pointer. The sorter animates the space at its end that stands in
+   for the dragged slides the gap does not hold. */
+#slide-sorter.dragging-slide {
+	transition: padding var(--duration-fast) var(--ease-out);
+}
+
+#slide-sorter.dragging-slide .preview-frame {
+	transition: margin var(--duration-fast) var(--ease-out), height var(--duration-fast) var(--ease-out),
+		width var(--duration-fast) var(--ease-out), padding var(--duration-fast) var(--ease-out), opacity var(--duration-fast) var(--ease-out);
+}
+
+/* The frames and the space at the end of the sorter change in a single
+   step. */
+#slide-sorter.dragging-slide.drag-no-transition,
+#slide-sorter.dragging-slide.drag-no-transition .preview-frame {
+	transition: none;
+}
+
+/* The drag ghost: the grabbed slide's picture with the standard preview
+   border on top; the other dragged slides stack behind it and a badge
+   counts them all. It sits at the viewport's top-left corner while the
+   browser takes its snapshot, because browsers only render a drag image
+   element that is on screen; the negative z-index keeps the page content
+   painted over it, so the user never sees it. */
+.slide-drag-ghost {
+	position: absolute;
+	top: 0;
+	left: 0;
+	z-index: -1;
+}
+
+.slide-drag-ghost img,
+.slide-drag-ghost canvas {
+	display: block;
+	position: absolute;
+	border: 3px solid var(--color-border);
+	border-radius: var(--border-radius);
+	background: var(--color-background-lighter);
+}
+
+/* How many slides the drag carries, over the top picture's corner. */
+.slide-drag-ghost-count {
+	position: absolute;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	min-width: 22px;
+	height: 22px;
+	padding: 0 6px;
+	border-radius: 11px;
+	background: var(--color-primary);
+	color: var(--color-primary-text);
+	font-family: var(--cool-font);
+	font-size: 12px;
+	font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	#slide-sorter.dragging-slide,
+	#slide-sorter.dragging-slide .preview-frame {
+		transition: none;
+	}
+}
+
+.hidden-slide {
+	opacity: 0.5;
+}
+
+/* The mark of a slide that is linked to another file. The span takes no room
+   of its own and its picture overflows back over the thumbnail's top right
+   corner, so the thumbnails stay where they are and the mark follows the
+   picture in the strip and in the grid alike. The pointer goes through it to
+   the thumbnail, which carries the description of the link. */
+.preview-link-badge {
+	display: none;
+	width: 0;
+	height: 0;
+	overflow: visible;
+	pointer-events: none;
+}
+
+.preview-link-badge.linked {
+	display: block;
+}
+
+.preview-link-badge::before {
+	content: '';
+	display: block;
+	position: relative;
+	/* Back over the picture: its 10px strip margin, the width of the mark,
+	   and 6px inside the picture's corner. */
+	left: -38px;
+	top: 6px;
+	width: 22px;
+	height: 22px;
+	box-sizing: border-box;
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius-s);
+	background: var(--color-background-lighter) url('images/sc_linkedslide.svg') no-repeat center;
+	background-size: 16px 16px;
+}
+
+.preview-link-badge.outdated::before,
+.slide-section-link.outdated {
+	background-image: url('images/sc_linkedslideoutdated.svg');
+}
+
+.preview-link-badge.broken::before,
+.slide-section-link.broken {
+	background-image: url('images/sc_linkedslidebroken.svg');
+}
+
+.preview-link-badge.broken::before {
+	border-color: var(--color-status-error);
+}
+
+.preview-link-badge.disconnected::before,
+.slide-section-link.disconnected {
+	background-image: url('images/sc_linkedslidedisconnected.svg');
+}
+
+[data-theme='dark'] .preview-link-badge::before,
+[data-theme='dark'] .slide-section-link {
+	background-image: url('images/dark/sc_linkedslide.svg');
+}
+
+[data-theme='dark'] .preview-link-badge.outdated::before,
+[data-theme='dark'] .slide-section-link.outdated {
+	background-image: url('images/dark/sc_linkedslideoutdated.svg');
+}
+
+[data-theme='dark'] .preview-link-badge.broken::before,
+[data-theme='dark'] .slide-section-link.broken {
+	background-image: url('images/dark/sc_linkedslidebroken.svg');
+}
+
+[data-theme='dark'] .preview-link-badge.disconnected::before,
+[data-theme='dark'] .slide-section-link.disconnected {
+	background-image: url('images/dark/sc_linkedslidedisconnected.svg');
+}
+
+/* Slide section headers - styled to match sidebar expander labels */
+.slide-section-header {
+	display: flex;
+	align-items: center;
+	margin-inline: 16px;
+	line-height: var(--sidebar-header-height, 34px);
+	cursor: pointer;
+	user-select: none;
+	border-bottom: 1px solid var(--color-border, #ccc);
+}
+
+#slide-sorter .slide-section-header + .preview-frame {
+	scroll-margin-top: calc(var(--sidebar-header-height, 34px) + 1px);
+}
+
+.slide-section-header:hover {
+	background-color: var(--color-background-darker);
+	border-radius: var(--border-radius-s);
+}
+
+.slide-section-toggle {
+	background: transparent;
+	border: 0;
+	padding: 0;
+	margin-inline-end: 7px;
+	cursor: pointer;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
+	flex: 0 0 auto;
+	color: inherit;
+}
+
+.slide-section-toggle::before {
+	content: '';
+	display: inline-block;
+	width: 9px;
+	height: 9px;
+	background: transparent url('images/lc_menu_chevron.svg') no-repeat center;
+	filter: brightness(0.5);
+	transform: rotate(90deg); /* expanded: chevron points down */
+	transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+.slide-section-header.collapsed .slide-section-toggle::before {
+	transform: rotate(0deg); /* collapsed: chevron points right */
+}
+
+[data-theme='dark'] .slide-section-toggle::before {
+	filter: brightness(1);
+}
+
+.slide-section-name {
+	color: var(--color-main-text);
+	font-family: var(--cool-font);
+	font-size: var(--header-font-size, 12px);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	flex: 1;
+}
+
+/* The mark of a section that holds a copy of a section of another file, next
+   to the section name. */
+.slide-section-link {
+	flex: 0 0 auto;
+	width: 16px;
+	height: 16px;
+	margin-inline-start: 6px;
+	background: url('images/sc_linkedslide.svg') no-repeat center;
+	background-size: 16px 16px;
+}
+
+.preview-frame.section-collapsed {
+	display: none;
+}
+
+/* The header of a linked presentation, above the headers of its sections,
+   carrying the name of the file it holds a copy of. */
+.slide-presentation-header .slide-section-name {
+	font-weight: 600;
+}
+
+/* The header of a section inside a linked presentation sits under the header
+   of the presentation, indented. */
+.slide-section-header.in-presentation {
+	margin-inline-start: 36px;
+}
+
+/* A collapsed presentation shows as one tile: the frame of its first slide
+   under its header, shown even while the section of that slide is collapsed.
+   The other frames of its run and the headers of its sections are hidden. */
+.preview-frame.presentation-tile.section-collapsed {
+	display: flex;
+}
+
+.preview-frame.presentation-collapsed,
+.slide-section-header.presentation-collapsed {
+	display: none;
+}
+
+/* The header of a presentation shown in the panel beside the sorter. */
+.slide-presentation-header.panel-open {
+	background-color: var(--color-background-darker);
+	border-radius: var(--border-radius-s);
+}
+
+/* The panel of a linked presentation: a column beside everything the
+   navigation sidebar holds, as wide as the sidebar and as tall, in the shape
+   of a panel of its own. The sidebar keeps its own content at its first
+   width and grows by the width of the column, which the panel takes, so the
+   document keeps its room. */
+#navigation-sidebar.visible:has(#presentation-controls-wrapper.slide-link-panel-open) {
+	position: relative;
+	padding-inline-end: var(--navigation-sidebar-width, 250px);
+}
+
+.slide-link-panel {
+	position: absolute;
+	inset-block: 0;
+	inset-inline-end: 0;
+	width: var(--navigation-sidebar-width, 250px);
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	border-inline-start: 1px solid var(--color-border);
+	background: var(--color-background-lighter);
+}
+
+/* The header of the panel takes the shape of the navigation header: the name
+   of the presentation as the title, the mark of its link after it, and the
+   close button at the end. */
+.slide-link-panel-title {
+	flex: none;
+	gap: 8px;
+	user-select: none;
+}
+
+.slide-link-panel-title .slide-section-name {
+	flex: 1;
+}
+
+.slide-link-panel-title .slide-section-link {
+	flex: none;
+}
+
+/* The deck takes the height under the header and scrolls on its own, like
+   the sorter. */
+.slide-link-panel-deck {
+	flex: 1;
+	min-height: 0;
+	white-space: nowrap;
+	overflow-x: hidden;
+	overflow-y: auto;
+	scrollbar-color: var(--scrollbar-color);
+	scrollbar-width: var(--scrollbar-width);
+}
+
+/* The sections in the deck are the sections of the presentation itself, so
+   they start at the edge the way the sections of the sorter do. */
+.slide-link-panel-deck .slide-section-header.in-presentation {
+	margin-inline-start: 16px;
+}
+
+/* How many slides a section holds, at the end of its header. */
+.slide-section-count {
+	flex-shrink: 0;
+	margin-inline-start: 8px;
+	color: var(--color-text-light);
+	white-space: nowrap;
+}
+
+/* Selecting a whole section is a checkbox, the way selecting one slide is,
+ * so the row itself is free to do what the row above it does and open or
+ * close the section. Only the slide import pane asks for it. */
+.slide-section-pick {
+	flex: 0 0 auto;
+	width: 18px;
+	height: 18px;
+	margin: 0;
+	margin-inline-start: 8px;
+	cursor: pointer;
+}
+
+.slide-section-name.selected {
+	color: rgb(var(--doc-type));
+	font-weight: 600;
+}
+
+/* Grid layout for the slide navigator's list while the panels are
+ * maximized. The slides flow into as many columns as the wide panel fits;
+ * the section headers take a whole row of their own. The grid takes the
+ * space left above the toolbar and scrolls on its own. The rows pack at
+ * their content height from the top: left to the default stretch, a short
+ * deck's row tracks would inflate to fill the panel and any fixed-height
+ * cell added to a row would redistribute that slack, moving every row. */
+.parts-preview-grid #slide-sorter {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+	align-content: start;
+	--slide-sorter-grid-gap: 12px;
+	gap: var(--slide-sorter-grid-gap);
+	--preview-outline: 3px;
+	padding: calc(20px + 1em) calc(16px + var(--preview-outline)) 12px;
+	white-space: normal;
+	overflow-x: visible;
+	overflow-y: auto;
+}
+
+/* The slide import pane lays its slides out in the same grid whatever the
+ * panel width; the wide panel only takes wider columns. */
+.parts-preview-grid .slide-import-list {
+	grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
+}
+
+/* The toolbar row is as wide as the whole document area here. Keep the slide
+ * buttons grouped in the centre at their normal size instead of spreading
+ * them to the far edges. */
+.parts-preview-grid #presentation-buttons-toolbar {
+	justify-content: center;
+	gap: 4px;
+}
+
+/* Centre the import button and give it a fixed width rather than letting it
+ * stretch across the whole row. */
+.parts-preview-grid #presentation-import-toolbar {
+	justify-content: center;
+}
+
+.parts-preview-grid #presentation-import-toolbar .unotoolbutton {
+	flex: 0 0 auto;
+	width: 300px;
+}
+
+.parts-preview-grid .slide-section-header {
+	grid-column: 1 / -1;
+}
+
+.parts-preview-grid #first-drop-site {
+	display: none;
+}
+
+.parts-preview-grid #slide-sorter .slide-section-header {
+	margin-inline: calc(-1 * var(--preview-outline));
+}
+
+.parts-preview-grid #slide-sorter .slide-section-header.in-presentation {
+	margin-inline-start: calc(36px - var(--preview-outline));
+}
+
+.parts-preview-grid #slide-sorter .slide-section-header + .preview-frame {
+	scroll-margin-top: calc(var(--sidebar-header-height, 34px) + 1px + var(--slide-sorter-grid-gap));
+}
+
+.parts-preview-grid #slide-sorter:has(.slide-section-header:not(.preview-frame:not(#first-drop-site) ~ *)) {
+	padding-top: 20px;
+}
+
+.parts-preview-grid .preview-frame {
+	padding: 0;
+	justify-content: stretch;
+}
+
+.parts-preview-grid .preview-helper,
+.parts-preview-grid .preview-slide-number {
+	display: none;
+}
+
+/* The preview code sets an inline pixel width and height on every thumbnail;
+ * in the grid the cell decides the size, so these override that inline rule
+ * to make each thumbnail fill its column while keeping the slide ratio. */
+.parts-preview-grid .preview-img {
+	box-sizing: border-box;
+	min-width: 0;
+	max-width: none;
+	max-height: none;
+	width: 100% !important;
+	height: auto !important;
+	margin: 0;
+}
+
+.parts-preview-grid .preview-avatars {
+	inset-inline-end: 6px;
+	bottom: 6px;
+}
+
+.parts-preview-grid .preview-link-badge::before {
+	left: -28px;
+}
+
+/* The row above the grid with the actions on every linked presentation at
+ * once. It shows in the grid only; the hidden class takes it away while the
+ * grid holds no linked presentation. */
+.slide-presentations-row {
+	display: none;
+}
+
+.parts-preview-grid > .slide-presentations-row {
+	display: flex;
+	justify-content: flex-end;
+	align-items: center;
+	gap: var(--spacing-s);
+	padding: var(--spacing-xs) 16px;
+	border-bottom: 1px solid var(--color-border);
+}
+
+/* The actions are links in the colour of the primary action. The room for
+ * the border the desktop rules add on hover is there from the start, so the
+ * row does not move under the pointer. The colours carry !important and the
+ * hover and disabled rules an id, since the rules for every button in
+ * device-desktop.css and jsdialogs.css set theirs with !important and more
+ * than a dozen classes of specificity. */
+.slide-presentations-row .ui-linkbutton {
+	margin: 0;
+	padding: var(--spacing-xs) var(--spacing-s);
+	border: 1px solid transparent;
+	border-radius: var(--border-radius);
+	background: transparent;
+	color: var(--color-primary) !important;
+	font: inherit;
+	cursor: pointer;
+}
+
+#presentation-controls-wrapper .slide-presentations-row .ui-linkbutton:hover {
+	color: var(--color-primary-dark) !important;
+	background-color: var(--color-btn-primary-hover-bg) !important;
+	border-color: transparent;
+}
+
+/* A disabled action is dimmed, which reads the same in the light and the
+ * dark palette. */
+#presentation-controls-wrapper .slide-presentations-row .ui-linkbutton:disabled,
+#presentation-controls-wrapper .slide-presentations-row .ui-linkbutton:disabled:hover {
+	color: var(--color-text-light) !important;
+	background-color: transparent !important;
+	opacity: 0.5;
+	cursor: default;
+}

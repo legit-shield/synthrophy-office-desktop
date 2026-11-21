@@ -1,0 +1,126 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** Services that run in the extension's browser frame rather than in the document process.
+
+    The document process has no network access and no per-user storage, so a script reaches
+    these through a proxy object that calls back into the browser and waits for the answer.
+    The user properties and the cache are kept in the browser's local storage, separately for
+    each extension, so they belong to one user in one browser.
+
+    @internal
+ */
+interface XClientRuntime {
+    /** @returns
+            The value, or null when the key is not set.
+
+        @gas Properties.getProperty
+     */
+    com::sun::star::beans::Optional<string> userPropGetProperty([in] string key);
+
+    /** @gas Properties.setProperty */
+    void userPropSetProperty([in] string key, [in] string value);
+
+    /** A key that is not set is accepted and nothing happens.
+
+        @gas Properties.deleteProperty
+     */
+    void userPropDeleteProperty([in] string key);
+
+    /** @gas Properties.getKeys */
+    sequence<string> userPropGetKeys();
+
+    /** @gas Properties.deleteAllProperties */
+    void userPropDeleteAll();
+
+    /** Every call throws, because no translation service is available.
+
+        @param origin
+            The ISO 639-1 code of the source language, or '' to detect it.
+        @param dest
+            The ISO 639-1 code of the target language.
+
+        @unimplemented
+        @gas LanguageApp.translate
+     */
+    string translate([in] string text, [in] string origin, [in] string dest);
+
+    /** @param scope
+            "user" or "script".
+        @returns
+            The value, or null when there is no entry or it has expired.
+
+        @gas Cache.get
+     */
+    com::sun::star::beans::Optional<string> cacheGet([in] string scope, [in] string key);
+
+    /** Stores a value in the cache under the given key, for the given number of seconds.
+
+        The caches of all extensions share room for about one million characters. Expired
+        entries are dropped to make room for a new one, then those that expire soonest. A value
+        too large to fit is not stored at all.
+
+        @param scope
+            "user" or "script".
+        @param ttlSeconds
+            A negative value counts as zero.
+
+        @gas Cache.put
+     */
+    void cachePut([in] string scope, [in] string key, [in] string value, [in] long ttlSeconds);
+
+    /** @param scope
+            "user" or "script".
+
+        @gas Cache.remove
+     */
+    void cacheRemove([in] string scope, [in] string key);
+
+    /** Makes an HTTP request from the browser and returns the response.
+
+        The request is subject to the browser's own rules for cross-origin requests. A network
+        failure, or a request the browser refuses, does not throw: it comes back as a response
+        with code 0 and the message in its error member.
+
+        @param method
+            The HTTP method in upper case, such as "GET" or "POST".
+        @param contentType
+            Sent as the Content-Type header when not empty. It replaces a Content-Type given in
+            the header arrays.
+        @param payload
+            The request body. It is not sent for a GET or HEAD request.
+        @param payloadIsBase64
+            True when payload is base64 and decodes to the raw bytes of the body, false when it
+            is sent as text.
+        @param headerNames
+            The names of the request headers, in the same order as headerValues.
+        @param followRedirects
+            When false, a redirect is not followed and the browser reports it as an opaque
+            response with code 0.
+
+        @gas UrlFetchApp.fetch
+     */
+    HttpResponse urlFetch(
+        [in] string url, [in] string method, [in] string contentType, [in] string payload,
+        [in] boolean payloadIsBase64, [in] sequence<string> headerNames,
+        [in] sequence<string> headerValues, [in] boolean followRedirects);
+
+    // Show a modal dialog with title (empty for none), prompt and the buttons of buttonSet ("OK",
+    // "OK_CANCEL", "YES_NO" or "YES_NO_CANCEL"), and return the button that closed it ("OK",
+    // "CANCEL", "YES" or "NO"), or "CLOSE" for one closed without a button:
+    string alert([in] string title, [in] string prompt, [in] string buttonSet);
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

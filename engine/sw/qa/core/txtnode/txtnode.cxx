@@ -1,0 +1,1258 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <swmodeltestbase.hxx>
+
+#include <COKit/COKit.hxx>
+#include <comphelper/kit.hxx>
+#include <comphelper/propertyvalue.hxx>
+#include <com/sun/star/beans/XPropertySet.hpp>
+#include <com/sun/star/drawing/XDrawPageSupplier.hpp>
+#include <com/sun/star/drawing/XShape.hpp>
+#include <com/sun/star/lang/XMultiServiceFactory.hpp>
+#include <com/sun/star/text/TextContentAnchorType.hpp>
+#include <com/sun/star/text/XTextDocument.hpp>
+#include <com/sun/star/text/XTextTable.hpp>
+#include <sfx2/viewsh.hxx>
+#include <vcl/gdimtf.hxx>
+#include <vcl/scheduler.hxx>
+#include <sfx2/kit/helper.hxx>
+#include <svl/whiter.hxx>
+#include <test/kitcallback.hxx>
+#include <comphelper/propertysequence.hxx>
+#include <comphelper/scopeguard.hxx>
+#include <editeng/adjustitem.hxx>
+#include <editeng/colritem.hxx>
+#include <editeng/escapementitem.hxx>
+#include <editeng/wghtitem.hxx>
+#include <numrule.hxx>
+#include <paratr.hxx>
+#include <fmtautofmt.hxx>
+#include <ndhints.hxx>
+
+#include <IDocumentStatistics.hxx>
+#include <IDocumentLayoutAccess.hxx>
+#include <fmtanchr.hxx>
+#include <frameformats.hxx>
+#include <wrtsh.hxx>
+#include <unotxdoc.hxx>
+#include <docsh.hxx>
+#include <formatcontentcontrol.hxx>
+#include <view.hxx>
+#include <edtwin.hxx>
+#include <txatbase.hxx>
+#include <ndtxt.hxx>
+#include <textcontentcontrol.hxx>
+#include <swdtflvr.hxx>
+#include <txtrfmrk.hxx>
+#include <frmmgr.hxx>
+#include <formatflysplit.hxx>
+#include <ftnidx.hxx>
+#include <rootfrm.hxx>
+#include <pagefrm.hxx>
+#include <txtfrm.hxx>
+#include <PostItMgr.hxx>
+#include <AnnotationWin.hxx>
+#include <docufld.hxx>
+#include <IDocumentFieldsAccess.hxx>
+#include <MarkManager.hxx>
+#include <fldmgr.hxx>
+
+using namespace css;
+using namespace ::cpo;
+using namespace ::cpo::uno;
+
+/// Covers sw/source/core/txtnode/ fixes.
+class SwCoreTxtnodeTest : public SwModelTestBase
+{
+public:
+    SwCoreTxtnodeTest()
+        : SwModelTestBase(u"/sw/qa/core/txtnode/data/"_ustr)
+    {
+    }
+};
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testBtlrCellChinese)
+{
+    // Load a document with a table cell, with btlr cell direction.  The cell has text which is
+    // classified as vertical, i.e. the glyph has the same direction in both the lrtb ("Latin") and
+    // tbrl ("Chinese") directions. Make sure that Chinese text is handled the same way in the btlr
+    // case as it's handled in the Latin case.
+    createSwDoc("btlr-cell-chinese.doc");
+    SwDocShell* pShell = getSwDocShell();
+    std::shared_ptr<GDIMetaFile> xMetaFile = pShell->GetPreviewMetaFile();
+    MetafileXmlDump dumper;
+    xmlDocUniquePtr pXmlDoc = dumpAndParse(dumper, *xMetaFile);
+    assertXPath(pXmlDoc, "//font[1]", "orientation", u"900");
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: false
+    // - Actual  : true
+    // i.e. the glyph was rotated further, so it was upside down.
+    assertXPath(pXmlDoc, "//font[1]", "vertical", u"false");
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testSpecialInsertAfterMergedCells)
+{
+    // Load a document with a table with bottom right cells merged vertically.
+    // SpecialInsert with alt-Enter must work here, too.
+    createSwDoc("special-insert-after-merged-cells.fodt");
+    SwDoc* pDoc = getSwDoc();
+    SwNodeOffset const nNodes(pDoc->GetNodes().Count());
+    SwDocShell* pShell = getSwDocShell();
+    SwWrtShell* pWrtShell = pShell->GetWrtShell();
+    // go to the merged cell
+    pWrtShell->Right(SwCursorSkipMode::Chars, /*bSelect=*/false, 1, /*bBasicCall=*/false);
+
+    // When pressing alt-Enter on the keyboard:
+    SwEditWin& rEditWin = pWrtShell->GetView().GetEditWin();
+    vcl::KeyCode aKeyCode(KEY_RETURN, KEY_MOD2);
+    KeyEvent aKeyEvent(' ', aKeyCode);
+    rEditWin.KeyInput(aKeyEvent);
+
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: nNodes + 1
+    // - Actual  : nNodes
+    // i.e. new empty paragraph wasn't inserted under the table
+    CPPUNIT_ASSERT_EQUAL(nNodes + 1, pDoc->GetNodes().Count());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testTextBoxCopyAnchor)
+{
+    createSwDoc("textbox-copy-anchor.docx");
+    SwDocShell* pShell = getSwDocShell();
+    SwWrtShell* pWrtShell = pShell->GetWrtShell();
+    SwDoc aClipboard;
+    pWrtShell->SelAll();
+    pWrtShell->Copy(aClipboard);
+    pWrtShell->SttEndDoc(/*bStart=*/false);
+    pWrtShell->Paste(aClipboard);
+
+    const auto& rFormats = *pShell->GetDoc()->GetSpzFrameFormats();
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: 4
+    // - Actual  : 6
+    // i.e. 2 fly frames were copied twice.
+    CPPUNIT_ASSERT_EQUAL(static_cast<size_t>(4), rFormats.size());
+
+    SwPosition aDrawAnchor1 = *rFormats[0]->GetAnchor().GetContentAnchor();
+    SwPosition aFlyAnchor1 = *rFormats[1]->GetAnchor().GetContentAnchor();
+    CPPUNIT_ASSERT_EQUAL(aFlyAnchor1.GetNodeIndex(), aDrawAnchor1.GetNodeIndex());
+    SwPosition aDrawAnchor2 = *rFormats[2]->GetAnchor().GetContentAnchor();
+    SwPosition aFlyAnchor2 = *rFormats[3]->GetAnchor().GetContentAnchor();
+    // This also failed, aFlyAnchor2 was wrong, as it got out of sync with aDrawAnchor2.
+    CPPUNIT_ASSERT_EQUAL(aFlyAnchor2.GetNodeIndex(), aDrawAnchor2.GetNodeIndex());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testTextBoxNodeSplit)
+{
+    createSwDoc("textbox-node-split.docx");
+    SwDocShell* pShell = getSwDocShell();
+    SwWrtShell* pWrtShell = pShell->GetWrtShell();
+    pWrtShell->SttEndDoc(/*bStart=*/false);
+    // Without the accompanying fix in place, this would have crashed in
+    // SwFlyAtContentFrame::SwClientNotify().
+    pWrtShell->SplitNode();
+}
+
+namespace
+{
+struct ViewCallback
+{
+    int m_nInvalidations = 0;
+
+    static void callback(COKitCallbackType eType, const char* pPayload, void* pData);
+    void callbackImpl(COKitCallbackType eType, const char* pPayload);
+};
+
+void ViewCallback::callback(COKitCallbackType eType, const char* pPayload, void* pData)
+{
+    static_cast<ViewCallback*>(pData)->callbackImpl(eType, pPayload);
+}
+
+void ViewCallback::callbackImpl(COKitCallbackType eType, const char* /*pPayload*/)
+{
+    switch (eType)
+    {
+        case COKitCallbackType::INVALIDATE_TILES:
+        {
+            ++m_nInvalidations;
+        }
+        break;
+        default:
+        break;
+    }
+}
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testTitleFieldInvalidate)
+{
+    // Set up COKit to track invalidations.
+    comphelper::COKit::setActive(true);
+
+    // Given a document with a title field:
+    createSwDoc("title-field-invalidate.fodt");
+    getSwTextDoc()->initializeForTiledRendering({});
+    SwDocShell* pShell = getSwDocShell();
+    SwDoc* pDoc = pShell->GetDoc();
+    SwWrtShell* pWrtShell = pShell->GetWrtShell();
+    pWrtShell->SttEndDoc(/*bStt=*/false);
+    ViewCallback aCallback;
+    TestKitCallbackWrapper aCallbackWrapper(&ViewCallback::callback, &aCallback);
+    pWrtShell->GetSfxViewShell()->setCOKitViewCallback(&aCallbackWrapper);
+    aCallbackWrapper.setKitViewId(KitHelper::getView(*pWrtShell->GetSfxViewShell()));
+    Scheduler::ProcessEventsToIdle();
+    aCallback.m_nInvalidations = 0;
+
+    // When typing to the document:
+    pWrtShell->Insert(u"x"_ustr);
+    pWrtShell->GetSfxViewShell()->flushPendingKitInvalidateTiles();
+
+    // Then make sure that only the text frame at the cursor is invalidated:
+    pDoc->getIDocumentStatistics().GetUpdatedDocStat(/*bCompleteAsync=*/true, /*bFields=*/false);
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: 1
+    // - Actual  : 2
+    // i.e. the footer was also invalidated on each keypress.
+    CPPUNIT_ASSERT_EQUAL(1, aCallback.m_nInvalidations);
+
+    // Tear down COKit.
+    pWrtShell->GetSfxViewShell()->setCOKitViewCallback(nullptr);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testFlyAnchorUndo)
+{
+    // Given a document with a fly frame, anchored after the last char of the document:
+    createSwDoc("fly-anchor-undo.odt");
+    SwDocShell* pShell = getSwDocShell();
+    SwDoc* pDoc = pShell->GetDoc();
+    const auto& rSpz = *pDoc->GetSpzFrameFormats();
+    sal_Int32 nExpected = rSpz[0]->GetAnchor().GetAnchorContentOffset();
+
+    // When deleting that last character and undoing it:
+    SwWrtShell* pWrtShell = pShell->GetWrtShell();
+    pWrtShell->SttEndDoc(/*bStt=*/false);
+    pWrtShell->DelLeft();
+    pWrtShell->Undo();
+
+    // Then make sure the anchor position after the undo is the same as the original:
+    sal_Int32 nActual = rSpz[0]->GetAnchor().GetAnchorContentOffset();
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: 3
+    // - Actual  : 2
+    // i.e. the anchor position was left unchanged by the undo.
+    CPPUNIT_ASSERT_EQUAL(nExpected, nActual);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testSplitNodeSuperscriptCopy)
+{
+    // Given a document with superscript text at the end of a paragraph:
+    createSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->Insert(u"1st"_ustr);
+    pWrtShell->Left(SwCursorSkipMode::Chars, /*bSelect=*/true, 2, /*bBasicCall=*/false);
+    SfxItemSet aSet(SfxItemSet::makeFixedSfxItemSet<RES_CHRATR_ESCAPEMENT, RES_CHRATR_ESCAPEMENT>(
+        pWrtShell->GetAttrPool()));
+    SvxEscapementItem aItem(SvxEscapement::Superscript, RES_CHRATR_ESCAPEMENT);
+    aSet.Put(aItem);
+    pWrtShell->SetAttrSet(aSet);
+
+    // When hitting enter at the end of the paragraph:
+    pWrtShell->SttEndDoc(/*bStt=*/false);
+    pWrtShell->SplitNode(/*bAutoFormat=*/true);
+
+    // Then make sure that the superscript formatting doesn't appear on the next paragraph:
+    aSet.ClearItem(RES_CHRATR_ESCAPEMENT);
+    pWrtShell->GetCurAttr(aSet);
+    // Without the accompanying fix in place, this test would have failed, the unexpected
+    // superscript appeared in the next paragraph.
+    CPPUNIT_ASSERT(!aSet.HasItem(RES_CHRATR_ESCAPEMENT));
+}
+
+/* FIXME: behavior change reverted due to regression;
+ * see sw/source/core/txtnode/atrref.cxx
+ *CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testDontExpandRefmark)
+ *{
+ *    // Given a document with a refmark:
+ *    createSwDoc();
+ *
+ *    cpo::uno::Sequence<css::beans::PropertyValue> aArgs = {
+ *        comphelper::makePropertyValue("TypeName", cpo::uno::Any(OUString("SetRef"))),
+ *        comphelper::makePropertyValue(
+ *            "Name", cpo::uno::Any(OUString("ZOTERO_ITEM CSL_CITATION {} RNDpyJknp173F"))),
+ *        comphelper::makePropertyValue("Content", cpo::uno::Any(OUString("foo"))),
+ *    };
+ *    dispatchCommand(mxComponent, ".uno:InsertField", aArgs);
+ *
+ *    SwDoc* pDoc = getSwDoc();
+ *    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+ *    SwPosition& rCursor = *pWrtShell->GetCursor()->GetPoint();
+ *    SwTextNode* pTextNode = rCursor.GetNode().GetTextNode();
+ *    std::vector<SwTextAttr*> aAttrs
+ *        = pTextNode->GetTextAttrsAt(rCursor.GetContentIndex(), RES_TXTATR_REFMARK);
+ *
+ *    auto& rRefmark = const_cast<SwFormatRefMark&>(aAttrs[0]->GetRefMark());
+ *    auto pTextRefMark = const_cast<SwTextRefMark*>(rRefmark.GetTextRefMark());
+ *
+ *    // When typing after the refmark...
+ *    pWrtShell->SttEndDoc(true);
+ *    pWrtShell->Right(SwCursorSkipMode::Chars, false, 3, false);
+ *    pWrtShell->Insert(" bar");
+ *
+ *    // and skipping back to insert a comma after the refmark
+ *    pWrtShell->Left(SwCursorSkipMode::Chars, false, 4, false);
+ *    pWrtShell->Insert(",");
+ *
+ *    // Without the accompanying fix in place, this test would have failed with:
+ *    // - Expected: 3
+ *    // - Actual  : 4
+ *    // i.e. the reference mark expanded
+ *    CPPUNIT_ASSERT_EQUAL(3, static_cast<int>(*pTextRefMark->End()));
+ *}
+ */
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testInsertDropDownContentControlTwice)
+{
+    // Given an already selected dropdown content control:
+    createSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->InsertContentControl(SwContentControlType::DROP_DOWN_LIST);
+
+    // When trying to insert an inner one, make sure that we don't crash:
+    pWrtShell->InsertContentControl(SwContentControlType::DROP_DOWN_LIST);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testCheckboxContentControlKeyboard)
+{
+    // Given an already selected checkbox content control:
+    createSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->InsertContentControl(SwContentControlType::CHECKBOX);
+    SwEditWin& rEditWin = pWrtShell->GetView().GetEditWin();
+
+    // When pressing space on the keyboard:
+    KeyEvent aKeyEvent(' ', KEY_SPACE);
+    rEditWin.KeyInput(aKeyEvent);
+
+    // Then make sure the state is toggled:
+    SwTextNode* pTextNode = pWrtShell->GetCursor()->GetPointNode().GetTextNode();
+    SwTextAttr* pAttr = pTextNode->GetTextAttrForCharAt(0, RES_TXTATR_CONTENTCONTROL);
+    auto pTextContentControl = static_txtattr_cast<SwTextContentControl*>(pAttr);
+    auto& rFormatContentControl
+        = static_cast<SwFormatContentControl&>(pTextContentControl->GetAttr());
+    std::shared_ptr<SwContentControl> pContentControl = rFormatContentControl.GetContentControl();
+    // Without the accompanying fix in place, this test would have failed, because the state
+    // remained unchanged.
+    CPPUNIT_ASSERT(pContentControl->GetChecked());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testDropdownContentControlKeyboard)
+{
+    // Given an already selected dropdown content control:
+    createSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->InsertContentControl(SwContentControlType::DROP_DOWN_LIST);
+
+    // When checking if alt-down should open a popup:
+    SwTextContentControl* pTextContentControl = pWrtShell->CursorInsideContentControl();
+    auto& rFormatContentControl
+        = static_cast<SwFormatContentControl&>(pTextContentControl->GetAttr());
+    std::shared_ptr<SwContentControl> pContentControl = rFormatContentControl.GetContentControl();
+    vcl::KeyCode aKeyCode(KEY_DOWN, KEY_MOD2);
+    bool bShouldOpen = pContentControl->ShouldOpenPopup(aKeyCode);
+
+    // Then make sure that the answer is yes for dropdowns:
+    // Without the accompanying fix in place, this test would have failed, the dropdown popup was
+    // mouse-only.
+    CPPUNIT_ASSERT(bShouldOpen);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testPictureContentControlKeyboard)
+{
+    // Given an already selected picture content control:
+    createSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->InsertContentControl(SwContentControlType::PICTURE);
+    pWrtShell->GotoObj(/*bNext=*/true, GotoObjFlags::Any);
+
+    // When checking if enter should trigger the file picker:
+    const SwFrameFormat* pFlyFormat = pWrtShell->GetFlyFrameFormat();
+    const SwFormatAnchor& rFormatAnchor = pFlyFormat->GetAnchor();
+    SwNode* pAnchorNode = rFormatAnchor.GetAnchorNode();
+    SwTextNode* pTextNode = pAnchorNode->GetTextNode();
+    SwTextAttr* pAttr
+        = pTextNode->GetTextAttrAt(rFormatAnchor.GetAnchorContentOffset(),
+                                   RES_TXTATR_CONTENTCONTROL, ::sw::GetTextAttrMode::Parent);
+    auto pTextContentControl = static_txtattr_cast<SwTextContentControl*>(pAttr);
+    auto& rFormatContentControl
+        = static_cast<SwFormatContentControl&>(pTextContentControl->GetAttr());
+    std::shared_ptr<SwContentControl> pContentControl = rFormatContentControl.GetContentControl();
+    bool bIsInteracting = pContentControl->IsInteractingCharacter('\r');
+
+    // Then make sure that the answer is yes for pictures:
+    // Without the accompanying fix in place, this test would have failed, the picture replacement
+    // file-picker was mouse-only.
+    CPPUNIT_ASSERT(bIsInteracting);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testDateContentControlKeyboard)
+{
+    // Given an already selected date content control:
+    createSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->InsertContentControl(SwContentControlType::DATE);
+
+    // When checking if alt-down should open a popup:
+    SwTextContentControl* pTextContentControl = pWrtShell->CursorInsideContentControl();
+    auto& rFormatContentControl
+        = static_cast<SwFormatContentControl&>(pTextContentControl->GetAttr());
+    std::shared_ptr<SwContentControl> pContentControl = rFormatContentControl.GetContentControl();
+    vcl::KeyCode aKeyCode(KEY_DOWN, KEY_MOD2);
+    bool bShouldOpen = pContentControl->ShouldOpenPopup(aKeyCode);
+
+    // Then make sure that the answer is yes for date:
+    // Without the accompanying fix in place, this test would have failed, the date popup was
+    // mouse-only.
+    CPPUNIT_ASSERT(bShouldOpen);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testContentControlCopy)
+{
+    // Given a document with a content control:
+    createSwDoc();
+    SwDoc* pDoc = getSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->InsertContentControl(SwContentControlType::CHECKBOX);
+
+    // When copying that content control:
+    pWrtShell->SelAll();
+    rtl::Reference<SwTransferable> xTransfer = new SwTransferable(*pWrtShell);
+    xTransfer->Copy();
+    // Kill the selection, go to the end of the document:
+    pWrtShell->EndOfSection();
+    TransferableDataHelper aHelper(xTransfer);
+    SwTransferable::Paste(*pWrtShell, aHelper);
+
+    // Then make sure that the copy is also a checkbox:
+    SwContentControlManager& rManager = pDoc->GetContentControlManager();
+    CPPUNIT_ASSERT_EQUAL(static_cast<size_t>(2), rManager.GetCount());
+    const SwFormatContentControl& rFormat1 = rManager.Get(0)->GetContentControl();
+    CPPUNIT_ASSERT_EQUAL(SwContentControlType::CHECKBOX, rFormat1.GetContentControl()->GetType());
+    const SwFormatContentControl& rFormat2 = rManager.Get(1)->GetContentControl();
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: 1 (CHECKBOX)
+    // - Actual  : 0 (RICH_TEXT)
+    // i.e. properties were not copied from the source to the destination content control.
+    CPPUNIT_ASSERT_EQUAL(SwContentControlType::CHECKBOX, rFormat2.GetContentControl()->GetType());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testTdf157287)
+{
+    createSwDoc("tdf157287.odt");
+    uno::Reference<text::XTextFieldsSupplier> xTextFieldsSupplier(mxComponent, uno::UNO_QUERY);
+    auto xFieldsAccess(xTextFieldsSupplier->getTextFields());
+    uno::Reference<container::XEnumeration> xFields(xFieldsAccess->createEnumeration());
+    uno::Reference<text::XTextField> xField(xFields->nextElement(), uno::UNO_QUERY);
+
+    CPPUNIT_ASSERT_EQUAL(u"30"_ustr, xField->getPresentation(false));
+
+    uno::Reference<text::XTextTablesSupplier> xTextTablesSupplier(mxComponent, uno::UNO_QUERY);
+    uno::Reference<container::XIndexAccess> xIndexAccess(xTextTablesSupplier->getTextTables(),
+                                                         uno::UNO_QUERY);
+    uno::Reference<text::XTextTable> xTextTable(xIndexAccess->getByIndex(0), uno::UNO_QUERY);
+
+    uno::Reference<text::XTextRange> xCellA1(xTextTable->getCellByName(u"B1"_ustr), uno::UNO_QUERY);
+    xCellA1->setString(u"100"_ustr);
+
+    dispatchCommand(mxComponent, u".uno:UpdateFields"_ustr, {});
+
+    // Without the fix in place, this test would have failed with
+    // - Expected: 120
+    // - Actual  :
+    CPPUNIT_ASSERT_EQUAL(u"120"_ustr, xField->getPresentation(false));
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testFlySplitFootnote)
+{
+    // Given a document with a split fly (to host a table):
+    createSwDoc();
+    SwDoc* pDoc = getSwDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    SwFlyFrameAttrMgr aMgr(true, pWrtShell, Frmmgr_Type::TEXT, nullptr);
+    RndStdIds eAnchor = RndStdIds::FLY_AT_PARA;
+    pWrtShell->StartAllAction();
+    aMgr.InsertFlyFrame(eAnchor, aMgr.GetPos(), aMgr.GetSize());
+    pWrtShell->EndAllAction();
+    pWrtShell->StartAllAction();
+    sw::FrameFormats<sw::SpzFrameFormat*>& rFlys = *pDoc->GetSpzFrameFormats();
+    sw::SpzFrameFormat* pFly = rFlys[0];
+    SwAttrSet aSet(pFly->GetAttrSet());
+    aSet.Put(SwFormatFlySplit(true));
+    pDoc->SetAttr(aSet, *pFly);
+    pWrtShell->EndAllAction();
+    pWrtShell->UnSelectFrame();
+    pWrtShell->LeaveSelFrameMode();
+    pWrtShell->GetView().AttrChangedNotify(nullptr);
+    pWrtShell->MoveSection(GoCurrSection, fnSectionEnd);
+
+    // When inserting a footnote:
+    pWrtShell->InsertFootnote(OUString());
+
+    // Then make sure the footnote gets inserted to the doc model.
+    // Without the accompanying fix in place, this test would have failed, insert code refused to
+    // have footnotes in all fly frames.
+    CPPUNIT_ASSERT(!pDoc->GetFootnoteIdxs().empty());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testSplitFlyAnchorSplit)
+{
+    // Given a document with a 2 pages long floating table:
+    createSwDoc("floattable-anchor-split.docx");
+
+    // When splitting the "AB" anchor text into "A" (remains as anchor text) and "B" (new text node
+    // after it):
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->SttEndDoc(/*bStt=*/false);
+    pWrtShell->Left(SwCursorSkipMode::Chars, /*bSelect=*/false, 1, /*bBasicCall=*/false);
+    // Without the accompanying fix in place, this test would have failed with a layout loop.
+    pWrtShell->SplitNode();
+
+    // Then make sure the resulting layout is what we want:
+    SwDoc* pDoc = getSwDoc();
+    SwRootFrame* pLayout = pDoc->getIDocumentLayoutAccess().GetCurrentLayout();
+    auto pPage1 = pLayout->Lower()->DynCastPageFrame();
+    CPPUNIT_ASSERT(pPage1);
+    // Page 1 has the master fly:
+    CPPUNIT_ASSERT(pPage1->GetSortedObjs());
+    auto pPage2 = pPage1->GetNext()->DynCastPageFrame();
+    CPPUNIT_ASSERT(pPage2);
+    // Page 2 has the follow fly:
+    CPPUNIT_ASSERT(pPage2->GetSortedObjs());
+    // Anchor text is now just "A":
+    auto pText1 = pPage2->FindFirstBodyContent()->DynCastTextFrame();
+    CPPUNIT_ASSERT_EQUAL(u"A"_ustr, pText1->GetText());
+    // New text frame is just "B":
+    auto pText2 = pText1->GetNext()->DynCastTextFrame();
+    CPPUNIT_ASSERT_EQUAL(u"B"_ustr, pText2->GetText());
+
+    adjustLayoutLines();
+
+    // Also test that the new follow anchor text frame still has a fly portion, otherwise the anchor
+    // text and the floating table would overlap:
+    xmlDocUniquePtr pXmlDoc = parseLayoutDump();
+    OUString aPortionType = getXPath(
+        pXmlDoc, "//page[2]/body/txt[1]/SwParaPortion/SwLineLayout[1]/child::*[1]", "type");
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: PortionType::Fly
+    // - Actual  : PortionType::Para
+    // i.e. the fly portion was missing, text overlapped.
+    CPPUNIT_ASSERT_EQUAL(u"PortionType::Fly"_ustr, aPortionType);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testPlainContentControlCopy)
+{
+    // Given a document with a plain text content control, all text selected and copied to the
+    // clipboard:
+    createSwDoc("plain-content-control-copy.docx");
+    SwDocShell* pDocShell = getSwDocShell();
+    SwWrtShell* pWrtShell = pDocShell->GetWrtShell();
+    pWrtShell->SelAll();
+    {
+        rtl::Reference<SwTransferable> xTransfer = new SwTransferable(*pWrtShell);
+        xTransfer->Copy();
+    }
+
+    // When closing that document, then make sure we don't crash on shutdown:
+    uno::Reference<frame::XModel> xModel(mxComponent, uno::UNO_QUERY);
+    uno::Reference<util::XCloseable> xFrame(xModel->getCurrentController()->getFrame(),
+                                            uno::UNO_QUERY);
+    // Without the accompanying fix in place, this resulted in an assertion failure, a char style
+    // still had clients by the time it was deleted.
+    xFrame->close(false);
+    mxComponent.clear();
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testCopyCommentsWithReplies)
+{
+    createSwDoc("comment-reply-copy.odt");
+
+    SwXTextDocument* pTextDoc = dynamic_cast<SwXTextDocument*>(mxComponent.get());
+    SwDocShell* pShell = pTextDoc->GetDocShell();
+    SwWrtShell* pWrtShell = pShell->GetWrtShell();
+    SwDoc aClipboard;
+    pWrtShell->SelAll();
+    pWrtShell->Copy(aClipboard);
+    pWrtShell->SttEndDoc(/*bStart=*/false); // Send the cursor to the end of the document.
+    pWrtShell->Paste(aClipboard);
+
+    // Now we have selected all text (which is one line) and pasted it to the end.
+    // A comment and its reply should also be copied to the end of the document.
+    // We will check if our reply is referencing its copied parent instead of the source parent.
+
+    SwPostItMgr* postItManager = pWrtShell->GetPostItMgr();
+
+    std::vector<const SwPostItField*> comments;
+
+    Scheduler::ProcessEventsToIdle();
+
+    for (const auto& pItem : *postItManager) // There should be 4.
+    {
+        comments.push_back(pItem->mpPostIt->GetPostItField());
+    }
+
+    //                   parents (original-copied), replies (original-copied)
+    CPPUNIT_ASSERT_EQUAL(comments[0]->GetName().toString(),
+                         comments[1]->GetParentName().toString());
+    CPPUNIT_ASSERT_EQUAL(comments[2]->GetName().toString(),
+                         comments[3]->GetParentName().toString());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testCopyCommentsWithRepliesDocx)
+{
+    // Given a DOCX document with a comment thread (parent + 5 replies linked
+    // via commentsExtended.xml paraId/paraIdParent):
+    createSwDoc("comment-reply-copy.docx");
+
+    SwDocShell* pShell = getSwDocShell();
+    SwWrtShell* pWrtShell = pShell->GetWrtShell();
+    SwDoc* pDoc = pWrtShell->GetDoc();
+    SwDoc aClipboard;
+    pWrtShell->SelAll();
+    pWrtShell->Copy(aClipboard);
+    pWrtShell->SttEndDoc(/*bStart=*/false);
+    pWrtShell->Paste(aClipboard);
+
+    const SwFieldType* pPostitFieldType = nullptr;
+    for (const auto& pFieldType : *pDoc->getIDocumentFieldsAccess().GetFieldTypes())
+    {
+        if (pFieldType->Which() == SwFieldIds::Postit)
+        {
+            pPostitFieldType = pFieldType.get();
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pPostitFieldType);
+    std::vector<SwFormatField*> aFormatFields;
+    pPostitFieldType->GatherFields(aFormatFields);
+    // 6 original + 6 copied.
+    CPPUNIT_ASSERT_EQUAL(size_t(12), aFormatFields.size());
+
+    std::vector<const SwPostItField*> aOriginal, aCopied;
+    for (auto* pFF : aFormatFields)
+    {
+        auto* pField = static_cast<const SwPostItField*>(pFF->GetField());
+        if (pField->GetParaId() != 0)
+            aOriginal.push_back(pField);
+        else
+            aCopied.push_back(pField);
+    }
+    CPPUNIT_ASSERT_EQUAL(size_t(6), aOriginal.size());
+    CPPUNIT_ASSERT_EQUAL(size_t(6), aCopied.size());
+
+    // Without the fix, copied fields retained stale OOXML ParaIds. When
+    // UpdatePostItsParentInfo ran (sidebar rebuild) or on OOXML re-export,
+    // the stale IDs caused replies to be matched to the wrong parent,
+    // breaking comment threads.
+
+    // Verify copied annotations have ParaId/ParentId reset.
+    for (const auto* pField : aCopied)
+    {
+        CPPUNIT_ASSERT_EQUAL(sal_uInt32(0), pField->GetParaId());
+        CPPUNIT_ASSERT_EQUAL(sal_uInt32(0), pField->GetParentId());
+    }
+
+    // Verify copied thread is linked correctly via PostItId.
+    const SwPostItField* pCopiedParent = nullptr;
+    for (const auto* pField : aCopied)
+    {
+        if (pField->GetParentPostItId() == 0)
+        {
+            pCopiedParent = pField;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pCopiedParent);
+    for (const auto* pField : aCopied)
+    {
+        if (pField == pCopiedParent)
+            continue;
+        CPPUNIT_ASSERT_EQUAL(pCopiedParent->GetPostItId(),
+                             pField->GetParentPostItId());
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testNodeSplitStyleListLevel)
+{
+    // Given a document with a 3rd paragraph where the list level as direct formatting differs from
+    // the list level from style:
+    createSwDoc("node-split-style-list-level.odt");
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->Down(/*bSelect=*/false, /*nCount=*/2);
+    pWrtShell->EndPara();
+
+    // When pressing enter at the end of the paragraph:
+    pWrtShell->SplitNode();
+
+    SwTextNode* pNext = pWrtShell->GetCursor()->GetPointNode().GetTextNode();
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: 4
+    // - Actual  : 3
+    // i.e. the list level for the new paragraph changed on a simple node split.
+    CPPUNIT_ASSERT_EQUAL(4, pNext->GetAttrListLevel());
+    pWrtShell->Up(/*bSelect=*/false, /*nCount=*/1);
+    SwTextNode* pPrevious = pWrtShell->GetCursor()->GetPointNode().GetTextNode();
+    // Same happened for the old paragraph.
+    CPPUNIT_ASSERT_EQUAL(4, pPrevious->GetAttrListLevel());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testDOCXCommentImport)
+{
+    // Given a DOCX file with a comment in it:
+    // When loading that file:
+    createSwDoc("comment.docx");
+
+    // Then make sure that the postit field has a name that matches the name of an annotation mark:
+    SwDoc* pDoc = getSwDoc();
+    const SwFieldTypes* pFieldTypes = pDoc->getIDocumentFieldsAccess().GetFieldTypes();
+    const SwFieldType* pPostitFieldType = nullptr;
+    for (const auto& pFieldType : *pFieldTypes)
+    {
+        if (pFieldType->Which() == SwFieldIds::Postit)
+        {
+            pPostitFieldType = pFieldType.get();
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pPostitFieldType);
+    std::vector<SwFormatField*> aFormatPostits;
+    pPostitFieldType->GatherFields(aFormatPostits);
+    CPPUNIT_ASSERT_EQUAL(static_cast<size_t>(1), aFormatPostits.size());
+    const SwFormatField* pFormatPostit = aFormatPostits[0];
+    auto pPostit = static_cast<const SwPostItField*>(pFormatPostit->GetField());
+    IDocumentMarkAccess* pMarkAccess = pDoc->getIDocumentMarkAccess();
+    auto it = pMarkAccess->findAnnotationMark(pPostit->GetName());
+    // Without the accompanying fix in place, this test would have failed, there were no annotation
+    // marks with the name of pPostit.
+    CPPUNIT_ASSERT(it != pMarkAccess->getAnnotationMarksEnd());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testPageCrossrefUpdate)
+{
+    // Given a document with a "book" document variable set to 0, conditional content on pages 1-2,
+    // bookmark on page 3, reference to that bookmark on page 4:
+    createSwDoc("page-crossref-update.odt");
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->SttEndDoc(/*bStt=*/true);
+    // Go to the doc variable field.
+    pWrtShell->GoNextBookmark();
+
+    // When performing the equivalent of what SwFieldEditDlg would do to set "book" to "1":
+    SwFieldMgr aMgr(pWrtShell);
+    aMgr.UpdateCurField(0, u"book"_ustr, u"1"_ustr);
+    SwDoc* pDoc = getSwDoc();
+    pWrtShell->SetEnteringStdMode(true);
+    pDoc->getIDocumentStatistics().GetUpdatedDocStat(/*bCompleteAsync=*/true, /*bFields=*/false);
+    pWrtShell->SetEnteringStdMode(false);
+    Scheduler::ProcessEventsToIdle();
+
+    // Then make sure the reference to the bookmark on (now) page 2 expands to the correct value:
+    xmlDocUniquePtr pXmlDoc = parseLayoutDump();
+    OUString aExpand = getXPath(
+        pXmlDoc, "/root/page[3]/body/section/txt/SwParaPortion/SwLineLayout/SwFieldPortion",
+        "expand");
+    // Without the accompanying fix in place, this test would have failed with:
+    // - Expected: 2
+    // - Actual  : 3
+    // i.e. the reference to that bookmark was not updated for the new page number.
+    CPPUNIT_ASSERT_EQUAL(u"2"_ustr, aExpand);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteCharProps)
+{
+    // Given an empty Writer document with the merged-paste flag on:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    pDoc->SetInMergedPaste(true);
+    comphelper::ScopeGuard g([pDoc] { pDoc->SetInMergedPaste(false); });
+
+    // When importing an HTML file with a bold, red, superscript run into it:
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the pasted run's autoformat keeps bold and superscript but drops the red colour:
+    SwTextNode* pTextNode = nullptr;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (pCandidate && pCandidate->GetText().startsWith(u"bold"))
+        {
+            pTextNode = pCandidate;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pTextNode);
+    CPPUNIT_ASSERT(pTextNode->HasHints());
+    const SwpHints& rHints = pTextNode->GetSwpHints();
+    const SwFormatAutoFormat* pAutoFmt = nullptr;
+    for (size_t i = 0; i < rHints.Count(); ++i)
+    {
+        const SwTextAttr* pHint = rHints.Get(i);
+        if (pHint->Which() == RES_TXTATR_AUTOFMT)
+        {
+            pAutoFmt = &pHint->GetAutoFormat();
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pAutoFmt);
+    const SfxItemSet& rSet = *pAutoFmt->GetStyleHandle();
+    // Bold is kept, color is not:
+    const SvxWeightItem* pWeight = rSet.GetItemIfSet(RES_CHRATR_WEIGHT);
+    CPPUNIT_ASSERT(pWeight);
+    CPPUNIT_ASSERT_EQUAL(WEIGHT_BOLD, pWeight->GetWeight());
+    // Without the accompanying fix in place, this test would have failed, color was kept.
+    CPPUNIT_ASSERT(!rSet.GetItemIfSet(RES_CHRATR_COLOR));
+    // Superscript is also kept:
+    const SvxEscapementItem* pEscapement = rSet.GetItemIfSet(RES_CHRATR_ESCAPEMENT);
+    CPPUNIT_ASSERT(pEscapement);
+    CPPUNIT_ASSERT(pEscapement->GetEsc() > 0);
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteParaProps)
+{
+    // Given an empty Writer document with the merged-paste flag on:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    pDoc->SetInMergedPaste(true);
+    comphelper::ScopeGuard g([pDoc] { pDoc->SetInMergedPaste(false); });
+
+    // When importing an HTML file with a right-aligned paragraph into it:
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste-para.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the pasted paragraph drops the alignment:
+    SwTextNode* pTextNode = nullptr;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (pCandidate && pCandidate->GetText() == u"item")
+        {
+            pTextNode = pCandidate;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pTextNode);
+    const SfxItemSet& rSet = pTextNode->GetSwAttrSet();
+    // Without the accompanying fix in place, this failed, alignment was set by the HTML import.
+    CPPUNIT_ASSERT(!rSet.GetItemIfSet(RES_PARATR_ADJUST));
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteListIndent)
+{
+    // Given an empty Writer document with the merged-paste flag on:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    pDoc->SetInMergedPaste(true);
+    comphelper::ScopeGuard g([pDoc] { pDoc->SetInMergedPaste(false); });
+
+    // When importing an HTML file with a nested unordered list into it:
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste-list.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the inner bullet's indent-at is larger than the outer one:
+    SwTextNode* pInnerNode = nullptr;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (pCandidate && pCandidate->GetText() == u"inner")
+        {
+            pInnerNode = pCandidate;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pInnerNode);
+    const SwNumRule* pRule = pInnerNode->GetNumRule();
+    CPPUNIT_ASSERT(pRule);
+    const SwNumFormat& rOuter = pRule->Get(0);
+    const SwNumFormat& rInner = pRule->Get(1);
+    // Without the accompanying fix in place, this failed with both indents
+    // at 0: a default-constructed SwNumFormat is LABEL_WIDTH_AND_POSITION
+    // with zero indent-at, so neither bullet moved from the left margin.
+    CPPUNIT_ASSERT_GREATER(rOuter.GetIndentAt(), rInner.GetIndentAt());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteDestColor)
+{
+    // Given a Writer document with a paragraph that has a non-default font color
+    // and the cursor in the middle of its text:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aColorSet(pWrtShell->GetAttrPool());
+    Color nOrange(0xffcc00);
+    aColorSet.Put(SvxColorItem(nOrange, RES_CHRATR_COLOR));
+    pWrtShell->SetAttrSet(aColorSet);
+    pWrtShell->Insert(u"AAAZZZ"_ustr);
+    pWrtShell->Left(SwCursorSkipMode::Chars, /*bSelect=*/false, 3, /*bBasicCall=*/false);
+
+    // When merged-pasting an HTML snippet at that cursor position:
+    pDoc->SetInMergedPaste(true);
+    comphelper::ScopeGuard g([pDoc] { pDoc->SetInMergedPaste(false); });
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the destination's own characters before the paste position keep their font color:
+    SwTextNode* pTextNode = nullptr;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (pCandidate && pCandidate->GetText().startsWith(u"AAA"))
+        {
+            pTextNode = pCandidate;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pTextNode);
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aQuery(pDoc->GetAttrPool());
+    pTextNode->GetParaAttr(aQuery, 0, 3);
+    const SvxColorItem* pColor = aQuery.GetItemIfSet(RES_CHRATR_COLOR);
+    // Without the accompanying fix in place, this test would have failed, the
+    // destination's own font color before the paste position was black.
+    CPPUNIT_ASSERT(pColor);
+    CPPUNIT_ASSERT_EQUAL(nOrange, pColor->GetValue());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteJoinedKeepsDestColor)
+{
+    // Given a Writer document with a paragraph that has a non-default font color
+    // and the cursor in the middle of its text:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aColorSet(pWrtShell->GetAttrPool());
+    Color nOrange(0xffcc00);
+    aColorSet.Put(SvxColorItem(nOrange, RES_CHRATR_COLOR));
+    pWrtShell->SetAttrSet(aColorSet);
+    pWrtShell->Insert(u"AAAZZZ"_ustr);
+    pWrtShell->Left(SwCursorSkipMode::Chars, /*bSelect=*/false, 3, /*bBasicCall=*/false);
+
+    // When merged-pasting an HTML snippet where part of the run has no explicit color:
+    pDoc->SetInMergedPaste(true);
+    comphelper::ScopeGuard g([pDoc] { pDoc->SetInMergedPaste(false); });
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the uncolored portion of the pasted content, joined into the
+    // destination paragraph, inherits that paragraph's font color:
+    SwTextNode* pTextNode = nullptr;
+    sal_Int32 nPlain = -1;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (!pCandidate)
+            continue;
+        sal_Int32 nIdx = pCandidate->GetText().indexOf(u" plain");
+        if (nIdx >= 0)
+        {
+            pTextNode = pCandidate;
+            nPlain = nIdx;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pTextNode);
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aQuery(pDoc->GetAttrPool());
+    pTextNode->GetParaAttr(aQuery, nPlain, nPlain + 6);
+    const SvxColorItem* pColor = aQuery.GetItemIfSet(RES_CHRATR_COLOR);
+    // Without the accompanying fix in place, this test would have failed, the
+    // uncolored pasted text had the default black color.
+    CPPUNIT_ASSERT(pColor);
+    CPPUNIT_ASSERT_EQUAL(nOrange, pColor->GetValue());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteMultiParaDestColor)
+{
+    // Given a Writer document with a paragraph that has a non-default font color
+    // and the cursor in the middle of its text:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aColorSet(pWrtShell->GetAttrPool());
+    Color nOrange(0xffcc00);
+    aColorSet.Put(SvxColorItem(nOrange, RES_CHRATR_COLOR));
+    pWrtShell->SetAttrSet(aColorSet);
+    pWrtShell->Insert(u"AAAZZZ"_ustr);
+    pWrtShell->Left(SwCursorSkipMode::Chars, /*bSelect=*/false, 3, /*bBasicCall=*/false);
+
+    // When merged-pasting an HTML snippet that is multiple whole paragraphs:
+    pDoc->SetInMergedPaste(true);
+    // Snapshot the destination's paragraph attrs the way SwBaseShell::ExecClpbrd() does,
+    // since .uno:InsertDoc bypasses SID_PASTE:
+    SwTextNode* pDestNode = pWrtShell->GetCursor()->GetPoint()->GetNode().GetTextNode();
+    CPPUNIT_ASSERT(pDestNode);
+    auto pDestAttrs = std::make_shared<SfxItemSet>(pDestNode->GetSwAttrSet());
+    SfxWhichIter aWhichIter(*pDestAttrs);
+    for (sal_uInt16 nWhich = aWhichIter.FirstWhich(); nWhich; nWhich = aWhichIter.NextWhich())
+    {
+        if (SwTextNode::IsParaItemKeptInMergedPaste(nWhich))
+            pDestAttrs->ClearItem(nWhich);
+    }
+    pDoc->SetMergedPasteParaAttrs(std::move(pDestAttrs));
+    comphelper::ScopeGuard g([pDoc] {
+        pDoc->SetInMergedPaste(false);
+        pDoc->SetMergedPasteParaAttrs(nullptr);
+    });
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste-multi.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the brand-new middle paragraph between the two halves of the
+    // destination also inherits the paragraph's font color:
+    SwTextNode* pMiddleNode = nullptr;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (pCandidate && pCandidate->GetText() == u"second")
+        {
+            pMiddleNode = pCandidate;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pMiddleNode);
+    const SvxColorItem* pColor = pMiddleNode->GetSwAttrSet().GetItemIfSet(RES_CHRATR_COLOR);
+    // Without the accompanying fix in place, this test would have failed, the
+    // brand-new middle paragraph had the default black color.
+    CPPUNIT_ASSERT(pColor);
+    CPPUNIT_ASSERT_EQUAL(nOrange, pColor->GetValue());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteHintDestColor)
+{
+    // Given a Writer document whose destination font color comes from a hint,
+    // not from a paragraph-scope item, with the cursor inside that hint:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->Insert(u"beforeAAAZZZafter"_ustr);
+    pWrtShell->SttEndDoc(/*bStt=*/true);
+    pWrtShell->Right(SwCursorSkipMode::Chars, /*bSelect=*/false, 6, /*bBasicCall=*/false);
+    pWrtShell->Right(SwCursorSkipMode::Chars, /*bSelect=*/true, 6, /*bBasicCall=*/false);
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aColorSet(pWrtShell->GetAttrPool());
+    Color nOrange(0xffcc00);
+    aColorSet.Put(SvxColorItem(nOrange, RES_CHRATR_COLOR));
+    pWrtShell->SetAttrSet(aColorSet);
+    pWrtShell->SttEndDoc(/*bStt=*/true);
+    pWrtShell->Right(SwCursorSkipMode::Chars, /*bSelect=*/false, 9, /*bBasicCall=*/false);
+
+    // When merged-pasting an HTML snippet whose run has an explicit color of its own:
+    pDoc->SetInMergedPaste(true);
+    // Snapshot the destination's attrs the way SwBaseShell::ExecClpbrd() does,
+    // since .uno:InsertDoc bypasses SID_PASTE:
+    SwTextNode* pDestNode = pWrtShell->GetCursor()->GetPoint()->GetNode().GetTextNode();
+    CPPUNIT_ASSERT(pDestNode);
+    auto pParaAttrs = std::make_shared<SfxItemSet>(pDestNode->GetSwAttrSet());
+    SfxWhichIter aParaIter(*pParaAttrs);
+    for (sal_uInt16 nWhich = aParaIter.FirstWhich(); nWhich; nWhich = aParaIter.NextWhich())
+    {
+        if (SwTextNode::IsParaItemKeptInMergedPaste(nWhich))
+            pParaAttrs->ClearItem(nWhich);
+    }
+    auto pCharAttrs = std::make_shared<SfxItemSet>(pDestNode->GetSwAttrSet());
+    pCharAttrs->ClearItem();
+    const sal_Int32 nContent = pWrtShell->GetCursor()->GetPoint()->GetContentIndex();
+    pDestNode->GetParaAttr(*pCharAttrs, nContent, nContent, /*bOnlyTextAttr=*/true);
+    SfxWhichIter aCharIter(*pCharAttrs);
+    for (sal_uInt16 nWhich = aCharIter.FirstWhich(); nWhich; nWhich = aCharIter.NextWhich())
+    {
+        if (SwTextNode::IsCharItemKeptInMergedPaste(nWhich))
+            pCharAttrs->ClearItem(nWhich);
+    }
+    pDoc->SetMergedPasteParaAttrs(std::move(pParaAttrs));
+    pDoc->SetMergedPasteCharAttrs(std::move(pCharAttrs));
+    pDoc->SetMergedPasteOrigDestNode(pDestNode);
+    comphelper::ScopeGuard g([pDoc] {
+        pDoc->SetInMergedPaste(false);
+        pDoc->SetMergedPasteParaAttrs(nullptr);
+        pDoc->SetMergedPasteCharAttrs(nullptr);
+        pDoc->SetMergedPasteOrigDestNode(nullptr);
+    });
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste-hint.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the pasted run inherits the destination's hint-scope font color
+    // at the paste point, not its source color and not the default black:
+    SwTextNode* pTextNode = nullptr;
+    sal_Int32 nPasted = -1;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (!pCandidate)
+            continue;
+        sal_Int32 nIdx = pCandidate->GetText().indexOf(u"Bold and green:");
+        if (nIdx >= 0)
+        {
+            pTextNode = pCandidate;
+            nPasted = nIdx;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pTextNode);
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aQuery(pDoc->GetAttrPool());
+    pTextNode->GetParaAttr(aQuery, nPasted, nPasted + 6);
+    const SvxColorItem* pColor = aQuery.GetItemIfSet(RES_CHRATR_COLOR);
+    // Without the accompanying fix in place, this test would have failed, the
+    // pasted run ended up with the default black color.
+    CPPUNIT_ASSERT(pColor);
+    CPPUNIT_ASSERT_EQUAL(nOrange, pColor->GetValue());
+    // Also check that the destination's "before" portion, which was outside
+    // the hint, stays uncolored at paragraph scope.
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aBefore(pDoc->GetAttrPool());
+    pTextNode->GetParaAttr(aBefore, 0, 6);
+    CPPUNIT_ASSERT(!aBefore.GetItemIfSet(RES_CHRATR_COLOR));
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testMergedPasteMultiParaHintDestColor)
+{
+    // Given a Writer document whose destination font color comes from a hint:
+    createSwDoc();
+    SwDoc* pDoc = getSwDocShell()->GetDoc();
+    SwWrtShell* pWrtShell = getSwDocShell()->GetWrtShell();
+    pWrtShell->Insert(u"beforeAAAZZZafter"_ustr);
+    pWrtShell->SttEndDoc(/*bStt=*/true);
+    pWrtShell->Right(SwCursorSkipMode::Chars, /*bSelect=*/false, 6, /*bBasicCall=*/false);
+    pWrtShell->Right(SwCursorSkipMode::Chars, /*bSelect=*/true, 6, /*bBasicCall=*/false);
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aColorSet(pWrtShell->GetAttrPool());
+    Color nOrange(0xffcc00);
+    aColorSet.Put(SvxColorItem(nOrange, RES_CHRATR_COLOR));
+    pWrtShell->SetAttrSet(aColorSet);
+    pWrtShell->SttEndDoc(/*bStt=*/true);
+    pWrtShell->Right(SwCursorSkipMode::Chars, /*bSelect=*/false, 9, /*bBasicCall=*/false);
+
+    // When merged-pasting an HTML snippet that is multiple whole paragraphs:
+    pDoc->SetInMergedPaste(true);
+    SwTextNode* pDestNode = pWrtShell->GetCursor()->GetPoint()->GetNode().GetTextNode();
+    CPPUNIT_ASSERT(pDestNode);
+    auto pParaAttrs = std::make_shared<SfxItemSet>(pDestNode->GetSwAttrSet());
+    SfxWhichIter aParaIter(*pParaAttrs);
+    for (sal_uInt16 nWhich = aParaIter.FirstWhich(); nWhich; nWhich = aParaIter.NextWhich())
+    {
+        if (SwTextNode::IsParaItemKeptInMergedPaste(nWhich))
+            pParaAttrs->ClearItem(nWhich);
+    }
+    auto pCharAttrs = std::make_shared<SfxItemSet>(pDestNode->GetSwAttrSet());
+    pCharAttrs->ClearItem();
+    const sal_Int32 nContent = pWrtShell->GetCursor()->GetPoint()->GetContentIndex();
+    pDestNode->GetParaAttr(*pCharAttrs, nContent, nContent, /*bOnlyTextAttr=*/true);
+    SfxWhichIter aCharIter(*pCharAttrs);
+    for (sal_uInt16 nWhich = aCharIter.FirstWhich(); nWhich; nWhich = aCharIter.NextWhich())
+    {
+        if (SwTextNode::IsCharItemKeptInMergedPaste(nWhich))
+            pCharAttrs->ClearItem(nWhich);
+    }
+    pDoc->SetMergedPasteParaAttrs(std::move(pParaAttrs));
+    pDoc->SetMergedPasteCharAttrs(std::move(pCharAttrs));
+    pDoc->SetMergedPasteOrigDestNode(pDestNode);
+    comphelper::ScopeGuard g([pDoc] {
+        pDoc->SetInMergedPaste(false);
+        pDoc->SetMergedPasteParaAttrs(nullptr);
+        pDoc->SetMergedPasteCharAttrs(nullptr);
+        pDoc->SetMergedPasteOrigDestNode(nullptr);
+    });
+    cpo::uno::Sequence<beans::PropertyValue> aArgs
+        = { comphelper::makePropertyValue(u"Name"_ustr, createFileURL(u"merged-paste-multi-hint.html")) };
+    dispatchCommand(mxComponent, u".uno:InsertDoc"_ustr, aArgs);
+
+    // Then the middle paragraph also inherits the hint's font color:
+    SwTextNode* pMiddleNode = nullptr;
+    SwNodes& rNodes = pDoc->GetNodes();
+    for (SwNodeOffset i(0); i < rNodes.Count(); ++i)
+    {
+        SwTextNode* pCandidate = rNodes[i]->GetTextNode();
+        if (pCandidate && pCandidate->GetText() == u"second")
+        {
+            pMiddleNode = pCandidate;
+            break;
+        }
+    }
+    CPPUNIT_ASSERT(pMiddleNode);
+    SfxItemSetFixed<RES_CHRATR_COLOR, RES_CHRATR_COLOR> aQuery(pDoc->GetAttrPool());
+    pMiddleNode->GetParaAttr(aQuery, 0, pMiddleNode->GetText().getLength());
+    const SvxColorItem* pColor = aQuery.GetItemIfSet(RES_CHRATR_COLOR);
+    // Without the accompanying fix in place, this test would have failed, the middle paragraph was
+    // black.
+    CPPUNIT_ASSERT(pColor);
+    CPPUNIT_ASSERT_EQUAL(nOrange, pColor->GetValue());
+}
+
+CPPUNIT_TEST_FIXTURE(SwCoreTxtnodeTest, testInsertTableSplittingParagraphWithAnchoredObjects) {
+    // Given a document with a single paragraph that anchors a shape, a text frame and two images
+    // anchored as characters...
+    createSwDoc();
+    cpo::uno::Reference<css::lang::XMultiServiceFactory> factory(
+        mxComponent, cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::text::XText> text
+        = cpo::uno::Reference<css::text::XTextDocument>(mxComponent, cpo::uno::UNO_QUERY_THROW)
+            ->getText();
+    cpo::uno::Reference<css::drawing::XDrawPageSupplier>(mxComponent, cpo::uno::UNO_QUERY_THROW)
+        ->getDrawPage()
+        ->add(
+            cpo::uno::Reference<css::drawing::XShape>(
+                factory->createInstance(u"com.sun.star.drawing.RectangleShape"_ustr),
+                cpo::uno::UNO_QUERY_THROW));
+    text->insertTextContent(
+        text->getEnd(),
+        cpo::uno::Reference<css::text::XTextContent>(
+            factory->createInstance(u"com.sun.star.text.TextFrame"_ustr),
+            cpo::uno::UNO_QUERY_THROW),
+        false);
+    cpo::uno::Reference<css::text::XTextContent> image1(
+        factory->createInstance(u"com.sun.star.text.TextGraphicObject"_ustr),
+        cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::beans::XPropertySet>(image1, cpo::uno::UNO_QUERY_THROW)
+        ->setPropertyValue(
+            u"AnchorType"_ustr, cpo::uno::Any(css::text::TextContentAnchorType_AS_CHARACTER));
+    text->insertTextContent(text->getStart(), image1, false);
+    cpo::uno::Reference<css::text::XTextContent> image2(
+        factory->createInstance(u"com.sun.star.text.TextGraphicObject"_ustr),
+        cpo::uno::UNO_QUERY_THROW);
+    cpo::uno::Reference<css::beans::XPropertySet>(image2, cpo::uno::UNO_QUERY_THROW)
+        ->setPropertyValue(
+            u"AnchorType"_ustr, cpo::uno::Any(css::text::TextContentAnchorType_AS_CHARACTER));
+    text->insertTextContent(text->getStart(), image2, false);
+
+    // ...when inserting a table at the end of the document, which splits that paragraph...
+    cpo::uno::Reference<css::text::XTextTable> table(
+        factory->createInstance(u"com.sun.star.text.TextTable"_ustr), cpo::uno::UNO_QUERY_THROW);
+    table->initialize(2, 2);
+    text->insertTextContent(text->getEnd(), table, false);
+
+    // ...then the table is inserted.  Without the accompanying fix in place, this test would have
+    // hit
+    //   Assertion `!m_pDrawObjs || m_pDrawObjs->is_sorted()' failed.
+    // in SwFrame::RemoveDrawObj:
+    cpo::uno::Reference<css::container::XIndexAccess> tables(
+        cpo::uno::Reference<css::text::XTextTablesSupplier>(mxComponent, cpo::uno::UNO_QUERY_THROW)
+            ->getTextTables(),
+        cpo::uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(1), tables->getCount());
+}
+
+CPPUNIT_PLUGIN_IMPLEMENT();
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

@@ -1,0 +1,4048 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following license notice:
+ *
+ *   Licensed to the Apache Software Foundation (ASF) under one or more
+ *   contributor license agreements. See the NOTICE file distributed
+ *   with this work for additional information regarding copyright
+ *   ownership. The ASF licenses this file to you under the Apache
+ *   License, Version 2.0 (the "License"); you may not use this file
+ *   except in compliance with the License. You may obtain a copy of
+ *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+ */
+
+#include <sal/config.h>
+
+#include <rtl/ustrbuf.hxx>
+#include <sal/log.hxx>
+#include <osl/diagnose.h>
+#include <rtl/character.hxx>
+#include <i18nutil/unicode.hxx>
+#include <swmodule.hxx>
+#include <doc.hxx>
+#include <IDocumentUndoRedo.hxx>
+#include <DocumentContentOperationsManager.hxx>
+#include <IDocumentRedlineAccess.hxx>
+#include <IDocumentState.hxx>
+#include <docary.hxx>
+#include <pam.hxx>
+#include <ndtxt.hxx>
+#include <redline.hxx>
+#include <UndoRedline.hxx>
+#include <section.hxx>
+#include <tox.hxx>
+#include <docsh.hxx>
+#include <fmtcntnt.hxx>
+#include <fmthdft.hxx>
+#include <modcfg.hxx>
+#include <frameformats.hxx>
+#include <swtable.hxx>
+#include <charfmt.hxx>
+#include <fchrfmt.hxx>
+#include <txatbase.hxx>
+#include <istyleaccess.hxx>
+#include <fmtcol.hxx>
+#include <svx/xdef.hxx>
+#include <svl/itemiter.hxx>
+#include <svl/whiter.hxx>
+#include <hintids.hxx>
+#include <o3tl/sorted_vector.hxx>
+#include <officecfg/Office/Writer.hxx>
+#include <swcrsr.hxx>
+#include <editeng/prntitem.hxx>
+#include <pagedesc.hxx>
+#include <ftnidx.hxx>
+#include <txtftn.hxx>
+#include <fmtftn.hxx>
+
+#include <com/sun/star/document/XDocumentPropertiesSupplier.hpp>
+#include <com/sun/star/document/XDocumentProperties.hpp>
+#include <com/sun/star/frame/XModel.hpp>
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <type_traits>
+#include <unordered_map>
+#include <vector>
+
+using namespace ::com::sun::star;
+using namespace ::cpo;
+
+using std::vector;
+
+namespace {
+
+class SwCompareLine final
+{
+    const SwNode* m_pNode;
+public:
+    explicit SwCompareLine( const SwNode& rNd ) : m_pNode( &rNd ) {}
+    SwCompareLine() : m_pNode( nullptr ) {}
+
+    sal_uLong GetHashValue() const;
+    bool Compare( const SwCompareLine& rLine ) const;
+
+    static sal_uLong GetTextNodeHashValue( const SwTextNode& rNd, sal_uLong nVal );
+    static bool CompareNode( const SwNode& rDstNd, const SwNode& rSrcNd );
+    static bool CompareTextNd( const SwTextNode& rDstNd,
+                              const SwTextNode& rSrcNd );
+
+    // bEvenIfDissimilar: show the changes inside the paragraph even when the two paragraphs have
+    // little text in common.
+    bool ChangesInLine( const SwCompareLine& rLine,
+                            std::unique_ptr<SwPaM>& rpInsRing, std::unique_ptr<SwPaM>& rpDelRing,
+                            bool bEvenIfDissimilar = false ) const;
+
+    const SwNode& GetNode() const { return *m_pNode; }
+
+    const SwNode& GetEndNode() const;
+
+    // for debugging
+    OUString GetText() const;
+};
+
+
+class CompareData
+{
+protected:
+    SwDoc& m_rDoc;
+private:
+    std::unique_ptr<size_t[]> m_pIndex;
+    std::unique_ptr<bool[]> m_pChangedFlag;
+
+    std::unique_ptr<SwPaM> m_pInsertRing, m_pDelRing;
+
+    static SwNodeOffset PrevIdx( const SwNode* pNd );
+    static SwNodeOffset NextIdx( const SwNode* pNd );
+
+    vector<SwCompareLine> m_aLines;
+    bool m_bRecordDiff;
+
+    // Comparisons of the cells of tables that have the same shape, each holding the changes found
+    // inside one cell.
+    vector<std::unique_ptr<CompareData>> m_aCellComparisons;
+
+    /// Pairs of a paragraph of this document and a paragraph of the other document that have
+    /// the same text.
+    vector<std::pair<const SwTextNode*, const SwTextNode*>> m_aSameTextNodes;
+
+    /// A range of this document whose formatting differs from the other document, with the
+    /// formatting of the other document.
+    struct FormatChange
+    {
+        std::unique_ptr<SwPaM> m_pPaM;
+        RedlineType m_eType;
+        std::unique_ptr<SwRedlineExtraData_FormatColl> m_pExtraData;
+    };
+    vector<FormatChange> m_aFormatChanges;
+
+    void AddSameText( const SwNode& rDstNd, const SwNode& rSrcNd );
+    void CompareParaFormatting( const SwTextNode& rDstNd, const SwTextNode& rSrcNd );
+    void CompareCharFormatting( const SwTextNode& rDstNd, const SwTextNode& rSrcNd );
+    void AddCharFormatChange( const SwTextNode& rDstNd, const SwTextNode& rSrcNd,
+                              sal_Int32 nStart, sal_Int32 nEnd );
+    void AppendFormatRedlines( std::size_t nAuthor, const DateTime& rTimeStamp );
+
+    // A row that is in only one of two compared tables. pSrcLine is null for a row of the new
+    // table, which is tracked as inserted. Otherwise pSrcLine is a row of the old table, which is
+    // tracked as deleted, and its copy goes in front of the row pDstLine of the new table, or
+    // behind it when bBehind is true.
+    struct TrackedRow
+    {
+        const SwTableLine* pDstLine;
+        const SwTableLine* pSrcLine;
+        bool bBehind;
+    };
+    vector<TrackedRow> m_aTrackedRows;
+
+    // Truncate beginning and end and add all others to the LinesArray
+    void CheckRanges( CompareData& );
+
+    // Whether nLine is the last line and nothing follows it before the end of the section.
+    bool IsLastLineOfSection( sal_uLong nLine );
+
+    virtual const SwNode& GetEndOfContent() = 0;
+
+public:
+    CompareData(SwDoc& rD, bool bRecordDiff)
+        : m_rDoc( rD )
+        , m_bRecordDiff(bRecordDiff)
+    {
+    }
+    virtual ~CompareData();
+
+    // Are there differences?
+    bool HasDiffs( const CompareData& rData ) const;
+
+    // Triggers the comparison and creation of two documents
+    void CompareLines( CompareData& rData );
+    // Display the differences - calls the methods ShowInsert and ShowDelete.
+    // These are passed the start and end line number.
+    // Displaying the actually content is to be handled by the subclass!
+    sal_uLong ShowDiffs( const CompareData& rData );
+    /// Finds the formatting differences in the paragraphs whose text is the same in both
+    /// documents. Returns the number of differences.
+    sal_uLong CompareFormatting();
+
+    void ShowInsert( sal_uLong nStt, sal_uLong nEnd );
+    void ShowDelete( const CompareData& rData, sal_uLong nStt,
+                                sal_uLong nEnd, sal_uLong nInsPos );
+    void CheckForChangesInLine( const CompareData& rData,
+                                    sal_uLong nStt, sal_uLong nEnd,
+                                    sal_uLong nThisStt, sal_uLong nThisEnd );
+    // Compares two tables cell by cell. Returns false if the tables neither have the same shape nor
+    // have simple rows, if a cell of either table ends with a nested table, or if no cell and no
+    // row has a difference.
+    bool CompareTableCells( const CompareData& rData, const SwTableNode& rDstTable,
+                            const SwTableNode& rSrcTable );
+    // Pairs the rows of two tables with simple rows, compares the cells of paired rows, and
+    // records the other rows as inserted or deleted. Returns false if no row and no cell has a
+    // difference.
+    bool CompareTableRows( const CompareData& rData, const SwTableNode& rDstTable,
+                           const SwTableNode& rSrcTable );
+    // Compares the content of one cell with the content of the old cell, its formatting included.
+    // Returns whether the cells differ.
+    bool CompareCells( const CompareData& rData, const SwNode& rDstCell, const SwNode& rSrcCell );
+
+    // Set non-ambiguous index for a line. Same lines have the same index, even in the other CompareData!
+    void SetIndex( size_t nLine, size_t nIndex );
+    size_t GetIndex( size_t nLine ) const
+        { return nLine < m_aLines.size() ? m_pIndex[ nLine ] : 0; }
+
+    // Set/get of a line has changed
+    void SetChanged( size_t nLine, bool bFlag = true );
+    bool GetChanged( size_t nLine ) const
+        {
+            return (m_pChangedFlag && nLine < m_aLines.size())
+                && m_pChangedFlag[ nLine ];
+        }
+
+    size_t GetLineCount() const     { return m_aLines.size(); }
+    const SwCompareLine& GetLine( size_t nLine ) const
+            { return m_aLines[ nLine ]; }
+    void InsertLine( SwCompareLine aLine )
+        { m_aLines.push_back( aLine ); }
+
+    // Tracks the differences. Adds to pInsertedNotes, when it is given, the footnotes and the
+    // endnotes whose anchors are tracked as inserted.
+    void SetRedlinesToDoc( bool bUseDocInfo,
+                           o3tl::sorted_vector<const SwTextFootnote*>* pInsertedNotes );
+
+private:
+    // Moves the end of a range off the end node of the section.
+    void KeepRangeInSection( SwPaM& rPaM );
+    // Adjusts the ranges of this comparison and of its cells before they become redlines.
+    void PrepareRedlineRanges();
+    // Adds the ranges and the tracked rows of this comparison and of its cells.
+    void CollectRedlineRanges( vector<SwPaM*>& rDeletes, vector<SwPaM*>& rInserts,
+                               vector<const TrackedRow*>& rRows );
+    // Copies an old row into the new table and tracks it as a deleted row. Returns the copy.
+    const SwTableLine* TrackDeletedRow( const SwTableLine& rAnchor, bool bBehind,
+                                        const SwTableLine& rSrcLine,
+                                        const SwRedlineData& rDeleteData );
+    // Tracks a row of the new table as an inserted row, and adds the ranges of its cells.
+    void TrackInsertedRow( const SwTableLine& rLine, vector<std::unique_ptr<SwPaM>>& rRanges );
+};
+
+class CompareMainText : public CompareData
+{
+public:
+    CompareMainText(SwDoc &rD, bool bRecordDiff)
+        : CompareData(rD, bRecordDiff)
+    {
+    }
+
+    virtual const SwNode& GetEndOfContent() override
+    {
+        return m_rDoc.GetNodes().GetEndOfContent();
+    }
+};
+
+// Compares the content between a start node and its end node, for example a text frame or a
+// table cell.
+class CompareSectionText : public CompareData
+{
+    const SwNode& m_rStartNode;
+public:
+    CompareSectionText(SwDoc &rD, const SwNode& rStartNode)
+        : CompareData(rD, true/*bRecordDiff*/)
+        , m_rStartNode(rStartNode)
+    {
+    }
+
+    virtual const SwNode& GetEndOfContent() override
+    {
+        return *m_rStartNode.EndOfSectionNode();
+    }
+};
+
+class Hash
+{
+    struct HashData
+    {
+        sal_uLong nNext, nHash;
+        SwCompareLine aLine;
+
+        HashData()
+            : nNext( 0 ), nHash( 0 ) {}
+    };
+
+    std::unique_ptr<sal_uLong[]> m_pHashArr;
+    std::unique_ptr<HashData[]> m_pDataArr;
+    sal_uLong m_nCount, m_nPrime;
+
+public:
+    explicit Hash( sal_uLong nSize );
+
+    void CalcHashValue( CompareData& rData );
+
+    sal_uLong GetCount() const { return m_nCount; }
+};
+
+class Compare
+{
+public:
+    class MovedData
+    {
+        std::unique_ptr<sal_uLong[]> m_pIndex;
+        std::unique_ptr<sal_uLong[]> m_pLineNum;
+        sal_uLong m_nCount;
+
+    public:
+        MovedData( CompareData& rData, const char* pDiscard );
+
+        sal_uLong GetIndex( sal_uLong n ) const { return m_pIndex[ n ]; }
+        sal_uLong GetLineNum( sal_uLong n ) const { return m_pLineNum[ n ]; }
+        sal_uLong GetCount() const { return m_nCount; }
+    };
+
+private:
+    /// Look for the moved lines
+    class CompareSequence
+    {
+        CompareData &m_rData1, &m_rData2;
+        const MovedData &m_rMoved1, &m_rMoved2;
+        std::unique_ptr<tools::Long[]> m_pMemory;
+        tools::Long *m_pFDiag, *m_pBDiag;
+
+        void Compare( sal_uLong nStt1, sal_uLong nEnd1, sal_uLong nStt2, sal_uLong nEnd2 );
+        sal_uLong CheckDiag( sal_uLong nStt1, sal_uLong nEnd1,
+                        sal_uLong nStt2, sal_uLong nEnd2, sal_uLong* pCost );
+    public:
+        CompareSequence( CompareData& rD1, CompareData& rD2,
+                        const MovedData& rMD1, const MovedData& rMD2 );
+    };
+
+    static void CountDifference( const CompareData& rData, sal_uLong* pCounts );
+    static void SetDiscard( const CompareData& rData,
+                            char* pDiscard, const sal_uLong* pCounts );
+    static void CheckDiscard( size_t nLen, char* pDiscard );
+    static void ShiftBoundaries( CompareData& rData1, CompareData& rData2 );
+
+public:
+    Compare( sal_uLong nDiff, CompareData& rData1, CompareData& rData2 );
+};
+
+class ArrayComparator
+{
+public:
+    virtual bool Compare( int nIdx1, int nIdx2 ) const = 0;
+    virtual int GetLen1() const = 0;
+    virtual int GetLen2() const = 0;
+    virtual ~ArrayComparator() {}
+};
+
+// The texts of the paragraphs of a table that are not empty, in sorted order, for each table.
+typedef std::unordered_map<const SwTableNode*, vector<OUString>> TableTexts;
+
+/// Consider two lines equal if similar enough (e.g. look like different
+/// versions of the same paragraph)
+class LineArrayComparator : public ArrayComparator
+{
+private:
+    int m_nLen1, m_nLen2;
+    const CompareData &m_rData1, &m_rData2;
+    int m_nFirst1, m_nFirst2;
+    // The texts of the tables that were compared so far. Each table is read once, although it is
+    // compared with many others.
+    mutable TableTexts m_aTableTexts;
+
+public:
+    LineArrayComparator( const CompareData &rD1, const CompareData &rD2,
+                            int nStt1, int nEnd1, int nStt2, int nEnd2 );
+
+    virtual bool Compare( int nIdx1, int nIdx2 ) const override;
+    virtual int GetLen1() const override { return m_nLen1; }
+    virtual int GetLen2() const override { return m_nLen2; }
+};
+
+// The text of each cell of a row, and the words of each cell in sorted order.
+struct RowTexts
+{
+    vector<OUString> aCells;
+    vector<vector<OUString>> aCellWords;
+};
+
+/// Consider two rows of tables with simple rows equal if all their cells have the same text, or
+/// similar if at least half of the cells with words in either row have the same text or at least
+/// half of their words are shared
+class RowArrayComparator : public ArrayComparator
+{
+private:
+    const vector<RowTexts> &m_rRows1, &m_rRows2;
+    int m_nFirst1, m_nLen1, m_nFirst2, m_nLen2;
+    bool m_bSimilar;
+
+public:
+    RowArrayComparator( const vector<RowTexts>& rRows1, int nStt1, int nEnd1,
+                        const vector<RowTexts>& rRows2, int nStt2, int nEnd2,
+                        bool bSimilar )
+        : m_rRows1( rRows1 ), m_rRows2( rRows2 )
+        , m_nFirst1( nStt1 ), m_nLen1( nEnd1 - nStt1 )
+        , m_nFirst2( nStt2 ), m_nLen2( nEnd2 - nStt2 )
+        , m_bSimilar( bSimilar )
+    {
+    }
+
+    bool Compare( int nIdx1, int nIdx2 ) const override;
+    int GetLen1() const override { return m_nLen1; }
+    int GetLen2() const override { return m_nLen2; }
+};
+
+// Compares footnotes or endnotes by their text. Each entry is the start node of the text of a note.
+class NoteArrayComparator : public ArrayComparator
+{
+private:
+    const vector<const SwNodeIndex*>& m_rNotes1;
+    const vector<const SwNodeIndex*>& m_rNotes2;
+
+public:
+    NoteArrayComparator( const vector<const SwNodeIndex*>& rNotes1,
+                         const vector<const SwNodeIndex*>& rNotes2 )
+        : m_rNotes1( rNotes1 ), m_rNotes2( rNotes2 )
+    {
+    }
+
+    bool Compare( int nIdx1, int nIdx2 ) const override;
+    int GetLen1() const override { return m_rNotes1.size(); }
+    int GetLen2() const override { return m_rNotes2.size(); }
+};
+
+class WordArrayComparator : public ArrayComparator
+{
+private:
+    const SwTextNode *m_pTextNode1, *m_pTextNode2;
+    std::unique_ptr<int[]> m_pPos1, m_pPos2;
+    int m_nCount1, m_nCount2;       // number of words
+
+    static void CalcPositions( int *pPos, const SwTextNode *pTextNd, int &nCnt );
+
+public:
+    WordArrayComparator( const SwTextNode *pNode1, const SwTextNode *pNode2 );
+
+    virtual bool Compare( int nIdx1, int nIdx2 ) const override;
+    virtual int GetLen1() const override { return m_nCount1; }
+    virtual int GetLen2() const override { return m_nCount2; }
+    int GetCharSequence( const int *pWordLcs1, const int *pWordLcs2,
+                        int *pSubseq1, int *pSubseq2, int nLcsLen );
+};
+
+class CharArrayComparator : public ArrayComparator
+{
+private:
+    const SwTextNode *m_pTextNode1, *m_pTextNode2;
+
+public:
+    CharArrayComparator( const SwTextNode *pNode1, const SwTextNode *pNode2 )
+        : m_pTextNode1( pNode1 ), m_pTextNode2( pNode2 )
+    {
+    }
+
+    virtual bool Compare( int nIdx1, int nIdx2 ) const override;
+    virtual int GetLen1() const override { return m_pTextNode1->GetText().getLength(); }
+    virtual int GetLen2() const override { return m_pTextNode2->GetText().getLength(); }
+};
+
+/// Options set in Tools->Options->Writer->Comparison
+struct CmpOptionsContainer
+{
+    SwCompareMode eCmpMode;
+    int nIgnoreLen;
+    bool bUseRsid;
+    bool bCompareFormatting;
+};
+
+}
+
+static CmpOptionsContainer CmpOptions;
+
+namespace {
+
+class CommonSubseq
+{
+private:
+    std::unique_ptr<int[]> m_pData;
+
+protected:
+    ArrayComparator &m_rComparator;
+
+    CommonSubseq( ArrayComparator &rComparator, int nMaxSize )
+        : m_rComparator( rComparator )
+    {
+        m_pData.reset( new int[ nMaxSize ] );
+    }
+
+    int FindLCS( int *pLcs1, int *pLcs2, int nStt1,
+                 int nEnd1, int nStt2, int nEnd2 );
+
+public:
+    static int IgnoreIsolatedPieces( int *pLcs1, int *pLcs2, int nLen1, int nLen2,
+                                int nLcsLen, int nPieceLen );
+};
+
+/// Use Hirschberg's algorithm to find LCS in linear space
+class LgstCommonSubseq: public CommonSubseq
+{
+private:
+    static const int CUTOFF = 1<<20; // Stop recursion at this value
+
+    std::unique_ptr<int[]> m_pL1, m_pL2;
+    std::unique_ptr<int[]> m_pBuff1, m_pBuff2;
+
+    void FindL( int *pL, int nStt1, int nEnd1, int nStt2, int nEnd2  );
+    int HirschbergLCS( int *pLcs1, int *pLcs2, int nStt1, int nEnd1,
+                                                int nStt2, int nEnd2 );
+
+public:
+    explicit LgstCommonSubseq( ArrayComparator &rComparator );
+
+    int Find( int *pSubseq1, int *pSubseq2 );
+};
+
+/// Find a common subsequence in linear time
+class FastCommonSubseq: private CommonSubseq
+{
+private:
+    static const int CUTOFF = 2056;
+
+    int FindFastCS( int *pSeq1, int *pSeq2, int nStt1, int nEnd1,
+                                             int nStt2, int nEnd2  );
+
+public:
+    explicit FastCommonSubseq( ArrayComparator &rComparator )
+        : CommonSubseq( rComparator, CUTOFF )
+    {
+    }
+
+    int Find( int *pSubseq1, int *pSubseq2 )
+    {
+        return FindFastCS( pSubseq1, pSubseq2, 0, m_rComparator.GetLen1(),
+                                                0, m_rComparator.GetLen2() );
+    }
+};
+
+}
+
+CompareData::~CompareData()
+{
+    if( m_pDelRing )
+    {
+        while( m_pDelRing->GetNext() != m_pDelRing.get() )
+            delete m_pDelRing->GetNext();
+        m_pDelRing.reset();
+    }
+    if( m_pInsertRing )
+    {
+        while( m_pInsertRing->GetNext() != m_pInsertRing.get() )
+            delete m_pInsertRing->GetNext();
+        m_pInsertRing.reset();
+    }
+}
+
+void CompareData::SetIndex( size_t nLine, size_t nIndex )
+{
+    if( !m_pIndex )
+    {
+        m_pIndex.reset( new size_t[ m_aLines.size() ] );
+        memset( m_pIndex.get(), 0, m_aLines.size() * sizeof( size_t ) );
+    }
+    if( nLine < m_aLines.size() )
+        m_pIndex[ nLine ] = nIndex;
+}
+
+void CompareData::SetChanged( size_t nLine, bool bFlag )
+{
+    if( !m_pChangedFlag )
+    {
+        m_pChangedFlag.reset( new bool[ m_aLines.size() +1 ] );
+        memset( m_pChangedFlag.get(), 0, (m_aLines.size() +1) * sizeof( bool ) );
+    }
+    if( nLine < m_aLines.size() )
+        m_pChangedFlag[ nLine ] = bFlag;
+}
+
+void CompareData::CompareLines( CompareData& rData )
+{
+    CheckRanges( rData );
+
+    sal_uLong nDifferent;
+    {
+        Hash aH( GetLineCount() + rData.GetLineCount() + 1 );
+        aH.CalcHashValue( *this );
+        aH.CalcHashValue( rData );
+        nDifferent = aH.GetCount();
+    }
+    {
+        Compare aComp( nDifferent, *this, rData );
+    }
+}
+
+sal_uLong CompareData::ShowDiffs( const CompareData& rData )
+{
+    sal_uLong nLen1 = rData.GetLineCount(), nLen2 = GetLineCount();
+    sal_uLong nStt1 = 0, nStt2 = 0;
+    sal_uLong nCnt = 0;
+
+    while( nStt1 < nLen1 || nStt2 < nLen2 )
+    {
+        if( rData.GetChanged( nStt1 ) || GetChanged( nStt2 ) )
+        {
+            // Find a region of different lines between two pairs of identical
+            // lines.
+            sal_uLong nSav1 = nStt1, nSav2 = nStt2;
+            while( nStt1 < nLen1 && rData.GetChanged( nStt1 )) ++nStt1;
+            while( nStt2 < nLen2 && GetChanged( nStt2 )) ++nStt2;
+
+            if (m_bRecordDiff)
+            {
+                // Check if there are changed lines (only slightly different) and
+                // compare them in detail.
+                CheckForChangesInLine( rData, nSav1, nStt1, nSav2, nStt2 );
+            }
+
+            ++nCnt;
+        }
+        // Here both lines are unchanged, so they have the same text.
+        if( CmpOptions.bCompareFormatting && nStt1 < nLen1 && nStt2 < nLen2 )
+            AddSameText( GetLine( nStt2 ).GetNode(), rData.GetLine( nStt1 ).GetNode() );
+        ++nStt1;
+        ++nStt2;
+    }
+    return nCnt;
+}
+
+bool CompareData::HasDiffs( const CompareData& rData ) const
+{
+    bool bRet = false;
+    sal_uLong nLen1 = rData.GetLineCount(), nLen2 = GetLineCount();
+    sal_uLong nStt1 = 0, nStt2 = 0;
+
+    while( nStt1 < nLen1 || nStt2 < nLen2 )
+    {
+        if( rData.GetChanged( nStt1 ) || GetChanged( nStt2 ) )
+        {
+            bRet = true;
+            break;
+        }
+        ++nStt1;
+        ++nStt2;
+    }
+    return bRet;
+}
+
+Hash::Hash( sal_uLong nSize )
+    : m_nCount(1)
+{
+
+    static const sal_uLong primes[] =
+    {
+      509,
+      1021,
+      2039,
+      4093,
+      8191,
+      16381,
+      32749,
+      65521,
+      131071,
+      262139,
+      524287,
+      1048573,
+      2097143,
+      4194301,
+      8388593,
+      16777213,
+      33554393,
+      67108859,         /* Preposterously large . . . */
+      134217689,
+      268435399,
+      536870909,
+      1073741789,
+      2147483647,
+      0
+    };
+    int i;
+
+    m_pDataArr.reset( new HashData[ nSize ] );
+    m_pDataArr[0].nNext = 0;
+    m_pDataArr[0].nHash = 0;
+    m_nPrime = primes[0];
+
+    for( i = 0; primes[i] < nSize / 3;  i++)
+        if( !primes[i] )
+        {
+            m_pHashArr = nullptr;
+            return;
+        }
+    m_nPrime = primes[ i ];
+    m_pHashArr.reset( new sal_uLong[ m_nPrime ] );
+    memset( m_pHashArr.get(), 0, m_nPrime * sizeof( sal_uLong ) );
+}
+
+void Hash::CalcHashValue( CompareData& rData )
+{
+    if( !m_pHashArr )
+        return;
+
+    for( size_t n = 0; n < rData.GetLineCount(); ++n )
+    {
+        const SwCompareLine aLine = rData.GetLine( n );
+        sal_uLong nH = aLine.GetHashValue();
+
+        sal_uLong* pFound = &m_pHashArr[ nH % m_nPrime ];
+        size_t i;
+        for( i = *pFound;  ;  i = m_pDataArr[i].nNext )
+            if( !i )
+            {
+                i = m_nCount++;
+                m_pDataArr[i].nNext = *pFound;
+                m_pDataArr[i].nHash = nH;
+                m_pDataArr[i].aLine = aLine;
+                *pFound = i;
+                break;
+            }
+            else if( m_pDataArr[i].nHash == nH &&
+                    m_pDataArr[i].aLine.Compare( aLine ))
+                break;
+
+        rData.SetIndex( n, i );
+    }
+}
+
+Compare::Compare( sal_uLong nDiff, CompareData& rData1, CompareData& rData2 )
+{
+    std::unique_ptr<MovedData> pMD1, pMD2;
+    // Look for the differing lines
+    {
+        std::unique_ptr<char[]> pDiscard1( new char[ rData1.GetLineCount() ] );
+        std::unique_ptr<char[]> pDiscard2( new char[ rData2.GetLineCount() ] );
+
+        std::unique_ptr<sal_uLong[]> pCount1(new sal_uLong[ nDiff ]);
+        std::unique_ptr<sal_uLong[]> pCount2(new sal_uLong[ nDiff ]);
+        memset( pCount1.get(), 0, nDiff * sizeof( sal_uLong ));
+        memset( pCount2.get(), 0, nDiff * sizeof( sal_uLong ));
+
+        // find indices in CompareData which have been assigned multiple times
+        CountDifference( rData1, pCount1.get() );
+        CountDifference( rData2, pCount2.get() );
+
+        // All which occur only once now have either been inserted or deleted.
+        // All which are also contained in the other one have been moved.
+        SetDiscard( rData1, pDiscard1.get(), pCount2.get() );
+        SetDiscard( rData2, pDiscard2.get(), pCount1.get() );
+
+        CheckDiscard( rData1.GetLineCount(), pDiscard1.get() );
+        CheckDiscard( rData2.GetLineCount(), pDiscard2.get() );
+
+        pMD1.reset(new MovedData( rData1, pDiscard1.get() ));
+        pMD2.reset(new MovedData( rData2, pDiscard2.get() ));
+    }
+
+    {
+        CompareSequence aTmp( rData1, rData2, *pMD1, *pMD2 );
+    }
+
+    ShiftBoundaries( rData1, rData2 );
+}
+
+void Compare::CountDifference( const CompareData& rData, sal_uLong* pCounts )
+{
+    sal_uLong nLen = rData.GetLineCount();
+    for( sal_uLong n = 0; n < nLen; ++n )
+    {
+        sal_uLong nIdx = rData.GetIndex( n );
+        ++pCounts[ nIdx ];
+    }
+}
+
+void Compare::SetDiscard( const CompareData& rData,
+                            char* pDiscard, const sal_uLong* pCounts )
+{
+    const sal_uLong nLen = rData.GetLineCount();
+
+    // calculate Max with respect to the line count
+    sal_uLong nMax = 5;
+
+    for( sal_uLong n = nLen / 64; ( n = n >> 2 ) > 0; )
+        nMax <<= 1;
+
+    for( sal_uLong n = 0; n < nLen; ++n )
+    {
+        sal_uLong nIdx = rData.GetIndex( n );
+        if( nIdx )
+        {
+            nIdx = pCounts[ nIdx ];
+            pDiscard[ n ] = !nIdx ? 1 : nIdx > nMax ? 2 : 0;
+        }
+        else
+            pDiscard[ n ] = 0;
+    }
+}
+
+void Compare::CheckDiscard( size_t nLen, char* pDiscard )
+{
+    for( size_t n = 0; n < nLen; ++n )
+    {
+        if( 2 == pDiscard[ n ] )
+            pDiscard[n] = 0;
+        else if( pDiscard[ n ] )
+        {
+            size_t j;
+            size_t length;
+            size_t provisional = 0;
+
+            /* Find end of this run of discardable lines.
+                Count how many are provisionally discardable.  */
+            for (j = n; j < nLen; j++)
+            {
+                if( !pDiscard[j] )
+                    break;
+                if( 2 == pDiscard[j] )
+                    ++provisional;
+            }
+
+            /* Cancel provisional discards at end, and shrink the run.  */
+            while( j > n && 2 == pDiscard[j - 1] )
+            {
+                pDiscard[ --j ] = 0;
+                --provisional;
+            }
+
+            /* Now we have the length of a run of discardable lines
+               whose first and last are not provisional.  */
+            length = j - n;
+
+            /* If 1/4 of the lines in the run are provisional,
+               cancel discarding of all provisional lines in the run.  */
+            if (provisional * 4 > length)
+            {
+                while (j > n)
+                    if (pDiscard[--j] == 2)
+                        pDiscard[j] = 0;
+            }
+            else
+            {
+                size_t consec;
+                size_t minimum = 1;
+                size_t tem = length / 4;
+
+                /* MINIMUM is approximate square root of LENGTH/4.
+                   A subrun of two or more provisionals can stand
+                   when LENGTH is at least 16.
+                   A subrun of 4 or more can stand when LENGTH >= 64.  */
+                while ((tem = tem >> 2) > 0)
+                    minimum *= 2;
+                minimum++;
+
+                /* Cancel any subrun of MINIMUM or more provisionals
+                   within the larger run.  */
+                for (j = 0, consec = 0; j < length; j++)
+                    if (pDiscard[n + j] != 2)
+                        consec = 0;
+                    else if (minimum == ++consec)
+                        /* Back up to start of subrun, to cancel it all.  */
+                        j -= consec;
+                    else if (minimum < consec)
+                        pDiscard[n + j] = 0;
+
+                /* Scan from beginning of run
+                   until we find 3 or more nonprovisionals in a row
+                   or until the first nonprovisional at least 8 lines in.
+                   Until that point, cancel any provisionals.  */
+                for (j = 0, consec = 0; j < length; j++)
+                {
+                    if (j >= 8 && pDiscard[n + j] == 1)
+                        break;
+                    if (pDiscard[n + j] == 2)
+                    {
+                        consec = 0;
+                        pDiscard[n + j] = 0;
+                    }
+                    else if (pDiscard[n + j] == 0)
+                        consec = 0;
+                    else
+                        consec++;
+                    if (consec == 3)
+                        break;
+                }
+
+                /* I advances to the last line of the run.  */
+                n += length - 1;
+
+                /* Same thing, from end.  */
+                for (j = 0, consec = 0; j < length; j++)
+                {
+                    if (j >= 8 && pDiscard[n - j] == 1)
+                        break;
+                    if (pDiscard[n - j] == 2)
+                    {
+                        consec = 0;
+                        pDiscard[n - j] = 0;
+                    }
+                    else if (pDiscard[n - j] == 0)
+                        consec = 0;
+                    else
+                        consec++;
+                    if (consec == 3)
+                        break;
+                }
+            }
+        }
+    }
+}
+
+Compare::MovedData::MovedData( CompareData& rData, const char* pDiscard )
+    : m_nCount( 0 )
+{
+    sal_uLong nLen = rData.GetLineCount();
+    sal_uLong n;
+
+    for( n = 0; n < nLen; ++n )
+        if( pDiscard[ n ] )
+            rData.SetChanged( n );
+        else
+            ++m_nCount;
+
+    if( m_nCount )
+    {
+        m_pIndex.reset( new sal_uLong[ m_nCount ] );
+        m_pLineNum.reset( new sal_uLong[ m_nCount ] );
+
+        for( n = 0, m_nCount = 0; n < nLen; ++n )
+            if( !pDiscard[ n ] )
+            {
+                m_pIndex[ m_nCount ] = rData.GetIndex( n );
+                m_pLineNum[ m_nCount++ ] = n;
+            }
+    }
+}
+
+/// Find the differing lines
+Compare::CompareSequence::CompareSequence(
+                            CompareData& rD1, CompareData& rD2,
+                            const MovedData& rMD1, const MovedData& rMD2 )
+    : m_rData1( rD1 ), m_rData2( rD2 ), m_rMoved1( rMD1 ), m_rMoved2( rMD2 )
+{
+    sal_uLong nSize = rMD1.GetCount() + rMD2.GetCount() + 3;
+    m_pMemory.reset( new tools::Long[ nSize * 2 ] );
+    m_pFDiag = m_pMemory.get() + ( rMD2.GetCount() + 1 );
+    m_pBDiag = m_pMemory.get() + ( nSize + rMD2.GetCount() + 1 );
+
+    Compare( 0, rMD1.GetCount(), 0, rMD2.GetCount() );
+}
+
+void Compare::CompareSequence::Compare( sal_uLong nStt1, sal_uLong nEnd1,
+                                        sal_uLong nStt2, sal_uLong nEnd2 )
+{
+    /* Slide down the bottom initial diagonal. */
+    while( nStt1 < nEnd1 && nStt2 < nEnd2 &&
+        m_rMoved1.GetIndex( nStt1 ) == m_rMoved2.GetIndex( nStt2 ))
+    {
+        ++nStt1;
+        ++nStt2;
+    }
+
+    /* Slide up the top initial diagonal. */
+    while( nEnd1 > nStt1 && nEnd2 > nStt2 &&
+        m_rMoved1.GetIndex( nEnd1 - 1 ) == m_rMoved2.GetIndex( nEnd2 - 1 ))
+    {
+        --nEnd1;
+        --nEnd2;
+    }
+
+    /* Handle simple cases. */
+    if( nStt1 == nEnd1 )
+        while( nStt2 < nEnd2 )
+            m_rData2.SetChanged( m_rMoved2.GetLineNum( nStt2++ ));
+
+    else if (nStt2 == nEnd2)
+        while (nStt1 < nEnd1)
+            m_rData1.SetChanged( m_rMoved1.GetLineNum( nStt1++ ));
+
+    else
+    {
+        sal_uLong c, d, b;
+
+        /* Find a point of correspondence in the middle of the files.  */
+
+        d = CheckDiag( nStt1, nEnd1, nStt2, nEnd2, &c );
+        b = m_pBDiag[ std::make_signed_t<decltype(d)>(d) ];
+
+        if( 1 != c )
+        {
+            /* Use that point to split this problem into two subproblems.  */
+            Compare( nStt1, b, nStt2, b - d );
+            /* This used to use f instead of b,
+               but that is incorrect!
+               It is not necessarily the case that diagonal d
+               has a snake from b to f.  */
+            Compare( b, nEnd1, b - d, nEnd2 );
+        }
+    }
+}
+
+sal_uLong Compare::CompareSequence::CheckDiag( sal_uLong nStt1, sal_uLong nEnd1,
+                                    sal_uLong nStt2, sal_uLong nEnd2, sal_uLong* pCost )
+{
+    const tools::Long dmin = nStt1 - nEnd2;    /* Minimum valid diagonal. */
+    const tools::Long dmax = nEnd1 - nStt2;    /* Maximum valid diagonal. */
+    const tools::Long fmid = nStt1 - nStt2;    /* Center diagonal of top-down search. */
+    const tools::Long bmid = nEnd1 - nEnd2;    /* Center diagonal of bottom-up search. */
+
+    tools::Long fmin = fmid, fmax = fmid;  /* Limits of top-down search. */
+    tools::Long bmin = bmid, bmax = bmid;  /* Limits of bottom-up search. */
+
+    tools::Long c;         /* Cost. */
+    tools::Long odd = (fmid - bmid) & 1;   /* True if southeast corner is on an odd
+                     diagonal with respect to the northwest. */
+
+    m_pFDiag[fmid] = nStt1;
+    m_pBDiag[bmid] = nEnd1;
+
+    for (c = 1;; ++c)
+    {
+        tools::Long d;         /* Active diagonal. */
+
+        /* Extend the top-down search by an edit step in each diagonal. */
+        if (fmin > dmin)
+            m_pFDiag[--fmin - 1] = -1;
+        else
+            ++fmin;
+        if (fmax < dmax)
+            m_pFDiag[++fmax + 1] = -1;
+        else
+            --fmax;
+        for (d = fmax; d >= fmin; d -= 2)
+        {
+            tools::Long x, y, tlo = m_pFDiag[d - 1], thi = m_pFDiag[d + 1];
+
+            if (tlo >= thi)
+                x = tlo + 1;
+            else
+                x = thi;
+            y = x - d;
+            while( x < tools::Long(nEnd1) && y < tools::Long(nEnd2) &&
+                m_rMoved1.GetIndex( x ) == m_rMoved2.GetIndex( y ))
+            {
+                ++x;
+                ++y;
+            }
+            m_pFDiag[d] = x;
+            if( odd && bmin <= d && d <= bmax && m_pBDiag[d] <= m_pFDiag[d] )
+            {
+                *pCost = 2 * c - 1;
+                return d;
+            }
+        }
+
+        /* Similar extend the bottom-up search. */
+        if (bmin > dmin)
+            m_pBDiag[--bmin - 1] = INT_MAX;
+        else
+            ++bmin;
+        if (bmax < dmax)
+            m_pBDiag[++bmax + 1] = INT_MAX;
+        else
+            --bmax;
+        for (d = bmax; d >= bmin; d -= 2)
+        {
+            tools::Long x, y, tlo = m_pBDiag[d - 1], thi = m_pBDiag[d + 1];
+
+            if (tlo < thi)
+                x = tlo;
+            else
+                x = thi - 1;
+            y = x - d;
+            while( x > tools::Long(nStt1) && y > tools::Long(nStt2) &&
+                m_rMoved1.GetIndex( x - 1 ) == m_rMoved2.GetIndex( y - 1 ))
+            {
+                --x;
+                --y;
+            }
+            m_pBDiag[d] = x;
+            if (!odd && fmin <= d && d <= fmax && m_pBDiag[d] <= m_pFDiag[d])
+            {
+                *pCost = 2 * c;
+                return d;
+            }
+        }
+    }
+}
+
+namespace
+{
+    void lcl_ShiftBoundariesOneway( CompareData* const pData, CompareData const * const pOtherData)
+    {
+        sal_uLong i = 0;
+        sal_uLong j = 0;
+        sal_uLong i_end = pData->GetLineCount();
+        sal_uLong preceding = ULONG_MAX;
+        sal_uLong other_preceding = ULONG_MAX;
+
+        while (true)
+        {
+            sal_uLong start, other_start;
+
+            /* Scan forwards to find beginning of another run of changes.
+               Also keep track of the corresponding point in the other file.  */
+
+            while( i < i_end && !pData->GetChanged( i ) )
+            {
+                while( pOtherData->GetChanged( j++ ))
+                    /* Non-corresponding lines in the other file
+                       will count as the preceding batch of changes.  */
+                    other_preceding = j;
+                i++;
+            }
+
+            if (i == i_end)
+                break;
+
+            start = i;
+            other_start = j;
+
+            while (true)
+            {
+                /* Now find the end of this run of changes.  */
+
+                while( pData->GetChanged( ++i ))
+                    ;
+
+                /* If the first changed line matches the following unchanged one,
+                   and this run does not follow right after a previous run,
+                   and there are no lines deleted from the other file here,
+                   then classify the first changed line as unchanged
+                   and the following line as changed in its place.  */
+
+                /* You might ask, how could this run follow right after another?
+                   Only because the previous run was shifted here.  */
+
+                if( i != i_end &&
+                    pData->GetIndex( start ) == pData->GetIndex( i ) &&
+                    !pOtherData->GetChanged( j ) &&
+                    start != preceding && other_start != other_preceding )
+                {
+                    pData->SetChanged( start++, false );
+                    pData->SetChanged(  i );
+                    /* Since one line-that-matches is now before this run
+                       instead of after, we must advance in the other file
+                       to keep in sync.  */
+                    ++j;
+                }
+                else
+                    break;
+            }
+
+            preceding = i;
+            other_preceding = j;
+        }
+    }
+}
+
+void Compare::ShiftBoundaries( CompareData& rData1, CompareData& rData2 )
+{
+    lcl_ShiftBoundariesOneway(&rData1, &rData2);
+    lcl_ShiftBoundariesOneway(&rData2, &rData1);
+}
+
+sal_uLong SwCompareLine::GetHashValue() const
+{
+    sal_uLong nRet = 0;
+    switch( m_pNode->GetNodeType() )
+    {
+    case SwNodeType::Text:
+        nRet = GetTextNodeHashValue( *m_pNode->GetTextNode(), nRet );
+        break;
+
+    case SwNodeType::Table:
+        {
+            const SwNode* pEndNd = m_pNode->EndOfSectionNode();
+            SwNodeIndex aIdx( *m_pNode );
+            while( &aIdx.GetNode() != pEndNd )
+            {
+                if( aIdx.GetNode().IsTextNode() )
+                    nRet = GetTextNodeHashValue( *aIdx.GetNode().GetTextNode(), nRet );
+                ++aIdx;
+            }
+        }
+        break;
+
+    case SwNodeType::Section:
+        {
+            OUString sStr( GetText() );
+            for( sal_Int32 n = 0; n < sStr.getLength(); ++n )
+                nRet = (nRet << 1) + sStr[ n ];
+        }
+        break;
+
+    case SwNodeType::Grf:
+    case SwNodeType::Ole:
+        // Fixed ID? Should never occur ...
+        break;
+    default: break;
+    }
+    return nRet;
+}
+
+const SwNode& SwCompareLine::GetEndNode() const
+{
+    const SwNode* pNd = m_pNode;
+    switch( m_pNode->GetNodeType() )
+    {
+    case SwNodeType::Table:
+        pNd = m_pNode->EndOfSectionNode();
+        break;
+
+    case SwNodeType::Section:
+        {
+            const SwSectionNode& rSNd = static_cast<const SwSectionNode&>(*m_pNode);
+            const SwSection& rSect = rSNd.GetSection();
+            if( SectionType::Content != rSect.GetType() || rSect.IsProtect() )
+                pNd = m_pNode->EndOfSectionNode();
+        }
+        break;
+    default: break;
+    }
+    return *pNd;
+}
+
+bool SwCompareLine::Compare( const SwCompareLine& rLine ) const
+{
+    return CompareNode( *m_pNode, *rLine.m_pNode );
+}
+
+namespace
+{
+    OUString SimpleTableToText(const SwNode &rNode)
+    {
+        OUStringBuffer sRet;
+        const SwNode* pEndNd = rNode.EndOfSectionNode();
+        SwNodeIndex aIdx( rNode );
+        while (&aIdx.GetNode() != pEndNd)
+        {
+            if (aIdx.GetNode().IsTextNode())
+            {
+                if (sRet.getLength())
+                {
+                    sRet.append( '\n' );
+                }
+                sRet.append( aIdx.GetNode().GetTextNode()->GetExpandText(nullptr) );
+            }
+            ++aIdx;
+        }
+        return sRet.makeStringAndClear();
+    }
+
+    // The start nodes of the cells of a table in document order. The cells of nested tables are
+    // inside these cells, so they are not in the list.
+    std::vector<const SwNode*> GetCellStartNodes(const SwTableNode& rTableNode)
+    {
+        std::vector<const SwNode*> aCells;
+        const SwNode* pEndNode = rTableNode.EndOfSectionNode();
+        SwNodeIndex aIdx(rTableNode, 1);
+        while (&aIdx.GetNode() != pEndNode)
+        {
+            aCells.push_back(&aIdx.GetNode());
+            aIdx.Assign(*aIdx.GetNode().EndOfSectionNode(), 1);
+        }
+        return aCells;
+    }
+
+    // Whether the content of the cell that starts at rCellStart ends with a nested table.
+    bool CellEndsWithTable(const SwNode& rCellStart)
+    {
+        const SwNode& rLast = *rCellStart.GetNodes()[rCellStart.EndOfSectionIndex() - 1];
+        return rLast.IsEndNode() && rLast.StartOfSectionNode()->IsTableNode();
+    }
+
+    // Whether the content of the cell that starts at rCellStart starts with a nested table.
+    bool CellStartsWithTable(const SwNode& rCellStart)
+    {
+        return rCellStart.GetNodes()[rCellStart.GetIndex() + 1]->IsTableNode();
+    }
+
+    // Same number of rows, the same number of cells in each row, and each pair of cells is split
+    // into the same rows and spans the same number of rows, down to the cells with content.
+    bool HasSameLinesShape(const SwTableLines& rLines1, const SwTableLines& rLines2)
+    {
+        if (rLines1.size() != rLines2.size())
+            return false;
+        for (size_t i = 0; i < rLines1.size(); ++i)
+        {
+            const SwTableBoxes& rBoxes1 = rLines1[i]->GetTabBoxes();
+            const SwTableBoxes& rBoxes2 = rLines2[i]->GetTabBoxes();
+            if (rBoxes1.size() != rBoxes2.size())
+                return false;
+            for (size_t j = 0; j < rBoxes1.size(); ++j)
+            {
+                if (rBoxes1[j]->getRowSpan() != rBoxes2[j]->getRowSpan()
+                    || !HasSameLinesShape(rBoxes1[j]->GetTabLines(), rBoxes2[j]->GetTabLines()))
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // The cells with content of two tables of the same shape pair up in document order.
+    bool HasSameTableShape(const SwTableNode& rTableNode1, const SwTableNode& rTableNode2)
+    {
+        return HasSameLinesShape(rTableNode1.GetTable().GetTabLines(),
+                                 rTableNode2.GetTable().GetTabLines());
+    }
+
+    // Every row of both tables has the same number of cells, and no cell is split or spans rows.
+    // The rows of such tables pair up one by one, whatever the number of rows.
+    bool HasSimpleRows(const SwTableNode& rTableNode1, const SwTableNode& rTableNode2)
+    {
+        const SwTableLines& rLines1 = rTableNode1.GetTable().GetTabLines();
+        const SwTableLines& rLines2 = rTableNode2.GetTable().GetTabLines();
+        if (rLines1.empty() || rLines2.empty())
+            return false;
+        const size_t nBoxes = rLines1[0]->GetTabBoxes().size();
+        for (const SwTableLines* pLines : { &rLines1, &rLines2 })
+        {
+            for (const SwTableLine* pLine : *pLines)
+            {
+                const SwTableBoxes& rBoxes = pLine->GetTabBoxes();
+                if (rBoxes.size() != nBoxes
+                    || std::any_of(rBoxes.begin(), rBoxes.end(), [](const SwTableBox* pBox) {
+                           return !pBox->GetSttNd() || pBox->getRowSpan() != 1;
+                       }))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Whether the cells of the two tables can be compared one by one, instead of the tables as a
+    // whole.
+    bool CanCompareTableCells(const SwTableNode& rTableNode1, const SwTableNode& rTableNode2)
+    {
+        return HasSimpleRows(rTableNode1, rTableNode2)
+               || HasSameTableShape(rTableNode1, rTableNode2);
+    }
+
+    // The texts of the paragraphs of a table that are not empty, in sorted order. They are read
+    // from the table the first time, and from rTableTexts after that.
+    const vector<OUString>& GetSortedParagraphTexts(const SwTableNode& rTableNode,
+                                                    TableTexts& rTableTexts)
+    {
+        auto [aEntry, bInserted] = rTableTexts.try_emplace(&rTableNode);
+        vector<OUString>& rTexts = aEntry->second;
+        if (!bInserted)
+            return rTexts;
+        const SwNodes& rNodes = rTableNode.GetNodes();
+        for (SwNodeOffset n = rTableNode.GetIndex() + 1; n < rTableNode.EndOfSectionIndex(); ++n)
+        {
+            const SwTextNode* pTextNode = rNodes[n]->GetTextNode();
+            if (pTextNode && !pTextNode->GetText().isEmpty())
+                rTexts.push_back(pTextNode->GetText());
+        }
+        std::sort(rTexts.begin(), rTexts.end());
+        return rTexts;
+    }
+
+    // Whether two tables look like two versions of one table. Two tables of the same shape always
+    // do. Otherwise their cells can be compared one by one, and the paragraphs that they share make
+    // up at least half of the paragraphs of the smaller one. A table without any text only looks
+    // like another table without any text.
+    bool IsSimilarTable(const SwTableNode& rTableNode1, const SwTableNode& rTableNode2,
+                        TableTexts& rTableTexts)
+    {
+        if (HasSameTableShape(rTableNode1, rTableNode2))
+            return true;
+        if (!CanCompareTableCells(rTableNode1, rTableNode2))
+            return false;
+        const vector<OUString>& rTexts1 = GetSortedParagraphTexts(rTableNode1, rTableTexts);
+        const vector<OUString>& rTexts2 = GetSortedParagraphTexts(rTableNode2, rTableTexts);
+        if (rTexts1.empty() || rTexts2.empty())
+            return rTexts1.empty() && rTexts2.empty();
+        vector<OUString> aCommon;
+        std::set_intersection(rTexts1.begin(), rTexts1.end(), rTexts2.begin(), rTexts2.end(),
+                              std::back_inserter(aCommon));
+        return 2 * aCommon.size() >= std::min(rTexts1.size(), rTexts2.size());
+    }
+
+    // The words of a text, split at white space, in sorted order.
+    vector<OUString> GetSortedWords(std::u16string_view aText)
+    {
+        vector<OUString> aWords;
+        size_t nStart = 0;
+        for (size_t i = 0; i <= aText.size(); ++i)
+        {
+            if (i < aText.size() && !unicode::isWhiteSpace(aText[i]))
+                continue;
+            if (i > nStart)
+                aWords.emplace_back(aText.substr(nStart, i - nStart));
+            nStart = i + 1;
+        }
+        std::sort(aWords.begin(), aWords.end());
+        return aWords;
+    }
+
+    // The number of words that two sorted lists of words have in common, counting a repeated word
+    // as often as it is in both lists.
+    size_t CountCommonWords(const vector<OUString>& rWords1, const vector<OUString>& rWords2)
+    {
+        size_t nCommon = 0;
+        auto aWord1 = rWords1.begin();
+        auto aWord2 = rWords2.begin();
+        while (aWord1 != rWords1.end() && aWord2 != rWords2.end())
+        {
+            if (*aWord1 < *aWord2)
+                ++aWord1;
+            else if (*aWord2 < *aWord1)
+                ++aWord2;
+            else
+            {
+                ++nCommon;
+                ++aWord1;
+                ++aWord2;
+            }
+        }
+        return nCommon;
+    }
+
+    // The text of each cell of a row, with a newline after each paragraph, and its words.
+    RowTexts GetRowTexts(const SwTableLine& rLine)
+    {
+        RowTexts aRow;
+        vector<OUString>& aTexts = aRow.aCells;
+        for (const SwTableBox* pBox : rLine.GetTabBoxes())
+        {
+            const SwNode& rCellStart = *pBox->GetSttNd();
+            const SwNodes& rNodes = rCellStart.GetNodes();
+            OUStringBuffer aText;
+            for (SwNodeOffset n = rCellStart.GetIndex() + 1; n < rCellStart.EndOfSectionIndex();
+                 ++n)
+            {
+                if (const SwTextNode* pTextNode = rNodes[n]->GetTextNode())
+                    aText.append(pTextNode->GetText() + "\n");
+            }
+            aTexts.push_back(aText.makeStringAndClear());
+            aRow.aCellWords.push_back(GetSortedWords(aTexts.back()));
+        }
+        return aRow;
+    }
+
+    // Pairs rows in [nStt1, nEnd1) of rRows1 with rows in [nStt2, nEnd2) of rRows2, keeping their
+    // order. Each pair holds the two row numbers.
+    vector<std::pair<int, int>> MatchRows(const vector<RowTexts>& rRows1, int nStt1, int nEnd1,
+                                          const vector<RowTexts>& rRows2, int nStt2, int nEnd2,
+                                          bool bSimilar)
+    {
+        vector<std::pair<int, int>> aPairs;
+        RowArrayComparator aCmp(rRows1, nStt1, nEnd1, rRows2, nStt2, nEnd2, bSimilar);
+        const int nMinLen = std::min(aCmp.GetLen1(), aCmp.GetLen2());
+        if (nMinLen == 0)
+            return aPairs;
+        std::unique_ptr<int[]> pLcs1(new int[nMinLen]);
+        std::unique_ptr<int[]> pLcs2(new int[nMinLen]);
+        FastCommonSubseq aSubseq(aCmp);
+        const int nLcsLen = aSubseq.Find(pLcs1.get(), pLcs2.get());
+        for (int i = 0; i < nLcsLen; ++i)
+            aPairs.emplace_back(nStt1 + pLcs1[i], nStt2 + pLcs2[i]);
+        return aPairs;
+    }
+
+    // Sets the property of a row that marks it as inserted or deleted with its tracked content.
+    void SetRowTracked(SwDoc& rDoc, const SwTableLine& rLine, bool bInserted)
+    {
+        SwCursor aCursor(SwPosition(*rLine.GetTabBoxes()[0]->GetSttNd()), nullptr);
+        rDoc.SetRowNotTracked(aCursor, SvxPrintItem(RES_PRINT, false), /*bAll=*/false,
+                              /*bIns=*/bInserted);
+    }
+
+    // The whole text of a cell, from the start of its first paragraph to the end of its last one.
+    std::unique_ptr<SwPaM> GetCellTextRange(const SwTableBox& rBox)
+    {
+        const SwNode& rCellStart = *rBox.GetSttNd();
+        const SwNodes& rNodes = rCellStart.GetNodes();
+        const SwNode& rLast = *rNodes[rCellStart.EndOfSectionIndex() - 1];
+        auto pRange = std::make_unique<SwPaM>(*rNodes[rCellStart.GetIndex() + 1], rLast);
+        if (const SwContentNode* pLastContent = rLast.GetContentNode())
+            pRange->GetPoint()->SetContent(pLastContent->Len());
+        return pRange;
+    }
+}
+
+bool SwCompareLine::CompareNode( const SwNode& rDstNd, const SwNode& rSrcNd )
+{
+    if( rSrcNd.GetNodeType() != rDstNd.GetNodeType() )
+        return false;
+
+    bool bRet = false;
+
+    switch( rDstNd.GetNodeType() )
+    {
+    case SwNodeType::Text:
+        bRet = CompareTextNd( *rDstNd.GetTextNode(), *rSrcNd.GetTextNode() );
+        break;
+
+    case SwNodeType::Table:
+        {
+            const SwTableNode& rTSrcNd = static_cast<const SwTableNode&>(rSrcNd);
+            const SwTableNode& rTDstNd = static_cast<const SwTableNode&>(rDstNd);
+
+            bRet = ( rTSrcNd.EndOfSectionIndex() - rTSrcNd.GetIndex() ) ==
+                   ( rTDstNd.EndOfSectionIndex() - rTDstNd.GetIndex() );
+
+            // --> #i107826#: compare actual table content
+            if (bRet)
+            {
+                bRet = (SimpleTableToText(rSrcNd) == SimpleTableToText(rDstNd));
+            }
+        }
+        break;
+
+    case SwNodeType::Section:
+        {
+            const SwSectionNode& rSSrcNd = static_cast<const SwSectionNode&>(rSrcNd),
+                               & rSDstNd = static_cast<const SwSectionNode&>(rDstNd);
+            const SwSection& rSrcSect = rSSrcNd.GetSection(),
+                           & rDstSect = rSDstNd.GetSection();
+            SectionType eSrcSectType = rSrcSect.GetType(),
+                        eDstSectType = rDstSect.GetType();
+            switch( eSrcSectType )
+            {
+            case SectionType::Content:
+                bRet = SectionType::Content == eDstSectType &&
+                        rSrcSect.IsProtect() == rDstSect.IsProtect();
+                if( bRet && rSrcSect.IsProtect() )
+                {
+                    // the only have they both the same size
+                    bRet = ( rSSrcNd.EndOfSectionIndex() - rSSrcNd.GetIndex() ) ==
+                              ( rSDstNd.EndOfSectionIndex() - rSDstNd.GetIndex() );
+                }
+                break;
+
+            case SectionType::ToxHeader:
+            case SectionType::ToxContent:
+                if( SectionType::ToxHeader == eDstSectType ||
+                    SectionType::ToxContent == eDstSectType )
+                {
+                    // the same type of TOX?
+                    const SwTOXBase* pSrcTOX = rSrcSect.GetTOXBase();
+                    const SwTOXBase* pDstTOX = rDstSect.GetTOXBase();
+                    bRet =  pSrcTOX && pDstTOX
+                            && pSrcTOX->GetType() == pDstTOX->GetType()
+                            && pSrcTOX->GetTitle() == pDstTOX->GetTitle()
+                            && pSrcTOX->GetTypeName() == pDstTOX->GetTypeName()
+                            ;
+                }
+                break;
+
+            case SectionType::DdeLink:
+            case SectionType::FileLink:
+                bRet = eSrcSectType == eDstSectType &&
+                        rSrcSect.GetLinkFileName() ==
+                        rDstSect.GetLinkFileName();
+                break;
+            }
+        }
+        break;
+
+    case SwNodeType::End:
+        bRet = rSrcNd.StartOfSectionNode()->GetNodeType() ==
+               rDstNd.StartOfSectionNode()->GetNodeType();
+
+        // --> #i107826#: compare actual table content
+        if (bRet && rSrcNd.StartOfSectionNode()->GetNodeType() == SwNodeType::Table)
+        {
+            bRet = CompareNode(
+                *rSrcNd.StartOfSectionNode(), *rDstNd.StartOfSectionNode());
+        }
+
+        break;
+
+    default: break;
+    }
+    return bRet;
+}
+
+OUString SwCompareLine::GetText() const
+{
+    OUString sRet;
+    switch( m_pNode->GetNodeType() )
+    {
+    case SwNodeType::Text:
+        sRet = m_pNode->GetTextNode()->GetExpandText(nullptr);
+        break;
+
+    case SwNodeType::Table:
+        {
+            sRet = "Tabelle: " + SimpleTableToText(*m_pNode);
+        }
+        break;
+
+    case SwNodeType::Section:
+        {
+            sRet = u"Section - Node:"_ustr;
+
+            const SwSectionNode& rSNd = static_cast<const SwSectionNode&>(*m_pNode);
+            const SwSection& rSect = rSNd.GetSection();
+            switch( rSect.GetType() )
+            {
+            case SectionType::Content:
+                if( rSect.IsProtect() )
+                    sRet += OUString::number(
+                            sal_Int32(rSNd.EndOfSectionIndex() - rSNd.GetIndex()) );
+                break;
+
+            case SectionType::ToxHeader:
+            case SectionType::ToxContent:
+                {
+                    const SwTOXBase* pTOX = rSect.GetTOXBase();
+                    if( pTOX )
+                        sRet += pTOX->GetTitle() + pTOX->GetTypeName() +
+                            OUString::number(pTOX->GetType());
+                }
+                break;
+
+            case SectionType::DdeLink:
+            case SectionType::FileLink:
+                sRet += rSect.GetLinkFileName();
+                break;
+            }
+        }
+        break;
+
+    case SwNodeType::Grf:
+        sRet = u"Grafik - Node:"_ustr;
+        break;
+    case SwNodeType::Ole:
+        sRet = u"OLE - Node:"_ustr;
+        break;
+    default: break;
+    }
+    return sRet;
+}
+
+sal_uLong SwCompareLine::GetTextNodeHashValue( const SwTextNode& rNd, sal_uLong nVal )
+{
+    OUString sStr( rNd.GetExpandText(nullptr) );
+    for( sal_Int32 n = 0; n < sStr.getLength(); ++n )
+        nVal = (nVal << 1 ) + sStr[ n ];
+    return nVal;
+}
+
+bool SwCompareLine::CompareTextNd( const SwTextNode& rDstNd,
+                                  const SwTextNode& rSrcNd )
+{
+    bool bRet = false;
+    // Very simple at first
+    if( rDstNd.GetText() == rSrcNd.GetText() )
+    {
+        // The text is the same, but are the "special attributes" (0xFF) also the same?
+        bRet = true;
+    }
+    return bRet;
+}
+
+bool SwCompareLine::ChangesInLine( const SwCompareLine& rLine,
+                            std::unique_ptr<SwPaM>& rpInsRing, std::unique_ptr<SwPaM>& rpDelRing,
+                            bool bEvenIfDissimilar ) const
+{
+    bool bRet = false;
+
+    // Only compare textnodes
+    if (m_pNode->IsTextNode() && rLine.GetNode().IsTextNode())
+    {
+        SwTextNode& rDstNd = *const_cast<SwTextNode*>(m_pNode->GetTextNode());
+        const SwTextNode& rSrcNd = *rLine.GetNode().GetTextNode();
+        SwDoc& rDstDoc = rDstNd.GetDoc();
+
+        int nLcsLen = 0;
+
+        int nDstLen = rDstNd.GetText().getLength();
+        int nSrcLen = rSrcNd.GetText().getLength();
+
+        int nMinLen = std::min( nDstLen , nSrcLen );
+        int nAvgLen = ( nDstLen + nSrcLen )/2;
+
+        std::vector<int> aLcsDst( nMinLen + 1 );
+        std::vector<int> aLcsSrc( nMinLen + 1 );
+
+        if( CmpOptions.eCmpMode == SwCompareMode::ByWord )
+        {
+            std::vector<int> aTmpLcsDst( nMinLen + 1 );
+            std::vector<int> aTmpLcsSrc( nMinLen + 1 );
+
+            WordArrayComparator aCmp( &rDstNd, &rSrcNd );
+
+            LgstCommonSubseq aSeq( aCmp );
+
+            nLcsLen = aSeq.Find( aTmpLcsDst.data(), aTmpLcsSrc.data() );
+
+            if( CmpOptions.nIgnoreLen )
+            {
+                nLcsLen = CommonSubseq::IgnoreIsolatedPieces( aTmpLcsDst.data(), aTmpLcsSrc.data(),
+                                                aCmp.GetLen1(), aCmp.GetLen2(),
+                                                nLcsLen, CmpOptions.nIgnoreLen );
+            }
+
+            nLcsLen = aCmp.GetCharSequence( aTmpLcsDst.data(), aTmpLcsSrc.data(),
+                                            aLcsDst.data(), aLcsSrc.data(), nLcsLen );
+        }
+        else
+        {
+            CharArrayComparator aCmp( &rDstNd, &rSrcNd );
+            LgstCommonSubseq aSeq( aCmp );
+
+            nLcsLen = aSeq.Find( aLcsDst.data(), aLcsSrc.data() );
+
+            if( CmpOptions.nIgnoreLen )
+            {
+                nLcsLen = CommonSubseq::IgnoreIsolatedPieces( aLcsDst.data(), aLcsSrc.data(), nDstLen,
+                                                    nSrcLen, nLcsLen,
+                                                    CmpOptions.nIgnoreLen );
+            }
+        }
+
+        // find the sum of the squares of the continuous substrings
+        int nSqSum = 0;
+        int nCnt = 1;
+        for( int i = 0; i < nLcsLen; i++ )
+        {
+            if( i != nLcsLen - 1 && aLcsDst[i] + 1 == aLcsDst[i + 1]
+                                && aLcsSrc[i] + 1 == aLcsSrc[i + 1] )
+            {
+                nCnt++;
+            }
+            else
+            {
+                nSqSum += nCnt*nCnt;
+                nCnt = 1;
+            }
+        }
+
+        // Don't compare if there aren't enough similarities
+        if ( !bEvenIfDissimilar && nAvgLen >= 8 && nSqSum*32 < nAvgLen*nAvgLen )
+        {
+            return false;
+        }
+
+        // Show the differences
+        int nSkip = 0;
+        for( int i = 0; i <= nLcsLen; i++ )
+        {
+            int nDstFrom = i ? (aLcsDst[i - 1] + 1) : 0;
+            int nDstTo = ( i == nLcsLen ) ? nDstLen : aLcsDst[i];
+            int nSrcFrom = i ? (aLcsSrc[i - 1] + 1) : 0;
+            int nSrcTo = ( i == nLcsLen ) ? nSrcLen : aLcsSrc[i];
+
+            SwPaM aPam( rDstNd, nDstTo + nSkip );
+
+            if ( nDstFrom < nDstTo )
+            {
+                SwPaM* pTmp = new SwPaM( *aPam.GetPoint(), rpInsRing.get() );
+                if( !rpInsRing )
+                    rpInsRing.reset(pTmp);
+                pTmp->SetMark();
+                pTmp->GetMark()->SetContent(nDstFrom + nSkip);
+            }
+
+            if ( nSrcFrom < nSrcTo )
+            {
+                bool bUndo = rDstDoc.GetIDocumentUndoRedo().DoesUndo();
+                rDstDoc.GetIDocumentUndoRedo().DoUndo( false );
+                SwPaM aCpyPam( rSrcNd, nSrcFrom );
+                aCpyPam.SetMark();
+                aCpyPam.GetPoint()->SetContent(nSrcTo);
+                aCpyPam.GetDoc().getIDocumentContentOperations().CopyRange( aCpyPam, *aPam.GetPoint(),
+                    SwCopyFlags::CheckPosInFly);
+                rDstDoc.GetIDocumentUndoRedo().DoUndo( bUndo );
+
+                SwPaM* pTmp = new SwPaM( *aPam.GetPoint(), rpDelRing.get() );
+                if( !rpDelRing )
+                    rpDelRing.reset(pTmp);
+
+                pTmp->SetMark();
+                pTmp->GetMark()->SetContent(nDstTo + nSkip);
+                nSkip += nSrcTo - nSrcFrom;
+
+                if( rpInsRing )
+                {
+                    SwPaM* pCorr = rpInsRing->GetPrev();
+                    if( *pCorr->GetPoint() == *pTmp->GetPoint() )
+                        *pCorr->GetPoint() = *pTmp->GetMark();
+                }
+            }
+        }
+
+        bRet = true;
+    }
+
+    return bRet;
+}
+
+SwNodeOffset CompareData::NextIdx( const SwNode* pNd )
+{
+    if( pNd->IsStartNode() )
+    {
+        if( pNd->IsTableNode() )
+            pNd = pNd->EndOfSectionNode();
+        else
+        {
+            const SwSectionNode* pSNd = pNd->GetSectionNode();
+            if( pSNd &&
+                ( SectionType::Content != pSNd->GetSection().GetType() ||
+                    pSNd->GetSection().IsProtect() ) )
+                pNd = pNd->EndOfSectionNode();
+        }
+    }
+    return pNd->GetIndex() + 1;
+}
+
+SwNodeOffset CompareData::PrevIdx( const SwNode* pNd )
+{
+    if( pNd->IsEndNode() )
+    {
+        if( pNd->StartOfSectionNode()->IsTableNode() )
+            pNd = pNd->StartOfSectionNode();
+        else
+        {
+            const SwSectionNode* pSNd = pNd->StartOfSectionNode()->GetSectionNode();
+            if( pSNd &&
+                ( SectionType::Content != pSNd->GetSection().GetType() ||
+                    pSNd->GetSection().IsProtect() ) )
+                pNd = pNd->StartOfSectionNode();
+        }
+    }
+    return pNd->GetIndex() - 1;
+}
+
+void CompareData::CheckRanges( CompareData& rData )
+{
+    const SwNodes& rSrcNds = rData.m_rDoc.GetNodes();
+    const SwNodes& rDstNds = m_rDoc.GetNodes();
+
+    const SwNode& rSrcEndNd = rData.GetEndOfContent();
+    const SwNode& rDstEndNd = GetEndOfContent();
+
+    SwNodeOffset nSrcSttIdx = NextIdx( rSrcEndNd.StartOfSectionNode() );
+    SwNodeOffset nSrcEndIdx = rSrcEndNd.GetIndex();
+
+    SwNodeOffset nDstSttIdx = NextIdx( rDstEndNd.StartOfSectionNode() );
+    SwNodeOffset nDstEndIdx = rDstEndNd.GetIndex();
+
+    while( nSrcSttIdx < nSrcEndIdx && nDstSttIdx < nDstEndIdx )
+    {
+        const SwNode* pSrcNd = rSrcNds[ nSrcSttIdx ];
+        const SwNode* pDstNd = rDstNds[ nDstSttIdx ];
+        if( !SwCompareLine::CompareNode( *pSrcNd, *pDstNd ))
+            break;
+        if( CmpOptions.bCompareFormatting )
+            AddSameText( *pDstNd, *pSrcNd );
+
+        nSrcSttIdx = NextIdx( pSrcNd );
+        nDstSttIdx = NextIdx( pDstNd );
+    }
+
+    nSrcEndIdx = PrevIdx( &rSrcEndNd );
+    nDstEndIdx = PrevIdx( &rDstEndNd );
+    while( nSrcSttIdx < nSrcEndIdx && nDstSttIdx < nDstEndIdx )
+    {
+        const SwNode* pSrcNd = rSrcNds[ nSrcEndIdx ];
+        const SwNode* pDstNd = rDstNds[ nDstEndIdx ];
+        if( !SwCompareLine::CompareNode( *pSrcNd, *pDstNd ))
+            break;
+        if( CmpOptions.bCompareFormatting )
+            AddSameText( *pDstNd, *pSrcNd );
+
+        nSrcEndIdx = PrevIdx( pSrcNd );
+        nDstEndIdx = PrevIdx( pDstNd );
+    }
+
+    while( nSrcSttIdx <= nSrcEndIdx )
+    {
+        const SwNode* pNd = rSrcNds[ nSrcSttIdx ];
+        rData.InsertLine( SwCompareLine( *pNd ) );
+        nSrcSttIdx = NextIdx( pNd );
+    }
+
+    while( nDstSttIdx <= nDstEndIdx )
+    {
+        const SwNode* pNd = rDstNds[ nDstSttIdx ];
+        InsertLine( SwCompareLine( *pNd ) );
+        nDstSttIdx = NextIdx( pNd );
+    }
+}
+
+void CompareData::ShowInsert( sal_uLong nStt, sal_uLong nEnd )
+{
+    SwPaM* pTmp = new SwPaM( GetLine( nStt ).GetNode(), 0,
+                             GetLine( nEnd-1 ).GetEndNode(), 0,
+                             m_pInsertRing.get() );
+    if( !m_pInsertRing )
+        m_pInsertRing.reset( pTmp );
+
+    // #i65201#: These SwPaMs are calculated smaller than needed, see comment below
+}
+
+void CompareData::ShowDelete(
+    const CompareData& rData,
+    sal_uLong nStt,
+    sal_uLong nEnd,
+    sal_uLong nInsPos )
+{
+    SwNodeRange aRg(
+        rData.GetLine( nStt ).GetNode(), SwNodeOffset(0),
+        rData.GetLine( nEnd-1 ).GetEndNode(), SwNodeOffset(1) );
+
+    // The deleted lines go in front of line nInsPos, or after the last line when nInsPos is past
+    // the end.
+    SwNodeOffset nOffset(0);
+    std::optional<SwCompareLine> xLine;
+    if( nInsPos < GetLineCount() )
+        xLine = GetLine( nInsPos );
+    else if( nInsPos >= 1 )
+    {
+        xLine = GetLine( nInsPos-1 );
+        nOffset = SwNodeOffset(1);
+    }
+
+    const SwNode* pLineNd;
+    if( xLine )
+    {
+        if( nOffset )
+            pLineNd = &xLine->GetEndNode();
+        else
+            pLineNd = &xLine->GetNode();
+    }
+    else
+    {
+        pLineNd = &GetEndOfContent();
+        nOffset = SwNodeOffset(0);
+    }
+
+    SwNodeIndex aInsPos( *pLineNd, nOffset );
+    SwNodeIndex aSavePos( aInsPos, -1 );
+
+    rData.m_rDoc.GetDocumentContentOperationsManager().CopyWithFlyInFly(aRg, aInsPos.GetNode());
+    m_rDoc.getIDocumentState().SetModified();
+    ++aSavePos;
+
+    // #i65201#: These SwPaMs are calculated when the (old) delete-redlines are hidden,
+    // they will be inserted when the delete-redlines are shown again.
+    // To avoid unwanted insertions of delete-redlines into these new redlines, what happens
+    // especially at the end of the document, I reduce the SwPaM by one node.
+    // Before the new redlines are inserted, they have to expand again.
+    SwPaM* pTmp = new SwPaM( aSavePos.GetNode(), aInsPos.GetNode(), SwNodeOffset(0), SwNodeOffset(-1), m_pDelRing.get() );
+    if( !m_pDelRing )
+        m_pDelRing.reset(pTmp);
+
+    if( m_pInsertRing )
+    {
+        SwPaM* pCorr = m_pInsertRing->GetPrev();
+        if( *pCorr->GetPoint() == *pTmp->GetPoint() )
+        {
+            SwNodeIndex aTmpPos( pTmp->GetMark()->GetNode(), -1 );
+            pCorr->GetPoint()->Assign( aTmpPos );
+        }
+    }
+}
+
+bool CompareData::IsLastLineOfSection( sal_uLong nLine )
+{
+    return nLine + 1 == GetLineCount()
+           && GetLine( nLine ).GetEndNode().GetIndex() + 1 == GetEndOfContent().GetIndex();
+}
+
+void CompareData::CheckForChangesInLine( const CompareData& rData,
+                                    sal_uLong nStt, sal_uLong nEnd,
+                                    sal_uLong nThisStt, sal_uLong nThisEnd )
+{
+    LineArrayComparator aCmp( *this, rData, nThisStt, nThisEnd,
+                              nStt, nEnd );
+
+    int nMinLen = std::min( aCmp.GetLen1(), aCmp.GetLen2() );
+    std::unique_ptr<int[]> pLcsDst(new int[ nMinLen ]);
+    std::unique_ptr<int[]> pLcsSrc(new int[ nMinLen ]);
+
+    FastCommonSubseq subseq( aCmp );
+    int nLcsLen = subseq.Find( pLcsDst.get(), pLcsSrc.get() );
+    for (int i = 0; i <= nLcsLen; i++)
+    {
+        // Beginning of inserted lines (inclusive)
+        int nDstFrom = i ? pLcsDst[i - 1] + 1 : 0;
+        // End of inserted lines (exclusive)
+        int nDstTo = ( i == nLcsLen ) ? aCmp.GetLen1() : pLcsDst[i];
+        // Beginning of deleted lines (inclusive)
+        int nSrcFrom = i ? pLcsSrc[i - 1] + 1 : 0;
+        // End of deleted lines (exclusive)
+        int nSrcTo = ( i == nLcsLen ) ? aCmp.GetLen2() : pLcsSrc[i];
+
+        if( i )
+        {
+            const SwCompareLine aDstLn = GetLine( nThisStt + nDstFrom - 1 );
+            const SwCompareLine aSrcLn = rData.GetLine( nStt + nSrcFrom - 1 );
+
+            // Show differences in detail for lines that
+            // were matched as only slightly different
+            const SwTableNode* pDstTable = aDstLn.GetNode().GetTableNode();
+            const SwTableNode* pSrcTable = aSrcLn.GetNode().GetTableNode();
+            bool bShownInDetail
+                = pDstTable && pSrcTable
+                      ? CompareTableCells(rData, *pDstTable, *pSrcTable)
+                      : aDstLn.ChangesInLine(aSrcLn, m_pInsertRing, m_pDelRing,
+                                             IsLastLineOfSection(nThisStt + nDstFrom - 1));
+            if( !bShownInDetail )
+            {
+                ShowInsert( nThisStt + nDstFrom - 1, nThisStt + nDstFrom );
+                ShowDelete( rData, nStt + nSrcFrom - 1, nStt + nSrcFrom,
+                                                    nThisStt + nDstFrom );
+            }
+        }
+
+        // The deleted lines are copied after the inserted lines. At the end of a section no
+        // paragraph follows them, so the last inserted paragraph and the first deleted one are
+        // shown as changes inside one paragraph. Then accepting and rejecting both leave a single
+        // paragraph there.
+        int nJoinedLines = 0;
+        if (nDstFrom != nDstTo && nSrcFrom != nSrcTo
+            && IsLastLineOfSection(nThisStt + nDstTo - 1)
+            && GetLine(nThisStt + nDstTo - 1).GetNode().IsTextNode()
+            && rData.GetLine(nStt + nSrcFrom).GetNode().IsTextNode())
+        {
+            nJoinedLines = 1;
+        }
+
+        // Lines missing from source are inserted
+        if( nDstFrom != nDstTo - nJoinedLines )
+        {
+            ShowInsert( nThisStt + nDstFrom, nThisStt + nDstTo - nJoinedLines );
+        }
+
+        if (nJoinedLines)
+        {
+            GetLine(nThisStt + nDstTo - 1)
+                .ChangesInLine(rData.GetLine(nStt + nSrcFrom), m_pInsertRing, m_pDelRing,
+                               /*bEvenIfDissimilar=*/true);
+        }
+
+        // Lines missing from destination are deleted
+        if( nSrcFrom + nJoinedLines != nSrcTo )
+        {
+            ShowDelete( rData, nStt + nSrcFrom + nJoinedLines, nStt + nSrcTo, nThisStt + nDstTo );
+        }
+    }
+}
+
+namespace
+{
+    /// The character attributes, from RES_CHRATR_BEGIN up to the end of the text attributes
+    /// that have an end.
+    SfxItemSet lcl_MakeCharFormattingSet(SwDoc& rDoc)
+    {
+        return SfxItemSet::makeFixedSfxItemSet<RES_CHRATR_BEGIN, RES_TXTATR_WITHEND_END - 1>(
+            rDoc.GetAttrPool());
+    }
+
+    /// Puts into rSet the character formatting that applies to all of nStart to nEnd in rNd:
+    /// the paragraph's own character attributes, with the character attributes of its text on
+    /// top. The attributes that mark content rather than formatting it are left out.
+    void lcl_GetCharFormatting(const SwTextNode& rNd, sal_Int32 nStart, sal_Int32 nEnd,
+                               bool bExpandCharFormat, SfxItemSet& rSet)
+    {
+        if (const SwAttrSet* pParaSet = rNd.GetpSwAttrSet())
+            rSet.Put(*pParaSet);
+
+        SfxItemSet aTextSet(*rSet.GetPool(), rSet.GetRanges());
+        rNd.GetParaAttr(aTextSet, nStart, nEnd, /*bOnlyTextAttr=*/true, bExpandCharFormat);
+        aTextSet.ClearInvalidItems();
+        rSet.Put(aTextSet);
+
+        static constexpr sal_uInt16 aNotFormatting[]
+            = { RES_TXTATR_REFMARK,           RES_TXTATR_TOXMARK,    RES_TXTATR_META,
+                RES_TXTATR_METAFIELD,         RES_TXTATR_INETFMT,    RES_TXTATR_CJK_RUBY,
+                RES_TXTATR_UNKNOWN_CONTAINER, RES_TXTATR_INPUTFIELD, RES_TXTATR_CONTENTCONTROL,
+                RES_CHRATR_RSID,              RES_CHRATR_GRABBAG };
+        for (sal_uInt16 nWhich : aNotFormatting)
+            rSet.ClearItem(nWhich);
+        // The contents of an automatic style are in rSet already, as single items.
+        rSet.ClearItem(RES_TXTATR_AUTOFMT);
+    }
+
+    /// Clears the items of rSet that have the value that the paragraph style of rNd gives, so
+    /// that direct formatting with no effect counts the same as no direct formatting.
+    void lcl_ClearItemsSameAsStyle(SfxItemSet& rSet, const SwTextNode& rNd)
+    {
+        const SwTextFormatColl* pStyle = rNd.GetTextColl();
+        if (!pStyle)
+            return;
+        const SwAttrSet& rStyleSet = pStyle->GetAttrSet();
+        SfxWhichIter aIter(rSet);
+        for (sal_uInt16 nWhich = aIter.FirstWhich(); nWhich; nWhich = aIter.NextWhich())
+        {
+            const SfxPoolItem* pItem = nullptr;
+            if (rStyleSet.GetRanges().doesContainWhich(nWhich)
+                && rSet.GetItemState(nWhich, false, &pItem) == SfxItemState::SET
+                && *pItem == rStyleSet.Get(nWhich))
+                rSet.ClearItem(nWhich);
+        }
+    }
+
+    /// The character formatting of nStart to nEnd in rNd, in a form that two documents can
+    /// compare: the character style by its name, and all the other items expanded.
+    struct CharFormatting
+    {
+        SfxItemSet m_aSet;
+        UIName m_aCharFormatName;
+
+        CharFormatting(SwDoc& rDoc, const SwTextNode& rNd, sal_Int32 nStart, sal_Int32 nEnd)
+            : m_aSet(lcl_MakeCharFormattingSet(rDoc))
+        {
+            lcl_GetCharFormatting(rNd, nStart, nEnd, /*bExpandCharFormat=*/true, m_aSet);
+            lcl_ClearItemsSameAsStyle(m_aSet, rNd);
+            if (const SwFormatCharFormat* pItem = m_aSet.GetItemIfSet(RES_TXTATR_CHARFMT, false))
+            {
+                if (const SwCharFormat* pFormat = pItem->GetCharFormat())
+                    m_aCharFormatName = pFormat->GetName();
+                m_aSet.ClearItem(RES_TXTATR_CHARFMT);
+            }
+        }
+
+        bool operator==(const CharFormatting& rOther) const
+        {
+            return m_aCharFormatName == rOther.m_aCharFormatName
+                   && m_aSet.Equals(rOther.m_aSet, /*bComparePool=*/false);
+        }
+    };
+
+    /// The paragraph attributes that change how a paragraph looks, plus the numbering and list
+    /// attributes.
+    SfxItemSet lcl_MakeParaFormattingSet(SwDoc& rDoc)
+    {
+        return SfxItemSet::makeFixedSfxItemSet<
+            RES_PARATR_LINESPACING, RES_PARATR_AUTOFRAMEDIR, RES_PARATR_LIST_BEGIN,
+            RES_PARATR_LIST_END - 1, RES_MARGIN_FIRSTLINE, RES_MARGIN_RIGHT, RES_UL_SPACE,
+            RES_UL_SPACE, RES_BREAK, RES_BREAK, RES_BACKGROUND, RES_SHADOW, RES_KEEP, RES_KEEP,
+            RES_FRAMEDIR, RES_FRAMEDIR, XATTR_FILLSTYLE, XATTR_FILLCOLOR>(rDoc.GetAttrPool());
+    }
+
+    /// The paragraph attributes that rejecting a paragraph formatting change resets, plus the fill
+    /// attributes that the comparison looks at.
+    SfxItemSet lcl_MakeParaResetSet(SwDoc& rDoc)
+    {
+        return SfxItemSet::makeFixedSfxItemSet<RES_PARATR_BEGIN, RES_FRMATR_END - 1,
+                                               XATTR_FILLSTYLE, XATTR_FILLCOLOR>(
+            rDoc.GetAttrPool());
+    }
+
+    /// Whether nWhich is a numbering or list attribute, which the comparison leaves as they are,
+    /// or the drop cap, which refers to a character style of its own document.
+    bool lcl_IsNumberingOrDropCap(sal_uInt16 nWhich)
+    {
+        return nWhich == RES_PARATR_NUMRULE || nWhich == RES_PARATR_DROP
+               || (nWhich >= RES_PARATR_LIST_BEGIN && nWhich < RES_PARATR_LIST_END);
+    }
+
+    /// Clears the numbering and list attributes and the drop cap.
+    void lcl_ClearNumberingAndDropCap(SfxItemSet& rSet)
+    {
+        SfxWhichIter aIter(rSet);
+        for (sal_uInt16 nWhich = aIter.FirstWhich(); nWhich; nWhich = aIter.NextWhich())
+            if (lcl_IsNumberingOrDropCap(nWhich))
+                rSet.ClearItem(nWhich);
+    }
+
+    /// The paragraph formatting of rNd that two documents can compare: the paragraph style by
+    /// its name, and the paragraph's own attributes.
+    struct ParaFormatting
+    {
+        SfxItemSet m_aSet;
+        UIName m_aStyleName;
+
+        ParaFormatting(SwDoc& rDoc, const SwTextNode& rNd)
+            : m_aSet(lcl_MakeParaFormattingSet(rDoc))
+        {
+            if (const SwAttrSet* pParaSet = rNd.GetpSwAttrSet())
+                m_aSet.Put(*pParaSet);
+            lcl_ClearNumberingAndDropCap(m_aSet);
+            lcl_ClearItemsSameAsStyle(m_aSet, rNd);
+            if (const SwTextFormatColl* pStyle = rNd.GetTextColl())
+                m_aStyleName = pStyle->GetName();
+        }
+
+        bool operator==(const ParaFormatting& rOther) const
+        {
+            return m_aStyleName == rOther.m_aStyleName
+                   && m_aSet.Equals(rOther.m_aSet, /*bComparePool=*/false);
+        }
+    };
+
+    /// Adds the start and the end of each text attribute of rNd that has an end.
+    void lcl_AddAttributeBoundaries(const SwTextNode& rNd, o3tl::sorted_vector<sal_Int32>& rBoundaries)
+    {
+        const SwpHints* pHints = rNd.GetpSwpHints();
+        if (!pHints)
+            return;
+        for (size_t i = 0; i < pHints->Count(); ++i)
+        {
+            const SwTextAttr* pHint = pHints->Get(i);
+            if (const sal_Int32* pEnd = pHint->End())
+            {
+                rBoundaries.insert(pHint->GetStart());
+                rBoundaries.insert(*pEnd);
+            }
+        }
+    }
+
+    /// Adds the footnotes and the endnotes whose anchors are in rRange.
+    void lcl_AddNotesInRange(const SwPaM& rRange,
+                             o3tl::sorted_vector<const SwTextFootnote*>& rNotes)
+    {
+        const SwPosition& rStart = *rRange.Start();
+        const SwPosition& rEnd = *rRange.End();
+        const SwNodes& rNodes = rStart.GetNodes();
+        for (SwNodeOffset nIndex = rStart.GetNodeIndex(); nIndex <= rEnd.GetNodeIndex(); ++nIndex)
+        {
+            const SwTextNode* pTextNode = rNodes[nIndex]->GetTextNode();
+            const SwpHints* pHints = pTextNode ? pTextNode->GetpSwpHints() : nullptr;
+            if (!pHints)
+                continue;
+            for (size_t i = 0; i < pHints->Count(); ++i)
+            {
+                const SwTextAttr* pHint = pHints->Get(i);
+                if (pHint->Which() != RES_TXTATR_FTN)
+                    continue;
+                SwPosition aAnchor(*pTextNode, pHint->GetStart());
+                if (rStart <= aAnchor && aAnchor < rEnd)
+                    rNotes.insert(static_cast<const SwTextFootnote*>(pHint));
+            }
+        }
+    }
+}
+
+void CompareData::AddSameText( const SwNode& rDstNd, const SwNode& rSrcNd )
+{
+    if( rDstNd.IsTextNode() && rSrcNd.IsTextNode() )
+    {
+        m_aSameTextNodes.emplace_back( rDstNd.GetTextNode(), rSrcNd.GetTextNode() );
+        return;
+    }
+
+    // A table is one line. Its text is the same in both documents, so pair up its paragraphs.
+    const SwNode* pDstStart = rDstNd.IsEndNode() ? rDstNd.StartOfSectionNode() : &rDstNd;
+    const SwNode* pSrcStart = rSrcNd.IsEndNode() ? rSrcNd.StartOfSectionNode() : &rSrcNd;
+    if( !pDstStart->IsTableNode() || !pSrcStart->IsTableNode() )
+        return;
+
+    const SwNodes& rDstNodes = pDstStart->GetNodes();
+    const SwNodes& rSrcNodes = pSrcStart->GetNodes();
+    SwNodeOffset nDstIdx = pDstStart->GetIndex();
+    SwNodeOffset nSrcIdx = pSrcStart->GetIndex();
+    const SwNodeOffset nDstEnd = pDstStart->EndOfSectionIndex();
+    const SwNodeOffset nSrcEnd = pSrcStart->EndOfSectionIndex();
+    for( ; nDstIdx < nDstEnd && nSrcIdx < nSrcEnd; ++nDstIdx, ++nSrcIdx )
+    {
+        const SwTextNode* pDstText = rDstNodes[ nDstIdx ]->GetTextNode();
+        const SwTextNode* pSrcText = rSrcNodes[ nSrcIdx ]->GetTextNode();
+        if( pDstText && pSrcText && pDstText->GetText() == pSrcText->GetText() )
+            m_aSameTextNodes.emplace_back( pDstText, pSrcText );
+    }
+}
+
+sal_uLong CompareData::CompareFormatting()
+{
+    for( const auto& [ pDstNd, pSrcNd ] : m_aSameTextNodes )
+    {
+        CompareParaFormatting( *pDstNd, *pSrcNd );
+        CompareCharFormatting( *pDstNd, *pSrcNd );
+    }
+    m_aSameTextNodes.clear();
+    return m_aFormatChanges.size();
+}
+
+void CompareData::CompareParaFormatting( const SwTextNode& rDstNd, const SwTextNode& rSrcNd )
+{
+    // A paragraph format redline needs some text to cover.
+    if( rDstNd.GetText().isEmpty() )
+        return;
+    ParaFormatting aDst( m_rDoc, rDstNd );
+    ParaFormatting aSrc( m_rDoc, rSrcNd );
+    if( aDst == aSrc )
+        return;
+
+    SwTextFormatColl* pOldStyle = nullptr;
+    if( const SwTextFormatColl* pSrcStyle = rSrcNd.GetTextColl() )
+    {
+        pOldStyle = m_rDoc.FindTextFormatCollByName( pSrcStyle->GetName() );
+        if( !pOldStyle )
+            pOldStyle = m_rDoc.CopyTextColl( *pSrcStyle );
+    }
+
+    // Rejecting the change resets all the paragraph attributes and then sets the old ones. The
+    // old attributes are the compared ones of the old version, and the current value of each
+    // attribute that the comparison leaves alone, such as the numbering, so those stay.
+    auto pOldSet = std::make_shared<SfxItemSet>( lcl_MakeParaResetSet( m_rDoc ) );
+    pOldSet->Put( aSrc.m_aSet );
+    if( const SwAttrSet* pDstParaSet = rDstNd.GetpSwAttrSet() )
+    {
+        for( SfxItemIter aIter( *pDstParaSet ); !aIter.IsAtEnd(); aIter.Next() )
+        {
+            const SfxPoolItem* pItem = aIter.GetCurItem();
+            const sal_uInt16 nWhich = pItem->Which();
+            if( !pOldSet->GetRanges().doesContainWhich( nWhich ) )
+                continue;
+            if( lcl_IsNumberingOrDropCap( nWhich )
+                || !aSrc.m_aSet.GetRanges().doesContainWhich( nWhich ) )
+                pOldSet->Put( *pItem );
+        }
+    }
+
+    SwTextNode& rNd = const_cast<SwTextNode&>( rDstNd );
+    m_aFormatChanges.push_back( { std::make_unique<SwPaM>( rNd, 0, rNd, rNd.GetText().getLength() ),
+                                  RedlineType::ParagraphFormat,
+                                  std::make_unique<SwRedlineExtraData_FormatColl>(
+                                      pOldStyle ? pOldStyle->GetName() : UIName( u""_ustr ),
+                                      SwPoolFormatId::UNKNOWN, pOldSet ) } );
+}
+
+void CompareData::CompareCharFormatting( const SwTextNode& rDstNd, const SwTextNode& rSrcNd )
+{
+    const sal_Int32 nLen = rDstNd.GetText().getLength();
+    o3tl::sorted_vector<sal_Int32> aBoundaries;
+    aBoundaries.insert( 0 );
+    aBoundaries.insert( nLen );
+    lcl_AddAttributeBoundaries( rDstNd, aBoundaries );
+    lcl_AddAttributeBoundaries( rSrcNd, aBoundaries );
+
+    // Between two boundaries, each attribute covers all of the text or none of it. A change
+    // goes on as long as the formatting differs and the old formatting stays the same, because
+    // one redline holds one set of old formatting.
+    std::optional<CharFormatting> oChangeSrc;
+    sal_Int32 nChangeStart = 0;
+    for( size_t i = 1; i < aBoundaries.size(); ++i )
+    {
+        const sal_Int32 nStart = aBoundaries[ i - 1 ];
+        const sal_Int32 nEnd = aBoundaries[ i ];
+        CharFormatting aDst( m_rDoc, rDstNd, nStart, nEnd );
+        CharFormatting aSrc( m_rDoc, rSrcNd, nStart, nEnd );
+        const bool bDiffers = !( aDst == aSrc );
+        if( oChangeSrc && ( !bDiffers || !( *oChangeSrc == aSrc ) ) )
+        {
+            AddCharFormatChange( rDstNd, rSrcNd, nChangeStart, nStart );
+            oChangeSrc.reset();
+        }
+        if( bDiffers && !oChangeSrc )
+        {
+            oChangeSrc.emplace( std::move( aSrc ) );
+            nChangeStart = nStart;
+        }
+    }
+    if( oChangeSrc )
+        AddCharFormatChange( rDstNd, rSrcNd, nChangeStart, nLen );
+}
+
+void CompareData::AddCharFormatChange( const SwTextNode& rDstNd, const SwTextNode& rSrcNd,
+                                       sal_Int32 nStart, sal_Int32 nEnd )
+{
+    // The old formatting as rejecting the change sets it again: the character style itself,
+    // and the other items as direct formatting.
+    SfxItemSet aOldSet( lcl_MakeCharFormattingSet( m_rDoc ) );
+    lcl_GetCharFormatting( rSrcNd, nStart, nEnd, /*bExpandCharFormat=*/false, aOldSet );
+    if( const SwFormatCharFormat* pItem = aOldSet.GetItemIfSet( RES_TXTATR_CHARFMT, false ) )
+    {
+        SwCharFormat* pDstFormat = nullptr;
+        if( const SwCharFormat* pSrcFormat = pItem->GetCharFormat() )
+        {
+            pDstFormat = m_rDoc.FindCharFormatByName( pSrcFormat->GetName() );
+            if( !pDstFormat )
+                pDstFormat = m_rDoc.CopyCharFormat( *pSrcFormat );
+        }
+        aOldSet.ClearItem( RES_TXTATR_CHARFMT );
+        if( pDstFormat )
+            aOldSet.Put( SwFormatCharFormat( pDstFormat ) );
+    }
+    std::shared_ptr<SfxItemSet> pOldStyle
+        = m_rDoc.GetIStyleAccess().getAutomaticStyle( aOldSet, IStyleAccess::AUTO_STYLE_CHAR );
+
+    SwTextNode& rNd = const_cast<SwTextNode&>( rDstNd );
+    m_aFormatChanges.push_back( { std::make_unique<SwPaM>( rNd, nStart, rNd, nEnd ),
+                                  RedlineType::Format,
+                                  std::make_unique<SwRedlineExtraData_FormatColl>(
+                                      UIName( u""_ustr ), SwPoolFormatId::UNKNOWN, pOldStyle ) } );
+}
+
+void CompareData::AppendFormatRedlines( std::size_t nAuthor, const DateTime& rTimeStamp )
+{
+    for (const auto& pCellComparison : m_aCellComparisons)
+        pCellComparison->AppendFormatRedlines(nAuthor, rTimeStamp);
+
+    for( const FormatChange& rChange : m_aFormatChanges )
+    {
+        SwRedlineData aRedlnData( rChange.m_eType, nAuthor, rTimeStamp, 0, OUString(), nullptr );
+        aRedlnData.SetExtraData( rChange.m_pExtraData.get() );
+        if (IDocumentRedlineAccess::AppendResult::APPENDED ==
+                m_rDoc.getIDocumentRedlineAccess().AppendRedline(
+                    new SwRangeRedline( aRedlnData, *rChange.m_pPaM ), true) &&
+            m_rDoc.GetIDocumentUndoRedo().DoesUndo())
+        {
+            m_rDoc.GetIDocumentUndoRedo().AppendUndo(
+                std::make_unique<SwUndoCompDoc>( *rChange.m_pPaM, aRedlnData ));
+        }
+    }
+    m_aFormatChanges.clear();
+}
+
+bool CompareData::CompareTableCells( const CompareData& rData, const SwTableNode& rDstTable,
+                                     const SwTableNode& rSrcTable )
+{
+    // Collect all cells first, because comparing a cell can add nodes to the destination table.
+    const std::vector<const SwNode*> aDstCells = GetCellStartNodes(rDstTable);
+    const std::vector<const SwNode*> aSrcCells = GetCellStartNodes(rSrcTable);
+
+    // A tracked deletion ends in the paragraph that follows the deleted content. A cell that ends
+    // with a nested table has no such paragraph, so its table is compared as a whole.
+    if (std::any_of(aDstCells.begin(), aDstCells.end(),
+                    [](const SwNode* pCell) { return CellEndsWithTable(*pCell); })
+        || std::any_of(aSrcCells.begin(), aSrcCells.end(),
+                       [](const SwNode* pCell) { return CellEndsWithTable(*pCell); }))
+    {
+        return false;
+    }
+
+    // Matching the rows also keeps the other rows paired when one row was removed and another
+    // added. A row counts as tracked when the redlines in its own cells cover all its text, so
+    // the rows of a table where a cell starts with a nested table are not matched.
+    const auto aStartsWithTable = [](const SwNode* pCell) { return CellStartsWithTable(*pCell); };
+    if (HasSimpleRows(rDstTable, rSrcTable)
+        && std::none_of(aDstCells.begin(), aDstCells.end(), aStartsWithTable)
+        && std::none_of(aSrcCells.begin(), aSrcCells.end(), aStartsWithTable))
+    {
+        return CompareTableRows(rData, rDstTable, rSrcTable);
+    }
+    if (!HasSameTableShape(rDstTable, rSrcTable))
+        return false;
+
+    // Two tables differ also when only the displayed value of a field differs, which the
+    // comparison of the cells does not see. Such tables are compared as a whole.
+    bool bCellDiffers = false;
+    for (size_t i = 0; i < aDstCells.size(); ++i)
+        bCellDiffers |= CompareCells(rData, *aDstCells[i], *aSrcCells[i]);
+    return bCellDiffers;
+}
+
+bool CompareData::CompareTableRows( const CompareData& rData, const SwTableNode& rDstTable,
+                                    const SwTableNode& rSrcTable )
+{
+    const SwTableLines& rDstLines = rDstTable.GetTable().GetTabLines();
+    const SwTableLines& rSrcLines = rSrcTable.GetTable().GetTabLines();
+    vector<RowTexts> aDstRows, aSrcRows;
+    for (const SwTableLine* pLine : rDstLines)
+        aDstRows.push_back(GetRowTexts(*pLine));
+    for (const SwTableLine* pLine : rSrcLines)
+        aSrcRows.push_back(GetRowTexts(*pLine));
+    const int nDstRows = aDstRows.size();
+    const int nSrcRows = aSrcRows.size();
+
+    // Rows with the same text in all cells stay as they are. The rows between two of them were
+    // edited, inserted or deleted.
+    vector<std::pair<int, int>> aEqualRows
+        = MatchRows(aDstRows, 0, nDstRows, aSrcRows, 0, nSrcRows, /*bSimilar=*/false);
+    aEqualRows.emplace_back(nDstRows, nSrcRows);
+
+    // Two tables differ also when only the displayed value of a field differs, which the
+    // comparison of the rows and of the cells does not see. Such tables are compared as a whole.
+    bool bDiffers = false;
+    const auto aCompareRowCells = [&](int nDst, int nSrc) {
+        const SwTableBoxes& rDstBoxes = rDstLines[nDst]->GetTabBoxes();
+        const SwTableBoxes& rSrcBoxes = rSrcLines[nSrc]->GetTabBoxes();
+        for (size_t i = 0; i < rDstBoxes.size(); ++i)
+            bDiffers |= CompareCells(rData, *rDstBoxes[i]->GetSttNd(), *rSrcBoxes[i]->GetSttNd());
+    };
+    int nDstFrom = 0, nSrcFrom = 0;
+    for (const auto& [nDstTo, nSrcTo] : aEqualRows)
+    {
+        // The similar rows were edited in place, and the remaining ones were inserted or deleted.
+        // A row that was rewritten completely is a deleted row and an inserted row.
+        vector<std::pair<int, int>> aPairs = MatchRows(aDstRows, nDstFrom, nDstTo, aSrcRows,
+                                                       nSrcFrom, nSrcTo, /*bSimilar=*/true);
+        aPairs.emplace_back(nDstTo, nSrcTo);
+
+        int nDst = nDstFrom, nSrc = nSrcFrom;
+        for (const auto& [nPairDst, nPairSrc] : aPairs)
+        {
+            for (; nDst < nPairDst; ++nDst)
+            {
+                m_aTrackedRows.push_back({ rDstLines[nDst], nullptr, false });
+                bDiffers = true;
+            }
+            // The deleted rows go after the inserted rows, in front of the next row, or behind
+            // the last row at the end of the table.
+            for (; nSrc < nPairSrc; ++nSrc)
+            {
+                if (nPairDst < nDstRows)
+                    m_aTrackedRows.push_back({ rDstLines[nPairDst], rSrcLines[nSrc], false });
+                else
+                    m_aTrackedRows.push_back({ rDstLines[nDstRows - 1], rSrcLines[nSrc], true });
+                bDiffers = true;
+            }
+            if (nPairDst < nDstTo)
+                aCompareRowCells(nPairDst, nPairSrc);
+            nDst = nPairDst + 1;
+            nSrc = nPairSrc + 1;
+        }
+        // The cells of a row with the same text are compared too, because the comparison of cells
+        // also sees the formatting, the nested tables and the paragraph RSIDs, which the text of a
+        // row does not.
+        if (nDstTo < nDstRows)
+            aCompareRowCells(nDstTo, nSrcTo);
+        nDstFrom = nDstTo + 1;
+        nSrcFrom = nSrcTo + 1;
+    }
+    return bDiffers;
+}
+
+bool CompareData::CompareCells( const CompareData& rData, const SwNode& rDstCell,
+                                const SwNode& rSrcCell )
+{
+    CompareSectionText aSrcCell(rData.m_rDoc, rSrcCell);
+    auto pDstCell = std::make_unique<CompareSectionText>(m_rDoc, rDstCell);
+    pDstCell->CompareLines(aSrcCell);
+    sal_uLong nChanges = pDstCell->ShowDiffs(aSrcCell);
+    nChanges += pDstCell->CompareFormatting();
+    if (!nChanges)
+        return false;
+    m_aCellComparisons.push_back(std::move(pDstCell));
+    return true;
+}
+
+void CompareData::KeepRangeInSection( SwPaM& rPaM )
+{
+    // #i65201#: A range that ends at the start of a paragraph was made one node shorter when it
+    // was recorded, so it is expanded again here.
+    if( rPaM.GetPoint()->GetContentIndex() == 0 )
+    {
+        rPaM.GetPoint()->Adjust(SwNodeOffset(1));
+    }
+    // #i101009#
+    // prevent redlines that end on structural end node
+    if (& GetEndOfContent() ==
+        & rPaM.GetPoint()->GetNode())
+    {
+        rPaM.GetPoint()->Adjust(SwNodeOffset(-1));
+        SwContentNode *const pContentNode( rPaM.GetPointContentNode() );
+        if( pContentNode )
+            rPaM.GetPoint()->SetContent( pContentNode->Len() );
+        // tdf#106218 try to avoid losing a paragraph break here:
+        if (rPaM.GetMark()->GetContentIndex() == 0)
+        {
+            SwNodeIndex const prev(rPaM.GetMark()->GetNode(), -1);
+            if (prev.GetNode().IsTextNode())
+            {
+                rPaM.GetMark()->Assign(
+                    *prev.GetNode().GetTextNode(),
+                    prev.GetNode().GetTextNode()->Len());
+            }
+        }
+    }
+}
+
+void CompareData::PrepareRedlineRanges()
+{
+    for (const auto& pCellComparison : m_aCellComparisons)
+        pCellComparison->PrepareRedlineRanges();
+
+    SwPaM* pTmp = m_pDelRing.get();
+    if( pTmp )
+    {
+        do {
+            KeepRangeInSection( *pTmp );
+        } while( m_pDelRing.get() != ( pTmp = pTmp->GetNext()) );
+    }
+
+    pTmp = m_pInsertRing.get();
+    if( !pTmp )
+        return;
+
+    do {
+        KeepRangeInSection( *pTmp );
+    } while( m_pInsertRing.get() != ( pTmp = pTmp->GetNext()) );
+
+    // combine consecutive
+    if( pTmp->GetNext() != m_pInsertRing.get() )
+    {
+        do {
+            // coverity[deref_arg] - the SwPaM delete moves a new entry into GetNext()
+            SwPosition& rSttEnd = *pTmp->End(),
+                      & rEndStt = *pTmp->GetNext()->Start();
+            const SwContentNode* pCNd;
+            if( rSttEnd == rEndStt ||
+                (!rEndStt.GetContentIndex() &&
+                rEndStt.GetNodeIndex() - 1 == rSttEnd.GetNodeIndex() &&
+                nullptr != ( pCNd = rSttEnd.GetNode().GetContentNode() ) &&
+                rSttEnd.GetContentIndex() == pCNd->Len()))
+            {
+                if( pTmp->GetNext() == m_pInsertRing.get() )
+                {
+                    // are consecutive, so combine
+                    rEndStt = *pTmp->Start();
+                    delete pTmp;
+                    pTmp = m_pInsertRing.get();
+                }
+                else
+                {
+                    // are consecutive, so combine
+                    rSttEnd = *pTmp->GetNext()->End();
+                    delete pTmp->GetNext();
+                }
+            }
+            else
+                pTmp = pTmp->GetNext();
+        } while( m_pInsertRing.get() != pTmp );
+    }
+}
+
+void CompareData::CollectRedlineRanges( vector<SwPaM*>& rDeletes, vector<SwPaM*>& rInserts,
+                                        vector<const TrackedRow*>& rRows )
+{
+    for (auto& [pRing, rRanges] : { std::pair(m_pDelRing.get(), &rDeletes),
+                                     std::pair(m_pInsertRing.get(), &rInserts) })
+    {
+        SwPaM* pTmp = pRing;
+        if (!pTmp)
+            continue;
+        do {
+            rRanges->push_back(pTmp);
+        } while (pRing != (pTmp = pTmp->GetNext()));
+    }
+
+    for (const TrackedRow& rRow : m_aTrackedRows)
+        rRows.push_back(&rRow);
+
+    for (const auto& pCellComparison : m_aCellComparisons)
+        pCellComparison->CollectRedlineRanges(rDeletes, rInserts, rRows);
+}
+
+const SwTableLine* CompareData::TrackDeletedRow( const SwTableLine& rAnchor, bool bBehind,
+                                                 const SwTableLine& rSrcLine,
+                                                 const SwRedlineData& rDeleteData )
+{
+    IDocumentRedlineAccess& rRedlineAccess = m_rDoc.getIDocumentRedlineAccess();
+    IDocumentUndoRedo& rUndoRedo = m_rDoc.GetIDocumentUndoRedo();
+    const RedlineFlags eOldFlags = rRedlineAccess.GetRedlineFlags();
+
+    // The new row is an ordinary empty row, and its undo action removes it again.
+    SwSelBoxes aBoxes;
+    for (SwTableBox* pBox : rAnchor.GetTabBoxes())
+        aBoxes.insert(pBox);
+    const SwTableLines& rLines = rAnchor.GetTabBoxes()[0]->GetSttNd()->FindTableNode()
+                                     ->GetTable().GetTabLines();
+    rRedlineAccess.SetRedlineFlags_intern(eOldFlags & ~RedlineFlags::On);
+    const bool bInserted = m_rDoc.InsertRow(aBoxes, 1, bBehind, /*bInsertDummy=*/false);
+    rRedlineAccess.SetRedlineFlags_intern(eOldFlags);
+    const sal_uInt16 nAnchorPos = bInserted ? rLines.GetPos(&rAnchor) : USHRT_MAX;
+    if (nAnchorPos == USHRT_MAX)
+    {
+        SAL_WARN("sw.core", "CompareData::TrackDeletedRow: no row to hold the deleted row");
+        return nullptr;
+    }
+    const SwTableLine* pLine = rLines[bBehind ? nAnchorPos + 1 : nAnchorPos - 1];
+
+    // The copied text joins the empty paragraph of each new cell. The undo actions of the tracked
+    // deletions remove the text again, so the copy has none of its own.
+    const SwTableBoxes& rBoxes = pLine->GetTabBoxes();
+    const SwTableBoxes& rSrcBoxes = rSrcLine.GetTabBoxes();
+    {
+        ::sw::UndoGuard const aUndoGuard(rUndoRedo);
+        rRedlineAccess.SetRedlineFlags_intern(eOldFlags & ~RedlineFlags::On);
+        for (size_t i = 0; i < rBoxes.size(); ++i)
+        {
+            if (rSrcBoxes[i]->IsEmpty(/*bWithRemainingNestedTable=*/false))
+                continue;
+            std::unique_ptr<SwPaM> pSrcRange = GetCellTextRange(*rSrcBoxes[i]);
+            SwPosition aInsPos(*rBoxes[i]->GetSttNd(), SwNodeOffset(1));
+            rSrcLine.GetFrameFormat()->GetDoc().GetDocumentContentOperationsManager().CopyRange(
+                *pSrcRange, aInsPos, SwCopyFlags::CheckPosInFly);
+        }
+        // A row without any text is tracked by an invisible character, as when a row is deleted
+        // while recording changes.
+        if (pLine->IsEmpty())
+        {
+            SwPaM aPaM(*rBoxes[0]->GetSttNd(), SwNodeOffset(1));
+            m_rDoc.getIDocumentContentOperations().InsertString(
+                aPaM, OUStringChar(CH_TXT_TRACKED_DUMMY_CHAR));
+        }
+        rRedlineAccess.SetRedlineFlags_intern(eOldFlags);
+    }
+
+    SetRowTracked(m_rDoc, *pLine, /*bInserted=*/false);
+
+    for (const SwTableBox* pBox : rBoxes)
+    {
+        if (pBox->IsEmpty(/*bWithRemainingNestedTable=*/false))
+            continue;
+        std::unique_ptr<SwPaM> pRange = GetCellTextRange(*pBox);
+        rRedlineAccess.DeleteRedline(*pRange, false, RedlineType::Any);
+        if (rUndoRedo.DoesUndo())
+            rUndoRedo.AppendUndo(std::make_unique<SwUndoCompDoc>(*pRange, false));
+        rRedlineAccess.AppendRedline(new SwRangeRedline(rDeleteData, *pRange), true);
+    }
+    return pLine;
+}
+
+void CompareData::TrackInsertedRow( const SwTableLine& rLine,
+                                    vector<std::unique_ptr<SwPaM>>& rRanges )
+{
+    // A row without any text is tracked by an invisible character, as when a row is inserted
+    // while recording changes. Undoing the compare removes the character again.
+    const SwTableBoxes& rBoxes = rLine.GetTabBoxes();
+    if (rLine.IsEmpty())
+    {
+        IDocumentRedlineAccess& rRedlineAccess = m_rDoc.getIDocumentRedlineAccess();
+        const RedlineFlags eOldFlags = rRedlineAccess.GetRedlineFlags();
+        rRedlineAccess.SetRedlineFlags_intern(eOldFlags & ~RedlineFlags::On);
+        SwPaM aPaM(*rBoxes[0]->GetSttNd(), SwNodeOffset(1));
+        m_rDoc.getIDocumentContentOperations().InsertString(
+            aPaM, OUStringChar(CH_TXT_TRACKED_DUMMY_CHAR));
+        rRedlineAccess.SetRedlineFlags_intern(eOldFlags);
+    }
+
+    SetRowTracked(m_rDoc, rLine, /*bInserted=*/true);
+
+    for (const SwTableBox* pBox : rBoxes)
+    {
+        if (!pBox->IsEmpty(/*bWithRemainingNestedTable=*/false))
+            rRanges.push_back(GetCellTextRange(*pBox));
+    }
+}
+
+void CompareData::SetRedlinesToDoc( bool bUseDocInfo,
+                                    o3tl::sorted_vector<const SwTextFootnote*>* pInsertedNotes )
+{
+    // get the Author / TimeStamp from the "other" document info
+    std::size_t nAuthor = m_rDoc.getIDocumentRedlineAccess().GetRedlineAuthor();
+    DateTime aTimeStamp( DateTime::SYSTEM );
+    SwDocShell *pDocShell(m_rDoc.GetDocShell());
+    OSL_ENSURE(pDocShell, "no SwDocShell");
+    if (pDocShell) {
+        uno::Reference<document::XDocumentPropertiesSupplier> xDPS(
+            pDocShell->GetModel(), uno::UNO_QUERY_THROW);
+        uno::Reference<document::XDocumentProperties> xDocProps(
+            xDPS->getDocumentProperties());
+        OSL_ENSURE(xDocProps.is(), "Doc has no DocumentProperties");
+
+        if( bUseDocInfo && xDocProps.is() ) {
+            OUString aTmp( 1 == xDocProps->getEditingCycles()
+                                ? xDocProps->getAuthor()
+                                : xDocProps->getModifiedBy() );
+            util::DateTime uDT( 1 == xDocProps->getEditingCycles()
+                                ? xDocProps->getCreationDate()
+                                : xDocProps->getModificationDate() );
+
+            if( !aTmp.isEmpty() )
+            {
+                nAuthor = m_rDoc.getIDocumentRedlineAccess().InsertRedlineAuthor( aTmp );
+                aTimeStamp = DateTime(uDT);
+            }
+        }
+    }
+
+    PrepareRedlineRanges();
+
+    // The undo actions hold node positions. The ranges of the cells are applied in document order
+    // together with the others, so undo, which goes in reverse order, finds each position as it
+    // was recorded.
+    // Tracking a row changes the nodes of the table too, so the tracked rows take part in the same
+    // order. A tracked row goes in front of the deletions inside the row next to it.
+    vector<SwPaM*> aDeletes, aInserts;
+    vector<const TrackedRow*> aRows;
+    CollectRedlineRanges(aDeletes, aInserts, aRows);
+    struct Step
+    {
+        SwPosition aPos;
+        SwPaM* pDelete;
+        const TrackedRow* pRow;
+    };
+    vector<Step> aSteps;
+    for (SwPaM* pTmp : aDeletes)
+        aSteps.push_back({ *pTmp->Start(), pTmp, nullptr });
+    for (const TrackedRow* pRow : aRows)
+    {
+        const SwTableBoxes& rBoxes = pRow->pDstLine->GetTabBoxes();
+        if (pRow->bBehind)
+            aSteps.push_back({ SwPosition(*rBoxes.back()->GetSttNd()->EndOfSectionNode()),
+                               nullptr, pRow });
+        else
+            aSteps.push_back({ SwPosition(*rBoxes.front()->GetSttNd()), nullptr, pRow });
+    }
+    std::stable_sort(aSteps.begin(), aSteps.end(),
+                     [](const Step& rA, const Step& rB) { return rA.aPos < rB.aPos; });
+
+    SwRedlineData aDeleteData( RedlineType::Delete, nAuthor, aTimeStamp, 0,
+                               OUString(), nullptr );
+    vector<std::unique_ptr<SwPaM>> aRowInserts;
+    // Several deleted rows behind the same row go one after the other.
+    const SwTableLine* pBehindAnchor = nullptr;
+    const SwTableLine* pBehindLast = nullptr;
+    for (const Step& rStep : aSteps)
+    {
+        if (const TrackedRow* pRow = rStep.pRow)
+        {
+            if (!pRow->pSrcLine)
+                TrackInsertedRow(*pRow->pDstLine, aRowInserts);
+            else if (pRow->bBehind)
+            {
+                const SwTableLine* pAnchor
+                    = pRow->pDstLine == pBehindAnchor ? pBehindLast : pRow->pDstLine;
+                pBehindLast = TrackDeletedRow(*pAnchor, true, *pRow->pSrcLine, aDeleteData);
+                pBehindAnchor = pBehindLast ? pRow->pDstLine : nullptr;
+            }
+            else
+                TrackDeletedRow(*pRow->pDstLine, false, *pRow->pSrcLine, aDeleteData);
+            continue;
+        }
+
+        SwPaM* pTmp = rStep.pDelete;
+        m_rDoc.getIDocumentRedlineAccess().DeleteRedline( *pTmp, false, RedlineType::Any );
+
+        if (m_rDoc.GetIDocumentUndoRedo().DoesUndo())
+        {
+            m_rDoc.GetIDocumentUndoRedo().AppendUndo(
+                std::make_unique<SwUndoCompDoc>( *pTmp, false ));
+        }
+        m_rDoc.getIDocumentRedlineAccess().AppendRedline(
+            new SwRangeRedline( aDeleteData, *pTmp ), true );
+    }
+
+    for (const auto& pRange : aRowInserts)
+        aInserts.push_back(pRange.get());
+    auto aByStart = [](const SwPaM* pA, const SwPaM* pB) { return *pA->Start() < *pB->Start(); };
+    std::stable_sort(aInserts.begin(), aInserts.end(), aByStart);
+
+    SwRedlineData aInsertData( RedlineType::Insert, nAuthor, aTimeStamp, 0,
+                               OUString(), nullptr );
+    for (SwPaM* pTmp : aInserts)
+    {
+        if (pInsertedNotes)
+            lcl_AddNotesInRange(*pTmp, *pInsertedNotes);
+        if (IDocumentRedlineAccess::AppendResult::APPENDED ==
+                m_rDoc.getIDocumentRedlineAccess().AppendRedline(
+                    new SwRangeRedline(aInsertData, *pTmp), true) &&
+            m_rDoc.GetIDocumentUndoRedo().DoesUndo())
+        {
+            m_rDoc.GetIDocumentUndoRedo().AppendUndo(
+                std::make_unique<SwUndoCompDoc>( *pTmp, true ));
+        }
+    }
+
+    AppendFormatRedlines( nAuthor, aTimeStamp );
+}
+
+typedef std::shared_ptr<CompareData> CompareDataPtr;
+typedef std::pair<CompareDataPtr, CompareDataPtr> CompareDataPtrPair;
+typedef std::vector<CompareDataPtrPair> Comparators;
+
+namespace
+{
+    const SwNodeIndex* getContentIndex(const SwFormatHeader& rHeader)
+    {
+        const SwFrameFormat* pFormat = rHeader.GetHeaderFormat();
+        if (!rHeader.IsActive() || !pFormat)
+            return nullptr;
+        return pFormat->GetContent().GetContentIdx();
+    }
+
+    const SwNodeIndex* getContentIndex(const SwFormatFooter& rFooter)
+    {
+        const SwFrameFormat* pFormat = rFooter.GetFooterFormat();
+        if (!rFooter.IsActive() || !pFormat)
+            return nullptr;
+        return pFormat->GetContent().GetContentIdx();
+    }
+
+    void addSectionComparator(Comparators& rComparisons, SwDoc& rSrcDoc,
+                              const SwNodeIndex& rSrcIndex, SwDoc& rDestDoc,
+                              const SwNodeIndex& rDestIndex)
+    {
+        if (rSrcIndex.GetNodes()[rSrcIndex.GetIndex() + 1]->IsNoTextNode()
+            || rDestIndex.GetNodes()[rDestIndex.GetIndex() + 1]->IsNoTextNode())
+        {
+            return; // tdf#125660 don't redline GrfNode/OLENode
+        }
+        rComparisons.emplace_back(
+            std::make_shared<CompareSectionText>(rSrcDoc, rSrcIndex.GetNode()),
+            std::make_shared<CompareSectionText>(rDestDoc, rDestIndex.GetNode()));
+    }
+
+    Comparators buildComparators(SwDoc &rSrcDoc, SwDoc &rDestDoc)
+    {
+        Comparators aComparisons;
+        auto addTextComparator = [&](const SwNodeIndex& rSrcIndex, const SwNodeIndex& rDestIndex)
+        {
+            addSectionComparator(aComparisons, rSrcDoc, rSrcIndex, rDestDoc, rDestIndex);
+        };
+
+        //compare main text
+        aComparisons.emplace_back(std::make_shared<CompareMainText>(rSrcDoc, true),
+                                  std::make_shared<CompareMainText>(rDestDoc, true));
+
+        //if we have the same number of frames then try to compare within them
+        const sw::SpzFrameFormats* pSrcFrameFormats = rSrcDoc.GetSpzFrameFormats();
+        const sw::SpzFrameFormats* pDestFrameFormats = rDestDoc.GetSpzFrameFormats();
+        if (pSrcFrameFormats->size() == pDestFrameFormats->size())
+        {
+            for(sw::FrameFormats<sw::SpzFrameFormat*>::size_type i = 0; i < pSrcFrameFormats->size(); ++i)
+            {
+                const sw::SpzFrameFormat& rSrcFormat = *(*pSrcFrameFormats)[i];
+                const sw::SpzFrameFormat& rDestFormat = *(*pDestFrameFormats)[i];
+                const SwNodeIndex* pSrcIdx = rSrcFormat.GetContent().GetContentIdx();
+                const SwNodeIndex* pDestIdx = rDestFormat.GetContent().GetContentIdx();
+                if (!pSrcIdx && !pDestIdx)
+                    continue;
+                if (!pSrcIdx || !pDestIdx)
+                    break;
+                const SwNode* pSrcNode = pSrcIdx->GetNode().EndOfSectionNode();
+                const SwNode* pDestNode = pDestIdx->GetNode().EndOfSectionNode();
+                if (!pSrcNode && !pDestNode)
+                    continue;
+                if (!pSrcNode || !pDestNode)
+                    break;
+                addTextComparator(*pSrcIdx, *pDestIdx);
+            }
+        }
+
+        // Pair headers and footers of the page styles in use by page style name. Shared content is
+        // compared only once.
+        o3tl::sorted_vector<const SwNode*> aComparedDestNodes;
+        auto addHeaderFooterComparator
+            = [&](const SwNodeIndex* pSrcIndex, const SwNodeIndex* pDestIndex)
+        {
+            if (!pSrcIndex || !pDestIndex)
+                return;
+            if (!aComparedDestNodes.insert(&pDestIndex->GetNode()).second)
+                return;
+            addTextComparator(*pSrcIndex, *pDestIndex);
+        };
+        for (size_t i = 0; i < rDestDoc.GetPageDescCnt(); ++i)
+        {
+            const SwPageDesc& rDestDesc = rDestDoc.GetPageDesc(i);
+            if (!rDestDesc.IsUsed())
+                continue;
+            const SwPageDesc* pSrcDesc = rSrcDoc.FindPageDesc(rDestDesc.GetName());
+            if (!pSrcDesc)
+                continue;
+            const std::pair<const SwFrameFormat*, const SwFrameFormat*> aFormats[] = {
+                { &pSrcDesc->GetMaster(), &rDestDesc.GetMaster() },
+                { &pSrcDesc->GetLeft(), &rDestDesc.GetLeft() },
+                { &pSrcDesc->GetFirstMaster(), &rDestDesc.GetFirstMaster() },
+                { &pSrcDesc->GetFirstLeft(), &rDestDesc.GetFirstLeft() },
+            };
+            for (const auto& [pSrcFormat, pDestFormat] : aFormats)
+            {
+                addHeaderFooterComparator(getContentIndex(pSrcFormat->GetHeader()),
+                                          getContentIndex(pDestFormat->GetHeader()));
+                addHeaderFooterComparator(getContentIndex(pSrcFormat->GetFooter()),
+                                          getContentIndex(pDestFormat->GetFooter()));
+            }
+        }
+        return aComparisons;
+    }
+
+    // The footnotes or the endnotes of rDoc in the order of their anchors.
+    vector<const SwTextFootnote*> getNotes(const SwDoc& rDoc, bool bEndNote)
+    {
+        vector<const SwTextFootnote*> aNotes;
+        for (const SwTextFootnote* pNote : rDoc.GetFootnoteIdxs())
+        {
+            if (pNote->GetFootnote().IsEndNote() == bEndNote && pNote->GetStartNode())
+                aNotes.push_back(pNote);
+        }
+        return aNotes;
+    }
+
+    // Pairs old notes with new notes whose anchors were deleted and inserted at the same place.
+    // Notes with the same text match, and between two matches the notes are paired in order
+    // when there are as many old notes as new ones.
+    void addReplacedNoteComparators(Comparators& rComparisons, SwDoc& rSrcDoc,
+                                    const vector<const SwNodeIndex*>& rSrcNotes, SwDoc& rDestDoc,
+                                    const vector<const SwNodeIndex*>& rDestNotes)
+    {
+        if (rSrcNotes.empty() || rDestNotes.empty())
+            return;
+        NoteArrayComparator aCmp(rSrcNotes, rDestNotes);
+        const int nMinLen = std::min(aCmp.GetLen1(), aCmp.GetLen2());
+        std::unique_ptr<int[]> pLcs1(new int[nMinLen]);
+        std::unique_ptr<int[]> pLcs2(new int[nMinLen]);
+        LgstCommonSubseq aSubseq(aCmp);
+        const int nLcsLen = aSubseq.Find(pLcs1.get(), pLcs2.get());
+        int nStt1 = 0, nStt2 = 0;
+        for (int i = 0; i <= nLcsLen; ++i)
+        {
+            const int nEnd1 = i < nLcsLen ? pLcs1[i] : aCmp.GetLen1();
+            const int nEnd2 = i < nLcsLen ? pLcs2[i] : aCmp.GetLen2();
+            if (nEnd1 - nStt1 == nEnd2 - nStt2)
+            {
+                for (int j = 0; j < nEnd1 - nStt1; ++j)
+                    addSectionComparator(rComparisons, rSrcDoc, *rSrcNotes[nStt1 + j], rDestDoc,
+                                         *rDestNotes[nStt2 + j]);
+            }
+            nStt1 = nEnd1 + 1;
+            nStt2 = nEnd2 + 1;
+        }
+    }
+
+    // Pairs the footnotes and the endnotes of the two documents by their anchors, once the main
+    // text has its tracked changes. rKeptNotes are the notes rDestDoc had before the comparison.
+    // rShownNotes are the notes in text that was already tracked as deleted. They were hidden
+    // during the comparison, so they have no old note. Any other note is a copy of an old note in
+    // deleted text. rInsertedNotes are the notes whose anchors the comparison tracked as inserted.
+    // So the old notes are, in order, the new notes that are in neither rShownNotes nor
+    // rInsertedNotes.
+    Comparators buildNoteComparators(SwDoc& rSrcDoc, SwDoc& rDestDoc,
+                                     const o3tl::sorted_vector<const SwTextFootnote*>& rKeptNotes,
+                                     const o3tl::sorted_vector<const SwTextFootnote*>& rShownNotes,
+                                     const o3tl::sorted_vector<const SwTextFootnote*>&
+                                         rInsertedNotes)
+    {
+        Comparators aComparisons;
+        for (bool bEndNote : { false, true })
+        {
+            const vector<const SwTextFootnote*> aSrcNotes = getNotes(rSrcDoc, bEndNote);
+            vector<const SwTextFootnote*> aDestNotes = getNotes(rDestDoc, bEndNote);
+            std::erase_if(aDestNotes, [&rShownNotes](const SwTextFootnote* pNote)
+                          { return rShownNotes.contains(pNote); });
+            vector<RedlineType> aAnchorTypes;
+            for (const SwTextFootnote* pNote : aDestNotes)
+            {
+                if (!rKeptNotes.contains(pNote))
+                    aAnchorTypes.push_back(RedlineType::Delete);
+                else if (rInsertedNotes.contains(pNote))
+                    aAnchorTypes.push_back(RedlineType::Insert);
+                else
+                    aAnchorTypes.push_back(RedlineType::None);
+            }
+            const size_t nInserted
+                = std::count(aAnchorTypes.begin(), aAnchorTypes.end(), RedlineType::Insert);
+            if (aDestNotes.size() - nInserted != aSrcNotes.size())
+            {
+                SAL_WARN("sw.core", "buildNoteComparators: the old notes do not match the anchors");
+                continue;
+            }
+
+            // The notes since the last kept anchor whose anchors are deleted or inserted.
+            vector<const SwNodeIndex*> aDeletedNotes, aInsertedNotes;
+            size_t nSrc = 0;
+            for (size_t i = 0; i <= aDestNotes.size(); ++i)
+            {
+                const RedlineType eType
+                    = i < aDestNotes.size() ? aAnchorTypes[i] : RedlineType::None;
+                if (eType == RedlineType::Insert)
+                {
+                    aInsertedNotes.push_back(aDestNotes[i]->GetStartNode());
+                    continue;
+                }
+                if (eType == RedlineType::Delete)
+                {
+                    aDeletedNotes.push_back(aSrcNotes[nSrc++]->GetStartNode());
+                    continue;
+                }
+                addReplacedNoteComparators(aComparisons, rSrcDoc, aDeletedNotes, rDestDoc,
+                                           aInsertedNotes);
+                aDeletedNotes.clear();
+                aInsertedNotes.clear();
+                if (i < aDestNotes.size())
+                    addSectionComparator(aComparisons, rSrcDoc, *aSrcNotes[nSrc++]->GetStartNode(),
+                                         rDestDoc, *aDestNotes[i]->GetStartNode());
+            }
+        }
+        return aComparisons;
+    }
+}
+
+// Returns (the difference count?) if something is different
+tools::Long SwDoc::CompareDoc( const SwDoc& rDoc )
+{
+    if( &rDoc == this )
+        return 0;
+
+    tools::Long nRet = 0;
+
+    // Get comparison options
+    SwModule* mod = SwModule::get();
+    CmpOptions.eCmpMode = mod->GetCompareMode();
+    if( CmpOptions.eCmpMode == SwCompareMode::Auto )
+    {
+        if( getRsidRoot() == rDoc.getRsidRoot() )
+        {
+            CmpOptions.eCmpMode = SwCompareMode::ByChar;
+            CmpOptions.bUseRsid = true;
+            CmpOptions.nIgnoreLen = 2;
+        }
+        else
+        {
+            CmpOptions.eCmpMode = SwCompareMode::ByWord;
+            CmpOptions.bUseRsid = false;
+            CmpOptions.nIgnoreLen = 3;
+        }
+    }
+    else
+    {
+        CmpOptions.bUseRsid = getRsidRoot() == rDoc.getRsidRoot() && mod->IsUseRsid();
+        CmpOptions.nIgnoreLen = mod->IsIgnorePieces() ? mod->GetPieceLen() : 0;
+    }
+    CmpOptions.bCompareFormatting = officecfg::Office::Writer::Comparison::CompareFormatting::get();
+
+    GetIDocumentUndoRedo().StartUndo(SwUndoId::EMPTY, nullptr);
+    bool bDocWasModified = getIDocumentState().IsModified();
+    SwDoc& rSrcDoc = const_cast<SwDoc&>(rDoc);
+    bool bSrcModified = rSrcDoc.getIDocumentState().IsModified();
+
+    RedlineFlags eSrcRedlMode = rSrcDoc.getIDocumentRedlineAccess().GetRedlineFlags();
+    rSrcDoc.getIDocumentRedlineAccess().SetRedlineFlags( RedlineFlags::ShowInsert );
+    getIDocumentRedlineAccess().SetRedlineFlags(RedlineFlags::On | RedlineFlags::ShowInsert);
+
+    auto compare = [&](const Comparators& rComparisons,
+                       o3tl::sorted_vector<const SwTextFootnote*>* pShownNotes,
+                       o3tl::sorted_vector<const SwTextFootnote*>* pInsertedNotes)
+    {
+        tools::Long nDiffs = 0;
+        for (auto& a : rComparisons)
+        {
+            CompareData& rD0 = *a.first;
+            CompareData& rD1 = *a.second;
+            rD1.CompareLines( rD0 );
+            nDiffs |= rD1.ShowDiffs( rD0 );
+            nDiffs |= rD1.CompareFormatting();
+        }
+
+        if( nDiffs )
+        {
+            // Showing the deletions puts the text that was deleted before back with new notes.
+            o3tl::sorted_vector<const SwTextFootnote*> aVisibleNotes;
+            if (pShownNotes)
+            {
+                for (const SwTextFootnote* pNote : GetFootnoteIdxs())
+                    aVisibleNotes.insert(pNote);
+            }
+            getIDocumentRedlineAccess().SetRedlineFlags(RedlineFlags::On |
+                           RedlineFlags::ShowInsert | RedlineFlags::ShowDelete);
+            if (pShownNotes)
+            {
+                for (const SwTextFootnote* pNote : GetFootnoteIdxs())
+                {
+                    if (!aVisibleNotes.contains(pNote))
+                        pShownNotes->insert(pNote);
+                }
+            }
+
+            for (auto& a : rComparisons)
+            {
+                CompareData& rD1 = *a.second;
+                rD1.SetRedlinesToDoc( !bDocWasModified, pInsertedNotes );
+            }
+        }
+        return nDiffs;
+    };
+
+    // The notes are paired by their anchors, which the comparison of the main text tracks.
+    o3tl::sorted_vector<const SwTextFootnote*> aKeptNotes;
+    for (const SwTextFootnote* pNote : GetFootnoteIdxs())
+        aKeptNotes.insert(pNote);
+    o3tl::sorted_vector<const SwTextFootnote*> aShownNotes, aInsertedNotes;
+    nRet |= compare(buildComparators(rSrcDoc, *this), &aShownNotes, &aInsertedNotes);
+    // The deletions in the main text stay shown, so the copies of the old notes stay in place.
+    nRet |= compare(buildNoteComparators(rSrcDoc, *this, aKeptNotes, aShownNotes, aInsertedNotes),
+                    nullptr, nullptr);
+    if( nRet )
+        getIDocumentState().SetModified();
+
+    rSrcDoc.getIDocumentRedlineAccess().SetRedlineFlags( eSrcRedlMode );
+    getIDocumentRedlineAccess().SetRedlineFlags(RedlineFlags::ShowInsert | RedlineFlags::ShowDelete);
+
+    if( !bSrcModified )
+        rSrcDoc.getIDocumentState().ResetModified();
+
+    GetIDocumentUndoRedo().EndUndo(SwUndoId::EMPTY, nullptr);
+
+    return nRet;
+}
+
+namespace
+{
+    struct SaveMergeRedline
+    {
+        const SwRangeRedline* pSrcRedl;
+        SwRangeRedline* pDestRedl;
+        SaveMergeRedline( const SwNode& rDstNd, const SwRangeRedline& rSrcRedl);
+        sal_uInt16 InsertRedline(SwPaM* pLastDestRedline);
+    };
+}
+
+SaveMergeRedline::SaveMergeRedline( const SwNode& rDstNd,
+                        const SwRangeRedline& rSrcRedl)
+    : pSrcRedl( &rSrcRedl )
+{
+    SwPosition aPos( rDstNd );
+
+    const SwPosition* pStart = rSrcRedl.Start();
+    if( rDstNd.IsContentNode() )
+        aPos.SetContent( pStart->GetContentIndex() );
+    pDestRedl = new SwRangeRedline( rSrcRedl.GetRedlineData(), aPos );
+
+    if( RedlineType::Delete != pDestRedl->GetType() )
+        return;
+
+    // mark the area as deleted
+    const SwPosition* pEnd = rSrcRedl.End();
+
+    pDestRedl->SetMark();
+    pDestRedl->GetPoint()->Adjust( pEnd->GetNodeIndex() -
+                                    pStart->GetNodeIndex() );
+    if( pDestRedl->GetPointContentNode() )
+        pDestRedl->GetPoint()->SetContent( pEnd->GetContentIndex() );
+}
+
+sal_uInt16 SaveMergeRedline::InsertRedline(SwPaM* pLastDestRedline)
+{
+    sal_uInt16 nIns = 0;
+    SwDoc& rDoc = pDestRedl->GetDoc();
+
+    if( RedlineType::Insert == pDestRedl->GetType() )
+    {
+        // the part was inserted so copy it from the SourceDoc
+        ::sw::UndoGuard const undoGuard(rDoc.GetIDocumentUndoRedo());
+
+        SwNodeIndex aSaveNd( pDestRedl->GetPoint()->GetNode(), -1 );
+        const sal_Int32 nSaveCnt = pDestRedl->GetPoint()->GetContentIndex();
+
+        RedlineFlags eOld = rDoc.getIDocumentRedlineAccess().GetRedlineFlags();
+        rDoc.getIDocumentRedlineAccess().SetRedlineFlags_intern(eOld | RedlineFlags::Ignore);
+
+        pSrcRedl->GetDoc().getIDocumentContentOperations().CopyRange(
+                *const_cast<SwPaM*>(static_cast<const SwPaM*>(pSrcRedl)),
+                *pDestRedl->GetPoint(), SwCopyFlags::CheckPosInFly);
+
+        rDoc.getIDocumentRedlineAccess().SetRedlineFlags_intern( eOld );
+
+        pDestRedl->SetMark();
+        ++aSaveNd;
+        pDestRedl->GetMark()->Assign( aSaveNd, nSaveCnt );
+
+        if( pLastDestRedline && *pLastDestRedline->GetPoint() == *pDestRedl->GetPoint() )
+            *pLastDestRedline->GetPoint() = *pDestRedl->GetMark();
+    }
+    else
+    {
+        //JP 21.09.98: Bug 55909
+        // If there already is a deleted or inserted one at the same position, we have to split it!
+        SwPosition* pDStt = pDestRedl->GetMark(),
+                  * pDEnd = pDestRedl->GetPoint();
+        SwRedlineTable::size_type n = 0;
+
+            // find the first redline for StartPos
+        if (!rDoc.getIDocumentRedlineAccess().GetRedline( *pDStt, &n ) && n > 0)
+            --n;
+
+        const SwRedlineTable& rRedlineTable = rDoc.getIDocumentRedlineAccess().GetRedlineTable();
+        for( ; n < rRedlineTable.size(); ++n )
+        {
+            SwRangeRedline* pRedl = rRedlineTable[ n ];
+            auto [pRStt, pREnd] = pRedl->StartEnd();
+            if( RedlineType::Delete == pRedl->GetType() ||
+                RedlineType::Insert == pRedl->GetType() )
+            {
+                SwComparePosition eCmpPos = ComparePosition( *pDStt, *pDEnd, *pRStt, *pREnd );
+                switch( eCmpPos )
+                {
+                case SwComparePosition::CollideStart:
+                case SwComparePosition::Behind:
+                    break;
+
+                case SwComparePosition::Inside:
+                case SwComparePosition::Equal:
+                    delete pDestRedl;
+                    pDestRedl = nullptr;
+                    [[fallthrough]];
+
+                case SwComparePosition::CollideEnd:
+                case SwComparePosition::Before:
+                    n = rRedlineTable.size();
+                    break;
+
+                case SwComparePosition::Outside:
+                    assert(pDestRedl && "is this actually impossible");
+                    if (pDestRedl)
+                    {
+                        SwRangeRedline* pCpyRedl = new SwRangeRedline(
+                            pDestRedl->GetRedlineData(), *pDStt );
+                        pCpyRedl->SetMark();
+                        *pCpyRedl->GetPoint() = *pRStt;
+
+                        std::unique_ptr<SwUndoCompDoc> pUndo;
+                        if (rDoc.GetIDocumentUndoRedo().DoesUndo())
+                            pUndo.reset(new SwUndoCompDoc( *pCpyRedl ));
+
+                        // now modify doc: append redline, undo (and count)
+                        rDoc.getIDocumentRedlineAccess().AppendRedline( pCpyRedl, true );
+                        if( pUndo )
+                        {
+                            rDoc.GetIDocumentUndoRedo().AppendUndo(std::move(pUndo));
+                        }
+                        ++nIns;
+
+                        *pDStt = *pREnd;
+
+                        // we should start over now
+                        n = SwRedlineTable::npos;
+                    }
+                    break;
+
+                case SwComparePosition::OverlapBefore:
+                    *pDEnd = *pRStt;
+                    break;
+
+                case SwComparePosition::OverlapBehind:
+                    *pDStt = *pREnd;
+                    break;
+                }
+            }
+            else if( *pDEnd <= *pRStt )
+                break;
+        }
+
+    }
+
+    if( pDestRedl )
+    {
+        std::unique_ptr<SwUndoCompDoc> pUndo;
+        if (rDoc.GetIDocumentUndoRedo().DoesUndo())
+            pUndo.reset(new SwUndoCompDoc( *pDestRedl ));
+
+        // now modify doc: append redline, undo (and count)
+        IDocumentRedlineAccess::AppendResult const result(
+            rDoc.getIDocumentRedlineAccess().AppendRedline(pDestRedl, true));
+        if( pUndo )
+        {
+            rDoc.GetIDocumentUndoRedo().AppendUndo( std::move(pUndo) );
+        }
+        ++nIns;
+
+        // if AppendRedline has deleted our redline, we may not keep a
+        // reference to it
+        if (IDocumentRedlineAccess::AppendResult::APPENDED != result)
+            pDestRedl = nullptr;
+    }
+    return nIns;
+}
+
+/// Merge two documents
+tools::Long SwDoc::MergeDoc( const SwDoc& rDoc )
+{
+    if( &rDoc == this )
+        return 0;
+
+    tools::Long nRet = 0;
+
+    GetIDocumentUndoRedo().StartUndo(SwUndoId::EMPTY, nullptr);
+
+    SwDoc& rSrcDoc = const_cast<SwDoc&>(rDoc);
+    bool bSrcModified = rSrcDoc.getIDocumentState().IsModified();
+
+    RedlineFlags eSrcRedlMode = rSrcDoc.getIDocumentRedlineAccess().GetRedlineFlags();
+    rSrcDoc.getIDocumentRedlineAccess().SetRedlineFlags( RedlineFlags::ShowDelete );
+    getIDocumentRedlineAccess().SetRedlineFlags( RedlineFlags::ShowDelete );
+
+    CompareMainText aD0(rSrcDoc, false);
+    CompareMainText aD1(*this, false);
+    aD1.CompareLines( aD0 );
+    if( !aD1.HasDiffs( aD0 ) )
+    {
+        // we want to get all redlines from the SourceDoc
+
+        // look for all insert redlines from the SourceDoc and determine their position in the DestDoc
+        std::vector<SaveMergeRedline> vRedlines;
+        const SwRedlineTable& rSrcRedlTable = rSrcDoc.getIDocumentRedlineAccess().GetRedlineTable();
+        SwNodeOffset nEndOfExtra = rSrcDoc.GetNodes().GetEndOfExtras().GetIndex();
+        SwNodeOffset nMyEndOfExtra = GetNodes().GetEndOfExtras().GetIndex();
+        for(const SwRangeRedline* pRedl : rSrcRedlTable)
+        {
+            SwNodeOffset nNd = pRedl->GetPoint()->GetNodeIndex();
+            RedlineType eType = pRedl->GetType();
+            if( nEndOfExtra < nNd &&
+                ( RedlineType::Insert == eType || RedlineType::Delete == eType ))
+            {
+                const SwNode* pDstNd = GetNodes()[
+                                        nMyEndOfExtra + nNd - nEndOfExtra ];
+
+                // Found the position.
+                // Then we also have to insert the redline to the line in the DestDoc.
+                vRedlines.emplace_back(*pDstNd, *pRedl);
+            }
+        }
+
+        if( !vRedlines.empty() )
+        {
+            // Carry over all into DestDoc
+            rSrcDoc.getIDocumentRedlineAccess().SetRedlineFlags(RedlineFlags::ShowInsert | RedlineFlags::ShowDelete);
+
+            getIDocumentRedlineAccess().SetRedlineFlags(
+                                      RedlineFlags::On |
+                                      RedlineFlags::ShowInsert |
+                                      RedlineFlags::ShowDelete);
+
+            SwPaM* pLastDestRedline(nullptr);
+            for(SaveMergeRedline& rRedline: vRedlines)
+            {
+                nRet += rRedline.InsertRedline(pLastDestRedline);
+                pLastDestRedline = rRedline.pDestRedl;
+            }
+        }
+    }
+
+    rSrcDoc.getIDocumentRedlineAccess().SetRedlineFlags( eSrcRedlMode );
+    if( !bSrcModified )
+        rSrcDoc.getIDocumentState().ResetModified();
+
+    getIDocumentRedlineAccess().SetRedlineFlags(RedlineFlags::ShowInsert | RedlineFlags::ShowDelete);
+
+    GetIDocumentUndoRedo().EndUndo(SwUndoId::EMPTY, nullptr);
+
+    return nRet;
+}
+
+LineArrayComparator::LineArrayComparator( const CompareData &rD1,
+                                            const CompareData &rD2, int nStt1,
+                                            int nEnd1, int nStt2, int nEnd2 )
+    : m_rData1( rD1 ), m_rData2( rD2 ), m_nFirst1( nStt1 ), m_nFirst2( nStt2 )
+{
+    m_nLen1 = nEnd1 - nStt1;
+    m_nLen2 = nEnd2 - nStt2;
+}
+
+bool RowArrayComparator::Compare( int nIdx1, int nIdx2 ) const
+{
+    if( nIdx1 < 0 || nIdx2 < 0 || nIdx1 >= m_nLen1 || nIdx2 >= m_nLen2 )
+    {
+        SAL_WARN("sw.core", "RowArrayComparator::Compare: index out of range");
+        return false;
+    }
+
+    const RowTexts& rRow1 = m_rRows1[m_nFirst1 + nIdx1];
+    const RowTexts& rRow2 = m_rRows2[m_nFirst2 + nIdx2];
+    if (!m_bSimilar)
+        return rRow1.aCells == rRow2.aCells;
+
+    const size_t nCells = rRow1.aCells.size();
+    // Only the cells with words in either row count for similar rows. A column that is empty in
+    // both rows says nothing about whether the rows are two versions of one row.
+    size_t nTextCells = 0, nEqualTextCells = 0, nCommonWords = 0, nWords = 0;
+    for (size_t i = 0; i < nCells; ++i)
+    {
+        const bool bEqual = rRow1.aCells[i] == rRow2.aCells[i];
+        if (!rRow1.aCellWords[i].empty() || !rRow2.aCellWords[i].empty())
+        {
+            ++nTextCells;
+            if (bEqual)
+                ++nEqualTextCells;
+        }
+        nCommonWords += CountCommonWords(rRow1.aCellWords[i], rRow2.aCellWords[i]);
+        nWords += rRow1.aCellWords[i].size() + rRow2.aCellWords[i].size();
+    }
+    // Each shared word is in both rows, so 2 * nCommonWords of the nWords words are shared.
+    return (nTextCells > 0 && 2 * nEqualTextCells >= nTextCells)
+           || 2 * (2 * nCommonWords) >= nWords;
+}
+
+bool NoteArrayComparator::Compare( int nIdx1, int nIdx2 ) const
+{
+    if( nIdx1 < 0 || nIdx2 < 0 || nIdx1 >= GetLen1() || nIdx2 >= GetLen2() )
+    {
+        SAL_WARN("sw.core", "NoteArrayComparator::Compare: index out of range");
+        return false;
+    }
+
+    const SwNode& rStart1 = m_rNotes1[nIdx1]->GetNode();
+    const SwNode& rStart2 = m_rNotes2[nIdx2]->GetNode();
+    const SwNodeOffset nLen = rStart1.EndOfSectionIndex() - rStart1.GetIndex();
+    if (nLen != rStart2.EndOfSectionIndex() - rStart2.GetIndex())
+        return false;
+
+    const SwNodes& rNodes1 = rStart1.GetNodes();
+    const SwNodes& rNodes2 = rStart2.GetNodes();
+    SwNodeOffset nOffset(1);
+    while (nOffset < nLen)
+    {
+        const SwNode& rNode1 = *rNodes1[rStart1.GetIndex() + nOffset];
+        const SwNode& rNode2 = *rNodes2[rStart2.GetIndex() + nOffset];
+        if (!SwCompareLine::CompareNode(rNode2, rNode1))
+            return false;
+        // A table is compared as a whole, and equal tables have the same number of nodes.
+        if (rNode1.IsTableNode())
+            nOffset += rNode1.EndOfSectionIndex() - rNode1.GetIndex();
+        ++nOffset;
+    }
+    return true;
+}
+
+bool LineArrayComparator::Compare( int nIdx1, int nIdx2 ) const
+{
+    if( nIdx1 < 0 || nIdx2 < 0 || nIdx1 >= m_nLen1 || nIdx2 >= m_nLen2 )
+    {
+        OSL_ENSURE( false, "Index out of range!" );
+        return false;
+    }
+
+    const SwNode& rNode1 = m_rData1.GetLine( m_nFirst1 + nIdx1 ).GetNode();
+    const SwNode& rNode2 = m_rData2.GetLine( m_nFirst2 + nIdx2 ).GetNode();
+    if (rNode1.IsTableNode() && rNode2.IsTableNode())
+        return IsSimilarTable(*rNode1.GetTableNode(), *rNode2.GetTableNode(), m_aTableTexts);
+
+    const SwTextNode *pTextNd1 = rNode1.GetTextNode();
+    const SwTextNode *pTextNd2 = rNode2.GetTextNode();
+
+    if( !pTextNd1 || !pTextNd2
+        || ( CmpOptions.bUseRsid && !pTextNd1->CompareParRsid( *pTextNd2 ) ) )
+    {
+        return false;
+    }
+
+    const sal_Int32 nPar1Len = pTextNd1->Len();
+    const sal_Int32 nPar2Len = pTextNd2->Len();
+
+    if( std::min( nPar1Len, nPar2Len ) * 3 < std::max( nPar1Len, nPar2Len ) )
+    {
+        return false;
+    }
+
+    sal_Int32 nBorderLen = ( nPar1Len + nPar2Len )/16;
+
+    if( nBorderLen < 3 )
+    {
+        nBorderLen = std::min<sal_Int32>( 3, std::min( nPar1Len, nPar2Len ) );
+    }
+
+    std::set<unsigned> aHashes;
+    unsigned nHash = 0;
+    unsigned nMul = 251;
+    unsigned nPow = 1;
+    sal_Int32 i;
+
+    for( i = 0; i < nBorderLen - 1; i++ )
+    {
+        nPow *= nMul;
+    }
+    for( i = 0; i < nBorderLen; i++ )
+    {
+        nHash = nHash*nMul + pTextNd1->GetText()[i];
+    }
+    aHashes.insert( nHash );
+    for( ; i < nPar1Len; i++ )
+    {
+        nHash = nHash - nPow*pTextNd1->GetText()[ i - nBorderLen ];
+        nHash = nHash*nMul + pTextNd1->GetText()[ i ];
+
+        aHashes.insert( nHash );
+    }
+
+    nHash = 0;
+    for( i = 0; i < nBorderLen; i++ )
+    {
+        nHash = nHash*nMul + pTextNd2->GetText()[ i ];
+    }
+
+    if( aHashes.find( nHash ) != aHashes.end() )
+    {
+        return true;
+    }
+
+    for( ; i < nPar2Len; i++ )
+    {
+        nHash = nHash - nPow*pTextNd2->GetText()[ i - nBorderLen ];
+        nHash = nHash*nMul + pTextNd2->GetText()[ i ];
+        if( aHashes.find( nHash ) != aHashes.end() )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CharArrayComparator::Compare( int nIdx1, int nIdx2 ) const
+{
+    if( nIdx1 < 0 || nIdx2 < 0 || nIdx1 >= GetLen1() || nIdx2 >= GetLen2() )
+    {
+        OSL_ENSURE( false, "Index out of range!" );
+        return false;
+    }
+
+    return ( !CmpOptions.bUseRsid
+            || m_pTextNode1->CompareRsid(  *m_pTextNode2, nIdx1 + 1, nIdx2 + 1 ) )
+            && m_pTextNode1->GetText()[ nIdx1 ] == m_pTextNode2->GetText()[ nIdx2 ];
+}
+
+WordArrayComparator::WordArrayComparator( const SwTextNode *pNode1,
+                                            const SwTextNode *pNode2 )
+    : m_pTextNode1( pNode1 ), m_pTextNode2( pNode2 )
+{
+    m_pPos1.reset( new int[ m_pTextNode1->GetText().getLength() + 1 ] );
+    m_pPos2.reset( new int[ m_pTextNode2->GetText().getLength() + 1 ] );
+
+    CalcPositions( m_pPos1.get(), m_pTextNode1, m_nCount1 );
+    CalcPositions( m_pPos2.get(), m_pTextNode2, m_nCount2 );
+}
+
+bool WordArrayComparator::Compare( int nIdx1, int nIdx2 ) const
+{
+    int nLen = m_pPos1[ nIdx1 + 1 ] - m_pPos1[ nIdx1 ];
+    if( nLen != m_pPos2[ nIdx2 + 1 ] - m_pPos2[ nIdx2 ] )
+    {
+        return false;
+    }
+    for( int i = 0; i < nLen; i++)
+    {
+        if( m_pTextNode1->GetText()[ m_pPos1[ nIdx1 ] + i ]
+            != m_pTextNode2->GetText()[ m_pPos2[ nIdx2 ] + i ]
+            || ( CmpOptions.bUseRsid && !m_pTextNode1->CompareRsid( *m_pTextNode2,
+                                m_pPos1[ nIdx1 ] + i, m_pPos2[ nIdx2 ] + i ) ) )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+int WordArrayComparator::GetCharSequence( const int *pWordLcs1,
+            const int *pWordLcs2, int *pSubseq1, int *pSubseq2, int nLcsLen )
+{
+    int nLen = 0;
+    for( int i = 0; i < nLcsLen; i++ )
+    {
+        // Check for hash collisions
+        if( m_pPos1[ pWordLcs1[i] + 1 ] - m_pPos1[ pWordLcs1[i] ]
+            != m_pPos2[ pWordLcs2[i] + 1 ] - m_pPos2[ pWordLcs2[i] ] )
+        {
+            continue;
+        }
+        for( int j = 0; j < m_pPos1[pWordLcs1[i]+1] - m_pPos1[pWordLcs1[i]]; j++)
+        {
+            pSubseq1[ nLen ] = m_pPos1[ pWordLcs1[i] ] + j;
+            pSubseq2[ nLen ] = m_pPos2[ pWordLcs2[i] ] + j;
+
+            if( m_pTextNode1->GetText()[ m_pPos1[ pWordLcs1[i] ] + j ]
+             != m_pTextNode2->GetText()[ m_pPos2[ pWordLcs2[i] ] + j ] )
+            {
+                nLen -= j;
+                break;
+            }
+
+            nLen++;
+        }
+    }
+    return nLen;
+}
+
+void WordArrayComparator::CalcPositions( int *pPos, const SwTextNode *pTextNd,
+                                         int &nCnt )
+{
+    nCnt = -1;
+    for (int i = 0; i <= pTextNd->GetText().getLength(); ++i)
+    {
+        if (i == 0 || i == pTextNd->GetText().getLength()
+                    || !rtl::isAsciiAlphanumeric( pTextNd->GetText()[ i - 1 ])
+                    || !rtl::isAsciiAlphanumeric( pTextNd->GetText()[ i ]))
+        { // Begin new word
+            nCnt++;
+            pPos[ nCnt ] = i;
+        }
+    }
+}
+
+int CommonSubseq::FindLCS( int *pLcs1, int *pLcs2, int nStt1, int nEnd1,
+                                                    int nStt2, int nEnd2 )
+{
+    int nLen1 = nEnd1 ? nEnd1 - nStt1 : m_rComparator.GetLen1();
+    int nLen2 = nEnd2 ? nEnd2 - nStt2 : m_rComparator.GetLen2();
+
+    assert( nLen1 >= 0 );
+    assert( nLen2 >= 0 );
+
+    std::unique_ptr<int*[]> pLcs( new int*[ nLen1 + 1 ] );
+    pLcs[ 0 ] = m_pData.get();
+
+    for( int i = 1; i < nLen1 + 1; i++ )
+        pLcs[ i ] = pLcs[ i - 1 ] + nLen2 + 1;
+
+    for( int i = 0; i <= nLen1; i++ )
+        pLcs[i][0] = 0;
+
+    for( int j = 0; j <= nLen2; j++ )
+        pLcs[0][j] = 0;
+
+    // Find lcs
+    for( int i = 1; i <= nLen1; i++ )
+    {
+        for( int j = 1; j <= nLen2; j++ )
+        {
+            if( m_rComparator.Compare( nStt1 + i - 1, nStt2 + j - 1 ) )
+                pLcs[i][j] = pLcs[i - 1][j - 1] + 1;
+            else
+                pLcs[i][j] = std::max( pLcs[i][j - 1], pLcs[i - 1][j] );
+        }
+    }
+
+    int nLcsLen = pLcs[ nLen1 ][ nLen2 ];
+
+    // Recover the lcs in the two sequences
+    if( pLcs1 && pLcs2 )
+    {
+        int nIdx1 = nLen1;
+        int nIdx2 = nLen2;
+        int nIdx = nLcsLen - 1;
+
+        while( nIdx1 > 0 && nIdx2 > 0 )
+        {
+            if( pLcs[ nIdx1 ][ nIdx2 ] == pLcs[ nIdx1 - 1 ][ nIdx2 ] )
+                nIdx1--;
+            else if( pLcs[ nIdx1 ][ nIdx2 ] == pLcs[ nIdx1 ][ nIdx2 - 1 ] )
+                nIdx2--;
+            else
+            {
+                nIdx1--;
+                nIdx2--;
+                pLcs1[ nIdx ] = nIdx1 + nStt1;
+                pLcs2[ nIdx ] = nIdx2 + nStt2;
+                nIdx--;
+            }
+        }
+    }
+
+    return nLcsLen;
+}
+
+int CommonSubseq::IgnoreIsolatedPieces( int *pLcs1, int *pLcs2, int nLen1,
+                                        int nLen2, int nLcsLen, int nPieceLen )
+{
+    if( !nLcsLen )
+    {
+        return 0;
+    }
+
+    int nNext = 0;
+
+    // Don't ignore text at the beginning of the paragraphs
+    if( pLcs1[ 0 ] == 0 && pLcs2[ 0 ] == 0 )
+    {
+        while( nNext < nLcsLen - 1 && pLcs1[ nNext ] + 1 == pLcs1[ nNext + 1 ]
+                                && pLcs2[ nNext ] + 1 == pLcs2[ nNext + 1 ] )
+        {
+            nNext++;
+        }
+        nNext++;
+    }
+
+    int nCnt = 1;
+
+    for( int i = nNext; i < nLcsLen; i++ )
+    {
+        if( i != nLcsLen - 1 && pLcs1[ i ] + 1 == pLcs1[ i + 1 ]
+                            && pLcs2[ i ] + 1 == pLcs2[ i + 1 ] )
+        {
+            nCnt++;
+        }
+        else
+        {
+            if( nCnt > nPieceLen
+                // Don't ignore text at the end of the paragraphs
+                || ( i == nLcsLen - 1
+                && pLcs1[i] == nLen1 - 1 && pLcs2[i] == nLen2 - 1 ))
+            {
+                for( int j = i + 1 - nCnt; j <= i; j++ )
+                {
+                    pLcs2[ nNext ] = pLcs2[ j ];
+                    pLcs1[ nNext ] = pLcs1[ j ];
+                    nNext++;
+                }
+            }
+            nCnt = 1;
+        }
+    }
+
+    return nNext;
+}
+
+LgstCommonSubseq::LgstCommonSubseq( ArrayComparator &rComparator )
+    : CommonSubseq( rComparator, CUTOFF )
+{
+    m_pBuff1.reset( new int[ rComparator.GetLen2() + 1 ] );
+    m_pBuff2.reset( new int[ rComparator.GetLen2() + 1 ] );
+
+    m_pL1.reset( new int[ rComparator.GetLen2() + 1 ] );
+    m_pL2.reset( new int[ rComparator.GetLen2() + 1 ] );
+}
+
+void LgstCommonSubseq::FindL( int *pL, int nStt1, int nEnd1,
+                                        int nStt2, int nEnd2  )
+{
+    int nLen1 = nEnd1 ? nEnd1 - nStt1 : m_rComparator.GetLen1();
+    int nLen2 = nEnd2 ? nEnd2 - nStt2 : m_rComparator.GetLen2();
+
+    int *currL = m_pBuff1.get();
+    int *prevL = m_pBuff2.get();
+
+    // Avoid memory corruption
+    if( nLen2 > m_rComparator.GetLen2() )
+    {
+        assert( false );
+        return;
+    }
+
+    memset( m_pBuff1.get(), 0, sizeof( m_pBuff1[0] ) * ( nLen2 + 1 ) );
+    memset( m_pBuff2.get(), 0, sizeof( m_pBuff2[0] ) * ( nLen2 + 1 ) );
+
+    // Find lcs
+    for( int i = 1; i <= nLen1; i++ )
+    {
+        for( int j = 1; j <= nLen2; j++ )
+        {
+            if( m_rComparator.Compare( nStt1 + i - 1, nStt2 + j - 1 ) )
+                currL[j] = prevL[j - 1] + 1;
+            else
+                currL[j] = std::max( currL[j - 1], prevL[j] );
+        }
+        std::swap( currL, prevL );
+    }
+    memcpy( pL, prevL, ( nLen2 + 1 ) * sizeof( *prevL ) );
+}
+
+int LgstCommonSubseq::HirschbergLCS( int *pLcs1, int *pLcs2, int nStt1,
+                                    int nEnd1, int nStt2, int nEnd2 )
+{
+    static int nLen1;
+    static int nLen2;
+    nLen1 = nEnd1 - nStt1;
+    nLen2 = nEnd2 - nStt2;
+
+    if( ( nLen1 + 1 ) * ( nLen2 + 1 ) <= CUTOFF )
+    {
+        if( !nLen1 || !nLen2 )
+        {
+            return 0;
+        }
+        return FindLCS(pLcs1, pLcs2, nStt1, nEnd1, nStt2, nEnd2);
+    }
+
+    int nMid = nLen1/2;
+
+    FindL( m_pL1.get(), nStt1, nStt1 + nMid, nStt2, nEnd2 );
+    FindL( m_pL2.get(), nStt1 + nMid, nEnd1, nStt2, nEnd2 );
+
+    int nMaxPos = 0;
+    static int nMaxVal;
+    nMaxVal = -1;
+
+    static int i;
+    for( i = 0; i <= nLen2; i++ )
+    {
+        if( m_pL1[i] + ( m_pL2[nLen2] - m_pL2[i] ) > nMaxVal )
+        {
+            nMaxPos = i;
+            nMaxVal = m_pL1[i]+( m_pL2[nLen2] - m_pL2[i] );
+        }
+    }
+
+    int nRet = HirschbergLCS( pLcs1, pLcs2, nStt1, nStt1 + nMid,
+                                            nStt2, nStt2 + nMaxPos );
+    nRet += HirschbergLCS( pLcs1 + nRet, pLcs2 + nRet, nStt1 + nMid, nEnd1,
+                                                    nStt2 + nMaxPos, nEnd2 );
+
+    return nRet;
+}
+
+int LgstCommonSubseq::Find( int *pSubseq1, int *pSubseq2 )
+{
+    int nStt = 0;
+    int nCutEnd = 0;
+    int nEnd1 = m_rComparator.GetLen1();
+    int nEnd2 = m_rComparator.GetLen2();
+
+    // Check for corresponding lines in the beginning of the sequences
+    while( nStt < nEnd1 && nStt < nEnd2 && m_rComparator.Compare( nStt, nStt ) )
+    {
+        pSubseq1[ nStt ] = nStt;
+        pSubseq2[ nStt ] = nStt;
+        nStt++;
+    }
+
+    pSubseq1 += nStt;
+    pSubseq2 += nStt;
+
+    // Check for corresponding lines in the end of the sequences
+    while( nStt < nEnd1 && nStt < nEnd2
+                        && m_rComparator.Compare( nEnd1 - 1, nEnd2 - 1 ) )
+    {
+        nCutEnd++;
+        nEnd1--;
+        nEnd2--;
+    }
+
+    int nLen = HirschbergLCS( pSubseq1, pSubseq2, nStt, nEnd1, nStt, nEnd2 );
+
+    for( int i = 0; i < nCutEnd; i++ )
+    {
+        pSubseq1[ nLen + i ] = nEnd1 + i;
+        pSubseq2[ nLen + i ] = nEnd2 + i;
+    }
+
+    return nStt + nLen + nCutEnd;
+}
+
+int FastCommonSubseq::FindFastCS( int *pSeq1, int *pSeq2, int nStt1,
+                                    int nEnd1, int nStt2, int nEnd2  )
+{
+    int nCutBeg = 0;
+    int nCutEnd = 0;
+
+    // Check for corresponding lines in the beginning of the sequences
+    while( nStt1 < nEnd1 && nStt2 < nEnd2 && m_rComparator.Compare( nStt1, nStt2 ) )
+    {
+        pSeq1[ nCutBeg ] = nStt1++;
+        pSeq2[ nCutBeg ] = nStt2++;
+        nCutBeg++;
+    }
+
+    pSeq1 += nCutBeg;
+    pSeq2 += nCutBeg;
+
+    // Check for corresponding lines in the end of the sequences
+    while( nStt1 < nEnd1 && nStt2 < nEnd2
+                        && m_rComparator.Compare( nEnd1 - 1, nEnd2 - 1 ) )
+    {
+        nCutEnd++;
+        nEnd1--;
+        nEnd2--;
+    }
+
+    int nLen1 = nEnd1 - nStt1;
+    int nLen2 = nEnd2 - nStt2;
+
+    // Return if a sequence is empty
+    if( nLen1 <= 0 || nLen2 <= 0 )
+    {
+        for( int i = 0; i < nCutEnd; i++ )
+        {
+            pSeq1[ i ] = nEnd1 + i;
+            pSeq2[ i ] = nEnd2 + i;
+        }
+        return nCutBeg + nCutEnd;
+    }
+
+    // Cut to LCS for small values
+    if( nLen1 < 3 || nLen2 < 3 || ( nLen1 + 1 ) * ( nLen2 + 1 ) <= CUTOFF )
+    {
+        int nLcsLen = FindLCS( pSeq1, pSeq2, nStt1, nEnd1, nStt2, nEnd2);
+
+        for( int i = 0; i < nCutEnd; i++ )
+        {
+            pSeq1[ nLcsLen + i ] = nEnd1 + i;
+            pSeq2[ nLcsLen + i ] = nEnd2 + i;
+        }
+        return nCutBeg + nLcsLen + nCutEnd;
+    }
+
+    int nMid1 = nLen1/2;
+    int nMid2 = nLen2/2;
+
+    int nRad;
+    int nPos1 = -1, nPos2 = -1;
+
+    // Find a point of correspondence in the middle of the sequences
+    for( nRad = 0; nRad*nRad < std::min( nMid1, nMid2 ); nRad++ )
+    {
+        // Search to the left and to the right of the middle of the first sequence
+        for( int i = nMid1 - nRad; i <= nMid1 + nRad; i++ )
+        {
+            if( m_rComparator.Compare( nStt1 + i, nStt2 + nMid2 - nRad ) )
+            {
+                nPos1 = nStt1 + i;
+                nPos2 = nStt2 + nMid2 - nRad;
+                break;
+            }
+            if( m_rComparator.Compare( nStt1 + i, nStt2 + nMid2 + nRad ) )
+            {
+                nPos1 = nStt1 + i;
+                nPos2 = nStt2 + nMid2 - nRad;
+                break;
+            }
+        }
+        // Search to the left and to the right of the middle of the second sequence
+        for( int i = nMid2 - nRad; i <= nMid2 + nRad; i++ )
+        {
+            if( m_rComparator.Compare( nStt2 + nMid2 - nRad, nStt2 + i ) )
+            {
+                nPos2 = nStt2 + i;
+                nPos1 = nStt1 + nMid1 - nRad;
+                break;
+            }
+            if( m_rComparator.Compare( nStt2 + nMid2 - nRad, nStt2 + i ) )
+            {
+                nPos2 = nStt2 + i;
+                nPos1 = nStt1 + nMid1 - nRad;
+                break;
+            }
+        }
+    }
+
+    // return if no point of correspondence found
+    if( nPos1 == -1 )
+    {
+        for( int i = 0; i < nCutEnd; i++ )
+        {
+            pSeq1[ i ] = nEnd1 + i;
+            pSeq2[ i ] = nEnd2 + i;
+        }
+        return nCutBeg + nCutEnd;
+    }
+
+    // Run the same on the sequences to the left of the correspondence point
+    int nLen = FindFastCS( pSeq1, pSeq2, nStt1, nPos1, nStt2, nPos2 );
+
+    pSeq1[ nLen ] = nPos1;
+    pSeq2[ nLen ] = nPos2;
+
+    // Run the same on the sequences to the right of the correspondence point
+    nLen += FindFastCS( pSeq1 + nLen + 1, pSeq2 + nLen + 1,
+                         nPos1 + 1, nEnd1, nPos2 + 1, nEnd2 ) + 1;
+
+    for( int i = 0; i < nCutEnd; i++ )
+    {
+        pSeq1[ nLen + i ] = nEnd1 + i;
+        pSeq2[ nLen + i ] = nEnd2 + i;
+    }
+
+    return nLen + nCutBeg + nCutEnd;
+}
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

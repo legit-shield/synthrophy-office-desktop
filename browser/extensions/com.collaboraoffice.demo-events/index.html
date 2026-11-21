@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Events demo</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; background: #fff; padding: 12px; }
+label { display: block; margin: 8px 0 4px; font-weight: 600; }
+p.help { color: #666; margin-bottom: 8px; }
+.state { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; align-items: baseline; }
+.state .key { color: #666; }
+.state .val { word-break: break-word; }
+button { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; background: #666; color: #fff; margin-top: 12px; }
+</style>
+<script src="../cool.js"></script>
+</head>
+<body>
+
+<label data-l10n="Live document state:">Live document state:</label>
+<p class="help" data-l10n="Counters maintained from the cool.document.on* events. Modify the document, click around to change the selection, or add, edit or remove a comment in the sidebar.">
+  Counters maintained from the cool.document.on* events. Modify the document,
+  click around to change the selection, or add, edit or remove a comment in the sidebar.
+</p>
+<div class="state">
+  <span class="key" data-l10n="Modifications:">Modifications:</span>
+  <span class="val" id="modCount">0</span>
+  <span class="key" data-l10n="Selection changes:">Selection changes:</span>
+  <span class="val" id="selCount">0</span>
+  <span class="key" data-l10n="Active comments:">Active comments:</span>
+  <span class="val" id="commentCount">0</span>
+  <span class="key" data-l10n="Last comment activity:">Last comment activity:</span>
+  <span class="val" id="lastComment">-</span>
+</div>
+<button onclick="resetState()" data-l10n="Reset counters">Reset counters</button>
+
+<script>
+let modCount = 0;
+let selCount = 0;
+const activeComments = new Set();
+
+function refreshState() {
+  document.getElementById('modCount').textContent = modCount;
+  document.getElementById('selCount').textContent = selCount;
+  document.getElementById('commentCount').textContent = activeComments.size;
+}
+
+function resetState() {
+  modCount = 0;
+  selCount = 0;
+  activeComments.clear();
+  document.getElementById('lastComment').textContent = '-';
+  refreshState();
+}
+
+// wording has %1 for the author, e.g. cool._('added by %1')
+function describeComment(wording, c) {
+  const author = c.author || '?';
+  const snippet = (c.text || '').slice(0, 40)
+    + ((c.text || '').length > 40 ? '...' : '');
+  document.getElementById('lastComment').textContent
+    = wording.replace('%1', author) + (snippet ? ': ' + JSON.stringify(snippet) : '');
+}
+
+cool.document.onModified = function () {
+  modCount++;
+  refreshState();
+};
+cool.document.onSelectionChanged = function () {
+  selCount++;
+  refreshState();
+};
+cool.document.onCommentAdded = function (c) {
+  activeComments.add(c.id);
+  describeComment(cool._('added by %1'), c);
+  refreshState();
+};
+cool.document.onCommentChanged = function (c) {
+  activeComments.add(c.id);
+  describeComment(cool._('changed by %1'), c);
+  refreshState();
+};
+cool.document.onCommentRemoved = function (c) {
+  activeComments.delete(c.id);
+  describeComment(cool._('removed by %1'), c);
+  refreshState();
+};
+</script>
+</body>
+</html>

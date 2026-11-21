@@ -1,0 +1,190 @@
+// @ts-strict-ignore
+/* -*- js-indent-level: 8 -*- */
+
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * SlideCompositor is responsible for slide image generation, which later will be shown on the screen
+ */
+
+declare var SlideShow: any;
+
+// One part of a slide, in stacking order. The slide is split at each video on its master page:
+// image holds the layers between two such videos, over the whole slide, with the area outside
+// them transparent, and video is the video that plays between them.
+interface SlidePart {
+	image?: ImageBitmap;
+	video?: AnimatedContentRenderer;
+}
+
+abstract class SlideCompositor {
+	_slideShowPresenter: SlideShowPresenter = null;
+	protected _metaPresentation: MetaPresentation = null;
+	_initialSlideNumber: number = 0;
+	_onGotSlideCallback: VoidFunction = null;
+
+	constructor(slideShowPresenter: SlideShowPresenter) {
+		this._slideShowPresenter = slideShowPresenter;
+		this._addHooks();
+	}
+
+	// The presentation to draw. It is built after the compositor.
+	public setMetaPresentation(metaPresentation: MetaPresentation) {
+		this._metaPresentation = metaPresentation;
+	}
+
+	public getAnimatedElement(
+		slideHash: string,
+		animatedElementHash: string,
+	): AnimatedElement {
+		return this.getAnimatedElementMap(slideHash)?.get(animatedElementHash);
+	}
+
+	/// The animated elements of the slide by target, or undefined without
+	/// animations.
+	public getAnimatedElementMap(
+		slideHash: string,
+	): Map<string, AnimatedElement> | undefined {
+		const metaSlide = this._metaPresentation.getMetaSlide(slideHash);
+		if (!metaSlide) {
+			window.app.console.log(
+				'SlideCompositor.getAnimatedElementMap: failed to retrieve meta slide for hash: ' +
+					slideHash,
+			);
+			return undefined;
+		}
+		return metaSlide.animationsHandler?.getAnimatedElementMap();
+	}
+
+	/// The animated element of the kind this compositor draws, for the target sId.
+	public abstract createAnimatedElement(
+		sId: string,
+		slideHash: string,
+		title: string,
+		slideWidth: number,
+		slideHeight: number,
+		bIsTextElement: boolean,
+	): AnimatedElement;
+
+	/// The resolution of a layer that is shown in an area of the given size in CSS pixels.
+	public abstract computeLayerResolution(
+		width: number,
+		height: number,
+	): [number, number];
+
+	public computeLayerSize(width: number, height: number): [number, number] {
+		// compute the slide size in pixel with respect to the current resolution
+		const slideWidth = this._metaPresentation.getDocWidth();
+		const slideHeight = this._metaPresentation.getDocHeight();
+		const slideRatio = slideWidth / slideHeight;
+		const resolutionRatio = width / height;
+		if (slideRatio > resolutionRatio) {
+			height = Math.trunc((width * slideHeight) / slideWidth);
+		} else if (slideRatio < resolutionRatio) {
+			width = Math.ceil((height * slideWidth) / slideHeight);
+		}
+		return [width, height];
+	}
+
+	protected abstract _addHooks(): void;
+
+	public abstract removeHooks(): void;
+
+	public abstract onUpdatePresentationInfo(): void;
+
+	public fetchAndRun(slideNumber: number, callback: VoidFunction) {
+		this._initialSlideNumber = slideNumber;
+		this._onGotSlideCallback = callback;
+	}
+
+	public abstract getCanvasSize(): [number, number]; // [width, height]
+
+	public abstract getSlide(slideNumber: number): ImageBitmap;
+
+	public abstract getLayerImage(
+		slideHash: string,
+		targetElement: string,
+	): ImageBitmap;
+
+	public abstract getLayerBounds(
+		slideHash: string,
+		targetElement: string,
+	): BoundingBoxType;
+
+	public abstract getAnimatedSlide(slideIndex: number): ImageBitmap;
+
+	/// Draw the current frame of the slide straight into a WebGL context, filling its canvas, or
+	/// into texture when one is given. The context is the one of the slideshow canvas, or of a
+	/// canvas that shows the frames in another window. False when the compositor does not draw
+	/// the frame.
+	public drawFrameInto(
+		_context: RenderContextGl,
+		_slideIndex: number,
+		_texture?: WebGLTexture | null,
+	): boolean {
+		return false;
+	}
+
+	/// Draw the frame of a morph from one slide to the next at time, from 0 to 1, into the canvas
+	/// of the WebGL context. False when the compositor does not draw the slides object by object.
+	public drawMorphFrame(
+		_context: RenderContextGl,
+		_leavingIndex: number,
+		_enteringIndex: number,
+		_time: number,
+	): boolean {
+		return false;
+	}
+
+	/// Get ready to draw the frames of a morph from one slide to the next into the canvas of the
+	/// WebGL context, so the first one draws at once. False when the compositor does not draw
+	/// the slides object by object.
+	public prepareMorph(
+		_context: RenderContextGl,
+		_leavingIndex: number,
+		_enteringIndex: number,
+	): boolean {
+		return false;
+	}
+
+	/// True when the compositor draws the frames of the slides straight into a WebGL context.
+	public drawsFrames(): boolean {
+		return false;
+	}
+
+	public abstract getAnimatedLayerInfo(
+		slideHash: string,
+		targetElement: string,
+	): AnimatedShapeInfo;
+
+	public abstract getLayerRendererContext(): RenderContext;
+
+	public abstract getVideoRenderer(
+		slideHash: string,
+		videoInfo: VideoInfo,
+	): AnimatedContentRenderer;
+
+	public abstract deleteResources(): void;
+
+	public abstract pauseVideos(slideHash: string): void;
+
+	// Whether the slide shows a playing video on its master page.
+	public abstract hasMasterVideos(slideIndex: number): boolean;
+
+	// The number of frames shown so far by the videos on the master page of the slide.
+	public abstract getMasterVideoFrames(slideIndex: number): number;
+
+	public abstract notifyTransitionStart(slideHash: string): void;
+
+	public abstract notifyTransitionEnd(slideHash: string): void;
+}
+
+SlideShow.SlideCompositor = SlideCompositor;

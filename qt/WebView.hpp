@@ -1,0 +1,339 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#pragma once
+
+#include "Document.hpp"
+
+#include <Poco/URI.h>
+
+#include <QElapsedTimer>
+#include <QImage>
+#include <QJsonObject>
+#include <QList>
+#include <QMainWindow>
+#include <QObject>
+#include <QPointer>
+#include <QString>
+#include <QWebEngineView>
+
+#include <functional>
+#include <memory>
+#include <optional>
+
+class Bridge;
+class QWebEnginePage;
+class WebView;
+class QDragEnterEvent;
+class QDragMoveEvent;
+class QDragLeaveEvent;
+class QDropEvent;
+class QMimeData;
+class QTemporaryDir;
+
+namespace coda
+{
+Poco::URI::QueryParameters pageSettings(bool forDocument);
+} // namespace coda
+
+// The language of the user interface, such as "pt-BR", from the locale environment variables, or
+// "en-US" when they name none.
+std::string getUILanguage();
+
+// The user's portal "color-scheme" preference, cached on first call to avoid a
+// D-Bus round-trip per tab: true = dark, false = light, nullopt = no preference.
+std::optional<bool> portalPrefersDark();
+
+class CODAWebEngineView : public QWebEngineView
+{
+public:
+    CODAWebEngineView(QMainWindow* parent)
+        : QWebEngineView(parent)
+        , _mainWindow(parent)
+        , _presentationView(nullptr)
+        , _presenterConsole(nullptr)
+    {
+        // A page that starts to load has no drop zone open yet.
+        connect(this, &QWebEngineView::loadStarted, this, [this] { _templateDropTarget = false; });
+    }
+
+    ~CODAWebEngineView();
+
+    void setMainWindow(QMainWindow* mainWindow) { _mainWindow = mainWindow; }
+    QMainWindow* mainWindow() const { return _mainWindow; }
+
+    // The owning WebView; it says whether a drop has a document under it.
+    void setOwner(WebView* owner) { _owner = owner; }
+
+    void arrangePresentationWindows();
+    void exchangeMonitors();
+
+    // Ends any running presentation by closing the slideshow and presenter
+    // console windows (no-op otherwise).
+    void endPresentation();
+
+    // True while this view is running a presentation.
+    bool isPresenting() const { return _presentationView != nullptr; }
+
+    // True while the page shows a drop zone for template files.
+    void setTemplateDropTarget(bool enabled) { _templateDropTarget = enabled; }
+
+    // The path, file name, document type and size of a template file, as a JSON object.
+    static QJsonObject templateFileToJson(const QString& path);
+
+protected:
+    // Intercept files dropped onto the window from the OS
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dragMoveEvent(QDragMoveEvent* event) override;
+    void dragLeaveEvent(QDragLeaveEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
+
+private:
+    void connectScreenChanges();
+
+    // Show or hide the web-side hint shown while a file is dragged over the window.
+    void setDropFeedbackVisible(bool bVisible);
+
+    bool dropInsertsIntoDocument(const QMimeData* mimeData) const;
+    void insertDroppedFiles(QDropEvent* event);
+
+    void claimChildWindow(WebView* child, const QUrl& url);
+
+    // The hosting TabbedWindow or StandaloneWindow; updated when the view
+    // moves between windows (tab drag).
+    QMainWindow* _mainWindow;
+    WebView* _owner = nullptr;
+    // Given the general inability of wayland based environments
+    // to restore a window's position, especially after moving
+    // it to another monitor full-screen, the slideshow and the
+    // presenter console each play in their own window, opened
+    // from the page through window.open. The original document
+    // view is left untouched in its tab/window, so its
+    // content stays live and there is no full-screen window to
+    // restore.
+    WebView* _presentationView;
+    WebView* _presenterConsole;
+    // Dialog windows popped out of this document's page. Each window deletes
+    // itself on close, which clears its QPointer entry here.
+    QList<QPointer<QMainWindow>> _dialogWindows;
+    QMetaObject::Connection _screenAdded;
+    QMetaObject::Connection _screenRemoved;
+    bool _templateDropTarget = false;
+
+    QWebEngineView* createWindow(QWebEnginePage::WebWindowType type) override;
+};
+
+// One open document (or the starter screen). Owns its CODAWebEngineView and
+// Bridge, but not a window: the containing TabbedWindow or StandaloneWindow
+// hosts the view and is set via setMainWindow(). The owner deletes the WebView;
+// it never deletes itself. Inherits QObject so Bridge::_owner can be a QPointer.
+class WebView : public QObject
+{
+public:
+    using CloseRequestFn = std::function<void()>;
+    using CloseCancelledFn = std::function<void()>;
+    using TitleChangeFn = std::function<void(const QString&)>;
+    using UnmodifiedFn = std::function<void()>;
+    using ModifiedStatusChangeFn = std::function<void(bool)>;
+    using ThumbnailChangeFn = std::function<void(bool isFirstThumbnail)>;
+
+    explicit WebView(QWebEngineProfile* profile, bool isWelcome = false);
+    ~WebView() override;
+
+    CODAWebEngineView* webEngineView() { return _webView.get(); }
+
+    void setMainWindow(QMainWindow* window);
+    QMainWindow* mainWindow() const { return _mainWindow; }
+
+    // When requiresSaveAs is true the document opens editable and its first save
+    // is turned into a Save As, so the file at fileURL is never written to.
+    void load(const Poco::URI& fileURL = Poco::URI(), bool newFile = false,
+              bool isStarterMode = false, bool requiresSaveAs = false);
+
+    // The owner installs these; Bridge calls requestClose()/updateTitle().
+    void setOnCloseRequest(CloseRequestFn cb) { _onCloseRequest = std::move(cb); }
+    // Runs when the user kept the document open from the page's close prompt.
+    void setOnCloseCancelled(CloseCancelledFn cb) { _onCloseCancelled = std::move(cb); }
+    void setOnTitleChange(TitleChangeFn cb) { _onTitleChange = std::move(cb); }
+    // Runs each time the document stops holding a change that is not on disk.
+    void setOnUnmodified(UnmodifiedFn cb) { _onUnmodified = std::move(cb); }
+    void setOnModifiedStatusChange(ModifiedStatusChangeFn cb) { _onModifiedStatusChange = std::move(cb); }
+    // Runs each time the image of the document's current view changes.
+    void setOnThumbnailChange(ThumbnailChangeFn cb) { _onThumbnailChange = std::move(cb); }
+    void requestClose();
+    void closeCancelled();
+    void updateTitle(const QString& title);
+    /// The document reported that it holds no change that is not on disk.
+    void onDocumentUnmodified();
+    void onDocumentModifiedStatusChanged(bool modified);
+    /// Takes the current view as a "data:image/png;base64," URL. Anything else is ignored.
+    void updateThumbnail(const std::string& dataUrl);
+    // The document's current view, or a null image until the page has sent one.
+    const QImage& thumbnail() const { return _thumbnail; }
+    QString composedWindowTitle() const;
+
+    QString documentTitle() const { return _docTitle; }
+    // The full path of the local file the document is in. Empty for the starter screen, the
+    // welcome slideshow and a remote document.
+    QString documentPath() const;
+    // "writer" / "calc" / "impress" / "draw" / "starter" / "welcome" / "other"
+    QString documentType() const { return _docType; }
+
+    // Copies the template for `templateType` (or `templatePath` if set) into the
+    // user's Documents dir under a free name. Returns the path, or empty on failure.
+    static QString createNewDocumentFile(const std::string& templateType,
+                                         const std::string& templatePath,
+                                         const std::string& baseName);
+    static QString docTypeFromExtension(const QString& filePath);
+
+    // True when the file name has a document-template extension (.ott, .xltx, ...).
+    static bool isTemplate(const std::string& fileName);
+
+    // Open a template as a fresh editable document. The template is copied to a
+    // temporary working file that is loaded instead of the original, and the
+    // first save is redirected to Save As. The original template is never
+    // modified. Returns nullptr if the working copy could not be created.
+    static WebView* openTemplateAsNewDocument(QWebEngineProfile* profile,
+                                              const Poco::URI& templateURL);
+
+    static WebView* findOpenDocument(const Poco::URI& documentURI);
+    static const std::vector<WebView*>& getAllInstances() { return s_instances; }
+    void activateWindow();
+    /// True while a user-initiated save is in flight - see
+    /// Bridge::isSaveInFlight.  Used by the close handler so that
+    /// closing the tab while the save round-trip is not yet
+    /// done waits for the save rather than asking about "unsaved
+    /// changes" that are actually about to be saved.
+    bool isSaveInFlight() const;
+    /// Register a one-shot callback to run when the in-flight save
+    /// completes, told whether it succeeded.  Forwards to
+    /// Bridge::onSaveComplete; runs immediately if no save is in
+    /// flight.
+    void onSaveComplete(std::function<void(bool)> callback);
+    /// A close waits for the save in flight, see Bridge::closeWaitsForSave.
+    void closeWaitsForSave(std::function<void(bool saved)> then);
+    /// Run @script in the page on the GUI thread.  Forwards to
+    /// Bridge::evalJS; no-op if no bridge is attached.
+    void evalJS(const std::string& script);
+    /// Announce an orderly close to the per-document collab broker.
+    /// Forwarded to Bridge::sendCollabBye() while _document is still
+    /// valid - called from TabManager::closeTab before the WebView's
+    /// destruction tears _document down.  No-op for local-only docs.
+    void sendCollabBye();
+    /// True after saveAndClose() has been initiated for this document;
+    /// TabManager::closeTab uses this to skip the save-if-dirty path
+    /// on the re-entry that runs after the JS-side CLOSE_WINDOW
+    /// round-trip.
+    bool isReadyToClose() const;
+    /// Set the ready-to-close flag without going through JS.  Used by
+    /// the save-in-flight defer path so the close that fires once the
+    /// in-flight save finishes skips the redundant save-if-dirty
+    /// round-trip.
+    void markReadyToClose();
+    /// Ask the page-JS to run _saveAndClose (saves if dirty, posts
+    /// CLOSE_WINDOW on completion).  No-op if no bridge is attached.
+    void saveAndClose();
+    // Called when this document's window gains or loses the active state.
+    void onWindowActiveChanged(bool active);
+
+    /// Destroy this document's webview, and with it the web engine process that renders it.
+    /// The document stays loaded in the engine with any unsaved change.
+    void discardView();
+
+    /// Build a webview again and rejoin the document left loaded under this view's appDocId.
+    void restoreDiscardedView();
+
+    bool isViewDiscarded() const { return _viewDiscarded; }
+
+    /// True when this view shows a local document that has a file on disk. This does not
+    /// change while the document is open.
+    bool mayDiscardView() const;
+
+    /// True when the document holds no change that is not on disk yet.
+    bool isReadyToDiscardView() const;
+
+    /// Milliseconds this view still has to stay live before it may be discarded, or 0 when
+    /// it has had its time. A few seconds is long enough to load a page and rejoin it.
+    int millisecondsUntilViewSettled() const;
+
+    /// Ask the page to save the document, and run the callback when the save result comes
+    /// back, told whether the save succeeded. Returns false when no save was asked for.
+    bool requestSave(std::function<void(bool)> onComplete);
+
+    bool isDocumentModified() const;
+    void endPresentation();
+    bool isStarterScreen() const { return _docType == QStringLiteral("starter"); }
+    // A drop goes into the document only here. The starter screen, the welcome slideshow and
+    // a remote document open dropped files instead.
+    bool showsLocalDocument() const
+    {
+        return !isStarterScreen() && !_isWelcome && !_document._remoteInfo
+               && _document._fakeClientFd >= 0;
+    }
+    bool isWelcome() const { return _isWelcome; }
+
+    /// Open one more view of this document in a window of its own, as one more user would have
+    /// it. For the debug tools.
+    void openSecondaryView();
+
+    /// Apply the stored user interface zoom to this window's web view. An
+    /// explicit zoom percentage becomes the web view's zoom factor; with no
+    /// explicit zoom the system text scaling is queried and applied instead.
+    void applyUIZoom();
+    /// Apply the stored user interface zoom to every open window.
+    static void applyUIZoomToAll();
+
+private:
+    // query gnome font scaling factor and apply it to the web view
+    void queryGnomeFontScalingUpdateZoom();
+
+    // Make the webview and its page, and wire up the page signals.
+    void createWebEngineView();
+
+    // Join the document of `first` as one more session, under the same appDocId.
+    void loadAsSecondaryView(const WebView& first);
+
+    QMainWindow* _mainWindow;
+    QWebEngineProfile* _profile;
+    std::unique_ptr<CODAWebEngineView> _webView;
+    coda::DocumentData _document;
+    // The cool.html URL, with its query, that this document was loaded from.
+    QString _loadedUrl;
+    bool _viewDiscarded;
+    // Runs from the moment this view's webview was built.
+    QElapsedTimer _viewLiveSince;
+    QString _docTitle;
+    QString _docType;
+    bool _isWelcome;
+    // This is one more view of a document that another WebView has open.
+    bool _isSecondaryView = false;
+    // The windows of the secondary views of this document. A window that has closed leaves a null
+    // entry.
+    QList<QPointer<QMainWindow>> _secondaryViewWindows;
+    // The number in the window title of the next secondary view. The first view is view 1.
+    int _nextViewNumber = 2;
+    QImage _thumbnail;
+    Bridge* _bridge;
+    // Holds the temporary copy of a template while it is open as a new document,
+    // so the copy is removed when the window closes.
+    std::unique_ptr<QTemporaryDir> _templateWorkingDir;
+
+    CloseRequestFn _onCloseRequest;
+    CloseCancelledFn _onCloseCancelled;
+    TitleChangeFn _onTitleChange;
+    UnmodifiedFn _onUnmodified;
+    ModifiedStatusChangeFn _onModifiedStatusChange;
+    ThumbnailChangeFn _onThumbnailChange;
+
+    static std::vector<WebView*> s_instances;
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

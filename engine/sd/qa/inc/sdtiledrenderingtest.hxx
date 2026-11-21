@@ -1,0 +1,120 @@
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#ifndef INCLUDED_SD_QA_INC_SDTILEDRENDERINGTEST_HXX
+#define INCLUDED_SD_QA_INC_SDTILEDRENDERINGTEST_HXX
+
+#include <test/unoapixml_test.hxx>
+
+#include <boost/property_tree/json_parser.hpp>
+
+#include <osl/conditn.hxx>
+#include <test/kitcallback.hxx>
+
+#include "sdqahelperdllapi.h"
+
+class SdXImpressDocument;
+class SfxViewShell;
+
+class SDQAHELPER_DLLPUBLIC SdTiledRenderingTest : public UnoApiXmlTest
+{
+public:
+    SdTiledRenderingTest();
+    virtual void setUp() override;
+    virtual void tearDown() override;
+
+protected:
+    SdXImpressDocument* createDoc(const char* pName,
+                                  const cpo::uno::Sequence<css::beans::PropertyValue>& rArguments
+                                  = cpo::uno::Sequence<css::beans::PropertyValue>());
+    void setupCOKitViewCallback(SfxViewShell& pViewShell);
+    static void callback(COKitCallbackType eType, const char* pPayload, void* pData);
+    void callbackImpl(COKitCallbackType eType, const char* pPayload);
+    xmlDocUniquePtr parseXmlDump();
+
+    ::tools::Rectangle m_aInvalidation;
+    std::vector<::tools::Rectangle> m_aSelection;
+    bool m_bFound;
+    sal_Int32 m_nPart;
+    std::vector<OString> m_aSearchResultSelection;
+    std::vector<int> m_aSearchResultPart;
+    int m_nSelectionBeforeSearchResult;
+    int m_nSelectionAfterSearchResult;
+    int m_nSearchResultCount;
+
+    /// For document size changed callback.
+    osl::Condition m_aDocumentSizeCondition;
+    xmlBufferPtr m_pXmlBuffer;
+    TestKitCallbackWrapper m_callbackWrapper;
+};
+
+/// A view callback tracks callbacks invoked on one specific view.
+class SDQAHELPER_DLLPUBLIC SdTestViewCallback final
+{
+    SfxViewShell* mpViewShell;
+    int mnView;
+
+public:
+    bool m_bGraphicSelectionInvalidated;
+    bool m_bGraphicViewSelectionInvalidated;
+    /// Our current part, to be able to decide if a view cursor/selection is relevant for us.
+    int m_nPart;
+    bool m_bCursorVisibleChanged;
+    bool m_bCursorVisible;
+    bool m_bViewLock;
+    /// The view named by the last .uno:TextEditLocked state change, or -1.
+    int m_nTextEditLockedViewId;
+    /// The reason given by the last .uno:TextEditLocked state change.
+    std::string m_aTextEditLockedReason;
+    bool m_bTilesInvalidated;
+    std::vector<tools::Rectangle> m_aInvalidations;
+    /// The part each entry of m_aInvalidations names.
+    std::vector<int> m_aInvalidationParts;
+    /// The part and the edit mode of each invalidation that covers a whole part.
+    std::vector<std::pair<int, int>> m_aWholePartInvalidations;
+    std::map<int, bool> m_aViewCursorInvalidations;
+    std::map<int, bool> m_aViewCursorVisibilities;
+    bool m_bViewSelectionSet;
+    /// Every text selection payload this view was sent, in the order they arrived.
+    std::vector<OString> m_aTextSelections;
+    boost::property_tree::ptree m_aCommentCallbackResult;
+    OString m_ShapeSelection;
+    /// The last drag preview message holds the outlines that a drop would produce.
+    OString m_ShapeDragPreview;
+    std::vector<std::string> m_aStateChanged;
+    std::map<std::string, boost::property_tree::ptree> m_aStateChanges;
+    /// Number of jsdialog "select" actions seen for a given control id.
+    std::map<std::string, int> m_aJSDialogSelectCounts;
+    /** The results the uno commands reported, in the order they arrived. Each entry is the whole
+        payload: the name of the command, whether it worked and the result it carries. */
+    std::vector<boost::property_tree::ptree> m_aCommandResults;
+    /// The focused paragraph as last sent to the screen reader.
+    boost::property_tree::ptree m_aA11yFocusedParagraph;
+    /// How many times this view was told that the linked pages or sections changed.
+    int m_nSlideLinksChanged = 0;
+    /// The last clicked hyperlink this view was sent.
+    OString m_aHyperlinkClicked;
+    /// Every callback this view was sent, with its payload, in the order they arrived.
+    std::vector<std::pair<COKitCallbackType, OString>> m_aCallbacks;
+    TestKitCallbackWrapper m_callbackWrapper;
+    bool invalidatedAll;
+    int editModeOfInvalidation;
+    int partOfInvalidation;
+
+    SdTestViewCallback();
+
+    ~SdTestViewCallback();
+
+    static void callback(COKitCallbackType eType, const char* pPayload, void* pData);
+
+    void callbackImpl(COKitCallbackType eType, const char* pPayload);
+};
+
+#endif // INCLUDED_SD_QA_INC_SDTILEDRENDERINGTEST_HXX
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

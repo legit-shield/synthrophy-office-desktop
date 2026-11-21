@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, interactive-widget=resizes-content">
+    <title>Online</title>
+    <style>
+        html, body, iframe
+        {
+            margin: 0px;
+            padding: 0px;
+            border: none;
+        }
+        /* The picker that answers the editor's request for a presentation to import. */
+        #import-overlay
+        {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.4);
+            font-family: system-ui, sans-serif;
+        }
+        #import-dialog
+        {
+            min-width: 20rem;
+            max-width: 90vw;
+            max-height: 80vh;
+            overflow: auto;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            background: #ffffff;
+            color: #202124;
+        }
+        #import-title
+        {
+            margin: 0 0 0.75rem;
+            font-size: 1rem;
+            font-weight: 600;
+        }
+        #import-list button, #import-dialog .cancel
+        {
+            display: block;
+            width: 100%;
+            margin: 0 0 0.25rem;
+            padding: 0.5rem 0.75rem;
+            border: 1px solid #d8dadc;
+            border-radius: 0.25rem;
+            background: #f1f3f4;
+            color: inherit;
+            font: inherit;
+            text-align: left;
+            cursor: pointer;
+        }
+        #import-list button:hover, #import-dialog .cancel:hover
+        {
+            border-color: #0b87e7;
+        }
+        #import-dialog .cancel
+        {
+            margin-top: 0.75rem;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <form id="form" action enctype="multipart/form-data" target="coolframe" method="post">
+         <input name="access_token" value="test" type="hidden"/>
+         <input id="ui_defaults" name="ui_defaults" type="hidden"/>
+         <input id="wopi_setting_base_url" name="wopi_setting_base_url" type="hidden"/>
+    </form>
+    <iframe id="coolframe" name= "coolframe" style="width:100%;height:100%;position:absolute;" title="Synthrophy Office" allow="fullscreen">
+    </iframe>
+    <script>
+        function constructWopiUrl() {
+            let localServer = window.location.protocol + "//" + window.location.host;
+            let localUrl = localServer + window.location.pathname + "?";
+            let params = new URLSearchParams(window.location.search);
+            let page = "cool.html";
+            let preview = params.get('interactivepreview');
+            if (preview)
+            {
+                page = 'cool-preview.html';
+                let iframe = document.getElementById('coolframe');
+                // These are the dimensions used in SharePoint.
+                iframe.width = 350;
+                iframe.height = 221;
+                iframe.removeAttribute('style');
+            }
+            let req = params.get('req');
+            params.delete('req');
+            if (req)
+              req = req.replace('debug.html', page)
+            else
+              localUrl = localUrl.replace('debug.html', page);
+            var wopiSrc = params.get('WOPISrc');
+            if (wopiSrc)
+            {
+                params.delete('WOPISrc');
+                wopiSrc = encodeURIComponent(wopiSrc);
+            }
+            else
+            {
+                let filePath = params.get('file_path').substr(1);
+                params.delete('file_path');
+                const wopiPort = params.get('wopiPort');
+                params.delete('wopiPort');
+                // wopiPort names the port of coolwsd when this page came
+                // through proxy.php on another port, so it replaces the port
+                // of the page rather than being appended to it.
+                if (wopiPort)
+                  wopiSrc = window.location.protocol + "//" + window.location.hostname + ':' + wopiPort;
+                else
+                  wopiSrc = localServer;
+                wopiSrc += "/wopi/files/" + encodeURIComponent(filePath);
+            }
+            var filename = "Document"; // default
+            if (wopiSrc) {
+                var decodedWopiSrc = decodeURIComponent(wopiSrc);
+                var lastSlash = decodedWopiSrc.lastIndexOf('/');
+                if (lastSlash !== -1) {
+                    filename = decodedWopiSrc.substring(lastSlash + 1);
+                }
+            }
+            // Initial title carries the brand without a module suffix; the
+            // iframe will postMessage 'Doc_Title' once it knows the doc type
+            // and we refine to '<filename> - Collabora <Module>' then.
+            var initialTitle = filename + " - Synthrophy Office";
+            window.document.title = initialTitle;
+            document.getElementById("coolframe").title = initialTitle;
+            if (req)
+              localUrl += 'req=' + req + '&';
+
+            localUrl += "WOPISrc=" + wopiSrc;
+            let remainingParams = params.toString()
+            if (remainingParams)
+              localUrl = localUrl + '&' + params.toString();
+            // The debug user id identifies the user to the (test) WOPI host.
+            // The access token is an authorization credential, not an identity
+            // (a real host may mint several tokens for one user), so debugging
+            // multi-user scenarios needs a separate, explicit user id. Drive it
+            // purely from the URL: open with &userid=2 in a second tab to act
+            // as a different user; same userid across tabs/reloads = same user.
+            // It is a plain query param, not part of the WOPISrc, so the doc key
+            // and collaboration are unaffected. When present it already rode
+            // along in params above. When omitted the (test) WOPI host falls back
+            // to its default user "test", which stays the document owner
+            // (UserId == OwnerId), so add nothing here. An &ownerid rides along
+            // the same way and names another owner.
+            return localUrl
+          }
+        var form = document.getElementById("form");
+        var settingsBaseUrl = new URLSearchParams(window.location.search).get('wopi_setting_base_url');
+        if (!settingsBaseUrl)
+          settingsBaseUrl = window.location.protocol + "//" + window.location.host + "/wopi/settings";
+        document.getElementById("wopi_setting_base_url").value = settingsBaseUrl;
+        form.action = constructWopiUrl();
+        // The access token is an auth credential, not an identity, and the test
+        // WOPI server does not validate it. Vary it per user so the proactive
+        // vetting key (docKey_token) differs between users; otherwise two tabs
+        // opened at the same time share one key and the second tab can pick up
+        // the first user's vetting result. User identity for preset routing
+        // still comes from the separate userid param, not the token. With no
+        // userid the default user keeps the plain "test" token, so cypress and
+        // the committed seed are unaffected.
+        var debugUserId = new URLSearchParams(window.location.search).get('userid');
+        if (debugUserId)
+          document.querySelector('input[name=access_token]').value = 'test-' + debugUserId;
+        // Debug-only test aid: pass ?UITheme=dark|light to mimic an integrator
+        // whose UI theme default differs from the server-stored user setting.
+        // SavedUIState=false is the part that lets the integrator default win
+        // over the saved browsersetting on the client (prefs.get); it lets us
+        // exercise the client/core theme reconciliation easily.
+        var uiTheme = new URLSearchParams(window.location.search).get('UITheme');
+        if (uiTheme === 'dark' || uiTheme === 'light')
+          document.getElementById('ui_defaults').value =
+            'UITheme=' + uiTheme + ';SavedUIState=false';
+        form.submit();
+
+        // TODO: share code between debug.html and framed.doc.html
+        window.addEventListener('message', receivePostMessage);
+
+        function post(msg) {
+          window.frames[0].postMessage(JSON.stringify(msg), '*');
+        }
+
+        function getMentionUserData() {
+          const usernames = ['Alexandra', 'Alison', 'Amanda', 'Amelia', 'Amy', 'Andrea', 'Angela', 'Anna',
+                             'Audrey', 'Ava', 'Bella', 'Bernadette', 'Carol', 'Caroline', 'Carolyn' , 'John Doe', 'John Smith'];
+          const userProfileLink = 'https://github.com/CollaboraOnline/online';
+          let data = [];
+          usernames.forEach(username => data.push({
+            username: username,
+            profile: userProfileLink
+          }));
+
+          return data;
+        }
+
+        // The documents this server lists on documents.html: the samples and the uploaded ones,
+        // each as {name, path, size, lastModifiedTime}. The server root is kept, so the page
+        // works under a service root such as /browser-prefix/browser/<hash>/debug.html too.
+        function listDocuments() {
+          const serverRoot = window.location.pathname.replace(/\/browser\/[^/]*\/[^/]*$/, '');
+          return fetch(serverRoot + '/wopi/documents')
+            .then(function(response) {
+              if (!response.ok)
+                throw new Error('the server answered ' + response.status);
+              return response.json();
+            })
+            .then(function(documents) { return documents.uploaded.concat(documents.samples); });
+        }
+
+        // The file extensions each presentation type the editor filters on is stored with.
+        const extensionsByMimeType = {
+          'application/vnd.oasis.opendocument.presentation': ['odp', 'fodp'],
+          'application/vnd.oasis.opendocument.presentation-template': ['otp'],
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['pptx'],
+          'application/vnd.openxmlformats-officedocument.presentationml.slideshow': ['ppsx'],
+          'application/vnd.openxmlformats-officedocument.presentationml.template': ['potx'],
+          'application/vnd.ms-powerpoint': ['ppt', 'pps', 'pot'],
+          'application/vnd.ms-powerpoint.presentation.macroEnabled.12': ['pptm'],
+        };
+
+        // True when the name has one of the extensions the given types are stored with. With
+        // no filter every name passes.
+        function matchesMimeTypeFilter(name, mimeTypeFilter) {
+          if (!Array.isArray(mimeTypeFilter) || mimeTypeFilter.length === 0)
+            return true;
+          const extension = name.substring(name.lastIndexOf('.') + 1).toLowerCase();
+          return mimeTypeFilter.some(function(mimeType) {
+            return (extensionsByMimeType[mimeType] || []).indexOf(extension) !== -1;
+          });
+        }
+
+        // The WOPISrc this server serves a local document under
+        function localWopiSrc(parentWopiSrc, path) {
+          const filesPath = '/wopi/files/';
+          const filesIndex = (parentWopiSrc || '').indexOf(filesPath);
+          const base = filesIndex === -1
+            ? window.location.protocol + '//' + window.location.host + filesPath
+            : parentWopiSrc.substring(0, filesIndex + filesPath.length);
+          return base + encodeURIComponent(path.substring(1));
+        }
+
+        function closeImportPicker() {
+          const overlay = document.getElementById('import-overlay');
+          if (overlay)
+            overlay.remove();
+        }
+
+        // Registers the picked document with the server as a permanent link of the opened one:
+        // a POST to the /cool/links address the editor named, carrying the editor's one-time
+        // token and the links, one per picked document: the document, the token to reach it,
+        // its name, when it was last modified and the persistent link the pages of the opened
+        // document store.
+        function addPermanentLink(values, entry) {
+          const body = {
+            Nonce: values.Nonce,
+            Links: [
+              {
+                WOPISrc: localWopiSrc(values.WOPISrc, entry.path),
+                AccessToken: document.querySelector('input[name=access_token]').value,
+                BaseFileName: entry.name,
+                LastModifiedTime: entry.lastModifiedTime,
+                PersistentLink: values.PersistentLink || entry.name,
+              },
+            ],
+          };
+          fetch(values.Endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          })
+            .then(function(response) {
+              closeImportPicker();
+              if (!response.ok)
+                return response.text().then(function(text) {
+                  window.alert('debug.html: could not add ' + entry.name + ' (' +
+                               response.status + (text ? ': ' + text : '') + ')');
+                });
+            })
+            .catch(function(error) {
+              closeImportPicker();
+              window.alert('debug.html: could not add ' + entry.name + ': ' + error.message);
+            });
+        }
+
+        // Shows a dialog that lists documents of this server, and returns the element of the
+        // list. Cancel and Escape close it and call onCancel.
+        function openPicker(titleText, onCancel) {
+          closeImportPicker();
+
+          const overlay = document.createElement('div');
+          overlay.id = 'import-overlay';
+          const dialog = document.createElement('div');
+          dialog.id = 'import-dialog';
+          const title = document.createElement('p');
+          title.id = 'import-title';
+          title.textContent = titleText;
+          dialog.appendChild(title);
+          const list = document.createElement('div');
+          list.id = 'import-list';
+          list.textContent = 'Loading...';
+          dialog.appendChild(list);
+          const cancelPicker = function() {
+            closeImportPicker();
+            if (onCancel)
+              onCancel();
+          };
+          const cancel = document.createElement('button');
+          cancel.type = 'button';
+          cancel.className = 'cancel';
+          cancel.textContent = 'Cancel';
+          cancel.addEventListener('click', cancelPicker);
+          dialog.appendChild(cancel);
+          overlay.appendChild(dialog);
+          overlay.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape')
+              cancelPicker();
+          });
+          document.body.appendChild(overlay);
+          cancel.focus();
+          return list;
+        }
+
+        // Answers the editor's request for a presentation to import with a picker.
+        function openImportPicker(values) {
+          const list = openPicker('Add presentation - pick a document of this server');
+
+          listDocuments()
+            .then(function(entries) {
+              // The local path of the opened document, when this server serves it.
+              const parentWopiSrc = values.WOPISrc || '';
+              const filesIndex = parentWopiSrc.indexOf('/wopi/files/');
+              const openedPath = filesIndex === -1 ? '' :
+                decodeURIComponent(parentWopiSrc.substring(filesIndex + '/wopi/files'.length));
+              const offered = entries.filter(function(entry) {
+                return entry.path !== openedPath &&
+                       matchesMimeTypeFilter(entry.name, values.MimeTypeFilter);
+              });
+              list.textContent = '';
+              if (offered.length === 0) {
+                list.textContent = 'No presentation to add. Upload one on documents.html first.';
+                return;
+              }
+              offered.forEach(function(entry) {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.textContent = entry.name;
+                item.title = entry.path;
+                item.addEventListener('click', function() { addPermanentLink(values, entry); });
+                list.appendChild(item);
+              });
+            })
+            .catch(function(error) {
+              list.textContent = 'Could not list the documents: ' + error.message;
+            });
+        }
+
+        // The local path of the document this page opened, as the WOPI host serves it.
+        function openedDocumentPath() {
+          const params = new URLSearchParams(window.location.search);
+          const filePath = params.get('file_path');
+          if (filePath)
+            return filePath;
+          const wopiSrc = params.get('WOPISrc') || '';
+          const filesIndex = wopiSrc.indexOf('/wopi/files/');
+          return filesIndex === -1 ? '' :
+            decodeURIComponent(wopiSrc.substring(filesIndex + '/wopi/files'.length));
+        }
+
+        // The path of a file given by its path relative to the folder of another one.
+        function resolvePath(documentPath, relativePath) {
+          const segments = documentPath.split('/').slice(0, -1);
+          relativePath.split('/').forEach(function(segment) {
+            if (segment === '..')
+              segments.pop();
+            else if (segment !== '.' && segment !== '')
+              segments.push(segment);
+          });
+          return segments.join('/');
+        }
+
+        // The path of a file relative to the folder of another one.
+        function relativePath(documentPath, filePath) {
+          const from = documentPath.split('/').slice(0, -1);
+          const to = filePath.split('/');
+          let common = 0;
+          while (common < from.length && common < to.length - 1 && from[common] === to[common])
+            common++;
+          return '../'.repeat(from.length - common) + to.slice(common).join('/');
+        }
+
+        // Edit in the Navigator of a master document: the chapter opens in a tab of its own.
+        function openLinkedDocument(values) {
+          if (!values || !values.RelativePath)
+            return;
+          const url = new URL(window.location);
+          url.searchParams.delete('WOPISrc');
+          url.searchParams.set('file_path', resolvePath(openedDocumentPath(), values.RelativePath));
+          window.open(url.href, '_blank');
+        }
+
+        // Insert > File in the Navigator of a master document: a text document of this server,
+        // which the master document links to by its path relative to it.
+        // The file name patterns of the pick, e.g. ["*.odt;*.ott", "*.docx"], as one regular
+        // expression; a text document of any usual type when the pick names none.
+        function filePattern(filters) {
+          const extensions = [];
+          (filters || []).forEach(function(filter) {
+            String(filter).split(';').forEach(function(glob) {
+              const match = /^\*\.([A-Za-z0-9]+)$/.exec(glob.trim());
+              if (match)
+                extensions.push(match[1]);
+            });
+          });
+          if (extensions.length === 0)
+            return /\.(odt|fodt|ott|docx|doc|rtf)$/i;
+          return new RegExp('\\.(' + extensions.join('|') + ')$', 'i');
+        }
+
+        function openSubdocumentPicker(values) {
+          values = values || {};
+          let answered = false;
+          const answer = function(path) {
+            if (answered)
+              return;
+            answered = true;
+            post({'MessageId': 'Action_PickLinkedFile', 'Values': path ? {'RelativePath': path} : {}});
+          };
+          const list = openPicker((values.Title || 'Insert file') + ' - pick a document of this server',
+                                  function() { answer(''); });
+          const opened = openedDocumentPath();
+          const pattern = filePattern(values.Filters);
+          listDocuments()
+            .then(function(entries) {
+              const offered = entries.filter(function(entry) {
+                return entry.path !== opened && pattern.test(entry.name);
+              });
+              list.textContent = '';
+              if (offered.length === 0) {
+                list.textContent = 'No document of these types to insert. Upload one on documents.html first.';
+                return;
+              }
+              offered.forEach(function(entry) {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.textContent = entry.name;
+                item.title = entry.path;
+                item.addEventListener('click', function() {
+                  closeImportPicker();
+                  answer(relativePath(opened, entry.path));
+                });
+                list.appendChild(item);
+              });
+            })
+            .catch(function(error) {
+              list.textContent = 'Could not list the documents: ' + error.message;
+            });
+        }
+
+        function receivePostMessage(event) {
+          if (event.origin !== window.origin)
+            return;
+
+          // check if event is a error message
+          if (typeof event.data === 'object' &&
+              event.data !== null &&
+              typeof event.data.name === 'string' &&
+              event.data.name.endsWith("Error"))
+            throw event.data;
+
+          let msg;
+          try {
+            msg = JSON.parse(event.data);
+            if (!msg)
+              return;
+          } catch(e) {
+            return;
+          }
+
+          console.log('==== debug.html receiveMessage: ' + event.data);
+          switch (msg.MessageId) {
+            case 'App_LoadingStatus':
+              if (!msg.Values)
+                return;
+              if (msg.Values.Status == 'Document_Loaded')
+                post({'MessageId': 'Host_PostmessageReady'});
+              break;
+            case 'Doc_Title':
+              if (msg.Values && msg.Values.Title) {
+                window.document.title = msg.Values.Title;
+                document.getElementById("coolframe").title = msg.Values.Title;
+              }
+              break;
+            case 'UI_GetPermanentLink':
+              openImportPicker(msg.Values || {});
+              break;
+            case 'UI_OpenLinkedDocument':
+              openLinkedDocument(msg.Values);
+              break;
+            case 'UI_PickLinkedFile':
+              openSubdocumentPicker(msg.Values);
+              break;
+            case 'UI_Mention':
+              if (!msg.Values)
+                return;
+              const type = msg.Values.type;
+              const text = msg.Values.text;
+
+              if (type === 'autocomplete')
+              {
+                const userData = getMentionUserData();
+
+                let filteredUser = [];
+                userData.forEach(element => {
+                  if (element.username.toLowerCase().includes(text.toLowerCase()))
+                    filteredUser.push(element);
+                });
+                setTimeout(post, 0,
+                  {
+                    'MessageId': 'Action_Mention',
+                    'SendTime': Date.now(),
+                    'Values': {
+                      'list': filteredUser,
+                    }
+                  });
+              }
+              break;
+          }
+        }
+    </script>
+</body>
+</html>

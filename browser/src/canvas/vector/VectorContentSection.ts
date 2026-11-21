@@ -1,0 +1,275 @@
+// @ts-strict-ignore
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * VectorContentSection - Canvas section that draws the main view from
+ * vector primitives, for Impress and Draw. The part data, bitmap cache
+ * and renderer are shared through the RenderManager facade, so each part is
+ * fetched and decoded only once.
+ *
+ * The section is bound to the bitmap tiles section and drawn right after
+ * it. The background primitive is opaque, so the vector output fully
+ * covers the tiles area.
+ */
+
+/* global app */
+
+namespace cool {
+	export class VectorContentSection extends CanvasSectionObject {
+		processingOrder: number = app.CSections.VectorContent.processingOrder;
+		drawingOrder: number = app.CSections.VectorContent.drawingOrder;
+		zIndex: number = app.CSections.VectorContent.zIndex;
+		boundToSection: string = 'tiles';
+		interactable: boolean = false;
+
+		private _docLayer: any;
+
+		// Holds the rendered pixels of the current frame. Other sections
+		// trigger frequent redraws, so a redraw reuses these pixels when the
+		// part, scroll and zoom are unchanged.
+		private _offscreen: HTMLCanvasElement = null;
+		private _offscreenCtx: CanvasRenderingContext2D = null;
+		private _lastRenderKey: string = '';
+		// Id of the page whose pixels are in the offscreen canvas, so a blit
+		// reuses them only for that same page.
+		private _offscreenPart = '';
+		// Part the last draw reported, so the report comes once per page
+		// rather than once per frame.
+		private _reportedPartId = '';
+
+		constructor() {
+			super(app.CSections.VectorContent.name);
+
+			// Redraw when a part's data arrives, a deferred bitmap decodes, or
+			// the part is invalidated. Drop the cache key so the next draw
+			// re-renders the part.
+			RenderManager.onVectorChanged(this._onVectorChanged);
+		}
+
+		private _onVectorChanged = (): void => {
+			this._lastRenderKey = '';
+			if (app.sectionContainer) app.sectionContainer.requestReDraw();
+		};
+
+		onInitialize(): void {
+			this._docLayer = app.map._docLayer;
+		}
+
+		onRemove(): void {
+			RenderManager.offVectorChanged(this._onVectorChanged);
+			VectorFormControlLayer.update(undefined, 0, 0, 0);
+		}
+
+		private _ensureOffscreen(width: number, height: number): void {
+			if (!this._offscreen) {
+				this._offscreen = document.createElement('canvas');
+				this._offscreenCtx = this._offscreen.getContext('2d');
+			}
+			if (
+				this._offscreen.width !== width ||
+				this._offscreen.height !== height
+			) {
+				this._offscreen.width = width;
+				this._offscreen.height = height;
+			}
+		}
+
+		onDraw(): void {
+			// the working form controls are shown only over the page the view edits, and a zoom
+			// animation scales the canvas alone
+			if (this.containerObject.isInZoomAnimation()) {
+				VectorFormControlLayer.update(undefined, 0, 0, 0);
+				return;
+			}
+			if (!this._docLayer) return;
+
+			if (app.file.fileBasedView) {
+				VectorFormControlLayer.update(undefined, 0, 0, 0);
+				this._drawFileBasedView();
+				return;
+			}
+
+			const part = this._docLayer._selectedPart;
+			// The mode says which page list the selected part indexes, so a
+			// switch to master view draws the master page at that index.
+			const mode = app.activeDocument.activeModes[0];
+			// The key names the page on screen by where it sits, which is what
+			// the view asks by, so a switch of part or mode reads as a new page.
+			const partId = cool.vectorIndexKey(part, mode);
+			// A page is drawn only once the master it names has arrived too.
+			const cached = RenderManager.isPartDrawable(part, mode)
+				? RenderManager.requestPart(part, mode)
+				: undefined;
+			if (partId !== this._reportedPartId) {
+				this._reportedPartId = partId;
+				window.app.console.log(
+					'vector view: part=' +
+						part +
+						' mode=' +
+						mode +
+						' ' +
+						(cached ? 'objects=' + cached.objects.size : 'not ready'),
+				);
+			}
+			// while the page's objects are asked for again, its controls stay as they are
+			if (
+				cached ||
+				String(RenderManager.partIdAt(part, mode)) !==
+					VectorFormControlLayer.shownPart
+			)
+				VectorFormControlLayer.update(
+					cached,
+					this.myTopLeft[0] -
+						app.activeDocument.activeLayout.viewedRectangle.pX1,
+					this.myTopLeft[1] -
+						app.activeDocument.activeLayout.viewedRectangle.pY1,
+					app.twipsToPixels,
+				);
+			if (!cached) {
+				// Data not ready. Blit the prior frame only when it holds
+				// the page now at this index, so the view keeps the current
+				// page until its fresh data arrives.
+				const pageId = RenderManager.partIdAt(part, mode);
+				if (
+					this._offscreen &&
+					pageId !== undefined &&
+					this._offscreenPart === pageId
+				) {
+					this.context.drawImage(this._offscreen, 0, 0);
+				}
+				return;
+			}
+
+			const scale = app.twipsToPixels;
+			const viewedRectangle = app.activeDocument.activeLayout.viewedRectangle;
+			// The section container has translated the context to the
+			// section top-left, which equals the document anchor. So the
+			// scroll offset alone maps the part origin into place.
+			const offsetX = -viewedRectangle.pX1;
+			const offsetY = -viewedRectangle.pY1;
+
+			const w = this.context.canvas.width;
+			const h = this.context.canvas.height;
+			this._ensureOffscreen(w, h);
+
+			/*
+				Inside an entered group the rest of the page is drawn pale and what lies in front
+				of the group transparent; for an object active in place, whose surround is dimmed
+				already, only what lies in front of it. Entering and leaving draw it anew.
+			*/
+			const place = Interaction.placeOf(GraphicSelection.selectedObjectIDs);
+			const edited =
+				place.kind === 'group' || place.kind === 'diagram'
+					? { objectId: place.group, paleOutside: true }
+					: place.kind === 'table' && place.group
+						? { objectId: place.group, paleOutside: true }
+						: place.kind === 'inPlace'
+							? { objectId: place.object, paleOutside: false }
+							: undefined;
+
+			// An object active in place covers the upright window its parts are drawn into.
+			const activeInPlace =
+				place.kind === 'inPlace' && GraphicSelection.inPlaceArea
+					? {
+							objectId: place.object,
+							area: GraphicSelection.inPlaceArea.slice(),
+						}
+					: undefined;
+
+			// out of design mode the form controls work as controls and are not drawn into the page
+			const withoutFormControls = !app.map.isFormControlDesignMode();
+
+			// The objects drawn elsewhere are left out of the page, so the drawing is made again
+			// when they change.
+			const renderKey =
+				String(withoutFormControls) +
+				':' +
+				String(edited?.objectId) +
+				':' +
+				String(activeInPlace?.area) +
+				':' +
+				RenderManager.drawnElsewhereVersion() +
+				':' +
+				cached.partId +
+				':' +
+				scale +
+				':' +
+				offsetX +
+				':' +
+				offsetY +
+				':' +
+				w +
+				':' +
+				h;
+			if (renderKey !== this._lastRenderKey) {
+				this._offscreenCtx.clearRect(0, 0, w, h);
+				this._offscreenCtx.save();
+				this._offscreenCtx.translate(offsetX, offsetY);
+				this._offscreenCtx.scale(scale, scale);
+				RenderManager.renderInto(this._offscreenCtx, cached, {
+					editView: true,
+					edited: edited,
+					activeInPlace: activeInPlace,
+					withoutFormControls: withoutFormControls,
+				});
+				// The view edits the page, so it marks out the placeholders.
+				RenderManager.renderPlaceholderAids(this._offscreenCtx, cached);
+				this._offscreenCtx.restore();
+				this._lastRenderKey = renderKey;
+				this._offscreenPart = cached.partId;
+			}
+			this.context.drawImage(this._offscreen, 0, 0);
+		}
+
+		private _drawFileBasedView(): void {
+			const layout = app.activeDocument.activeLayout as ViewLayoutFileBased;
+			const pages = layout.viewRectangles;
+			if (!pages) return;
+
+			// The pages sit centred in one column of the layout, and the scroll position is in
+			// the same core pixels. The context starts at the document anchor.
+			const scrollX = layout.scrollProperties.viewX;
+			const scrollY = layout.scrollProperties.viewY;
+			const visible = cool.SimpleRectangle.fromCorePixels([
+				scrollX,
+				scrollY,
+				this.size[0],
+				this.size[1],
+			]);
+
+			const scale = app.twipsToPixels;
+
+			for (let part = 0; part < pages.length; part++) {
+				const page = pages[part];
+				if (!visible.intersectsRectangle(page.toArray())) continue;
+
+				// The file-based view scrolls the slides, never a master page. A slide is
+				// drawn once the master it names has arrived too.
+				const cached = RenderManager.isPartDrawable(
+					part,
+					cool.VectorMode.Slides,
+				)
+					? RenderManager.requestPart(part, cool.VectorMode.Slides)
+					: undefined;
+				if (!cached) continue;
+
+				this.context.save();
+				this.context.translate(page.pX1 - scrollX, page.pY1 - scrollY);
+				this.context.scale(scale, scale);
+				// Nobody edits a page in this view, so it draws the page without the
+				// content an editing view adds and without the placeholder outlines.
+				RenderManager.renderInto(this.context, cached);
+				this.context.restore();
+			}
+		}
+	}
+}

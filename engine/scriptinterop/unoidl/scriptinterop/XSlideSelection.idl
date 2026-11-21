@@ -1,0 +1,81 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** The selection in the presentation's view.
+
+    Each getter reads the view at the moment it is called, so the result follows later changes
+    to the selection.
+
+    @gas Selection
+ */
+interface XSlideSelection : XBase
+{
+    /** Returns the page shown in the view.
+
+        In the normal view this is a slide. In the master, notes or handout views it is a page of
+        that kind.
+
+        @returns
+            The current page, or null when there is no drawing view.
+
+        @gas Selection.getCurrentPage
+     */
+    com::sun::star::beans::Optional<XPage> getCurrentPage();
+
+    /** @returns
+            The selected page elements, or null when no page element is selected.
+
+        @gas Selection.getPageElementRange
+     */
+    com::sun::star::beans::Optional<XPageElementRange> getPageElementRange();
+
+    /** Returns the pages selected in the slide sorter.
+
+        @returns
+            The selected pages, or null when the view does not report selected pages.
+
+        @gas Selection.getPageRange
+     */
+    com::sun::star::beans::Optional<XPageRange> getPageRange();
+
+    /** The result is TEXT while text is being edited, PAGE_ELEMENT when page elements are
+        selected, PAGE when pages are selected in the slide sorter, CURRENT_PAGE when nothing is
+        selected on the shown page, and NONE when there is no current page. TABLE_CELL is not
+        reported yet.
+
+        @gas Selection.getSelectionType
+     */
+    SelectionType getSelectionType();
+
+    /** @returns
+            The selected cells, or null when no table cells are selected.
+
+        @unimplemented
+        @gas Selection.getTableCellRange
+     */
+    com::sun::star::beans::Optional<XSlideTableCellRange> getTableCellRange();
+
+    /** Returns the text that is highlighted in the shape being edited, or the position of the
+        cursor in it as an empty range when nothing is highlighted.
+
+        @returns
+            The text range, or null when no text is being edited.
+
+        @gas Selection.getTextRange
+     */
+    com::sun::star::beans::Optional<XTextRange> getTextRange();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

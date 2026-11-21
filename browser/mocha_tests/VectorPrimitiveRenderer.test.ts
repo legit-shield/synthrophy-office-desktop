@@ -1,0 +1,2035 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+describe('VectorPrimitiveRenderer', function () {
+	// The renderer constructs new Path2D and new Image. Stand-ins
+	// capture the constructor arguments and let the renderer treat
+	// the resulting object as a ready resource.
+	let originalPath2D: any;
+	let originalImage: any;
+
+	before(function () {
+		originalPath2D = (globalThis as any).Path2D;
+		(globalThis as any).Path2D = Path2DRecorder;
+		originalImage = (globalThis as any).Image;
+		(globalThis as any).Image = ImageRecorder;
+	});
+
+	after(function () {
+		(globalThis as any).Path2D = originalPath2D;
+		(globalThis as any).Image = originalImage;
+	});
+
+	// Each fixture is a single primitive built with the drawinglayer
+	// primitive constructor, so we can test the primitive in isolation.
+	// The page rectangle rides on the entry that stands for the page, which is
+	// the first object of a reply.
+	function pageBounds(primitiveTree: any): [number, number] {
+		for (const object of primitiveTree.objects) {
+			if (object.kind === 'page') return [object.width, object.height];
+		}
+		throw new Error('the reply carries no page entry');
+	}
+
+	// The first drawing object of a reply, the page entry aside. A fixture built
+	// from a document with one shape on it has exactly one.
+	function firstShape(primitiveTree: any): any {
+		for (const object of primitiveTree.objects) {
+			if (object.kind !== 'page') return object;
+		}
+		throw new Error('the reply carries no drawing object');
+	}
+
+	describe('Primitives', function () {
+		afterEach(function () {
+			ScratchCanvasStub.uninstall();
+		});
+
+		// Draws a text run at (50, 100), scaled by 10 at font size 10, with the given fields
+		// over those defaults, and returns the recorder of the drawing calls. The stub canvas
+		// measures every character 10 wide.
+		function drawRun(fields: any): CanvasRecorder {
+			const text = fields.text ?? 'ab';
+			const recorder = new CanvasRecorder(200, 150);
+			new cool.VectorPrimitiveRenderer().renderPrimitive(recorder as any, {
+				type: 'textSimplePortion',
+				text,
+				textPosition: 0,
+				textLength: text.length,
+				matrix: [10, 0, 0, 10, 50, 100],
+				fontSize: 10,
+				fontcolor: '#000000',
+				familyname: 'Arial',
+				...fields,
+			});
+			return recorder;
+		}
+
+		it('draws a run whole when the browser width matches its advances', function () {
+			const recorder = drawRun({
+				advances: [10, 10],
+			});
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 1);
+			nodeassert.deepStrictEqual(fills[0].args, ['ab', 50, 100]);
+		});
+
+		it('draws each word at the sum of the advances before it', function () {
+			// On this justified line the space steps 40 but measures 10, so the
+			// second word starts at 50 + 10 + 10 + 40. Each word matches its
+			// advances, so neither is stretched.
+			const recorder = drawRun({
+				text: 'ab cd',
+				advances: [10, 10, 40, 10, 10],
+			});
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 2);
+			nodeassert.deepStrictEqual(fills[0].args, ['ab', 50, 100]);
+			nodeassert.deepStrictEqual(fills[1].args, ['cd', 110, 100]);
+			nodeassert.strictEqual(recorder.callsOf('scale').length, 0);
+		});
+
+		it('stretches a word to its advances when the browser measures another width', function () {
+			// The advances make the word 70 wide and the browser measures 20.
+			const recorder = drawRun({
+				advances: [30, 40],
+			});
+
+			nodeassert.deepStrictEqual(
+				recorder.callsOf('translate')[0].args,
+				[50, 100],
+			);
+			nodeassert.deepStrictEqual(recorder.callsOf('scale')[0].args, [3.5, 1]);
+			nodeassert.deepStrictEqual(recorder.callsOf('fillText')[0].args, [
+				'ab',
+				0,
+				0,
+			]);
+		});
+
+		it('draws a letter with its combining mark, and a surrogate pair, each whole', function () {
+			// A letter with a combining accent, then a character of two UTF-16
+			// units. The advances have one entry per unit.
+			const pair = '\u{1F600}';
+			const accented = 'e\u0301';
+			const recorder = drawRun({
+				text: accented + ' ' + pair,
+				advances: [10, 0, 30, 20, 0],
+			});
+
+			const drawn = recorder
+				.callsOf('fillText')
+				.map((call: any) => call.args[0]);
+			nodeassert.deepStrictEqual(drawn, [accented, pair]);
+		});
+
+		it('stands the upright characters of a vertical run upright', function () {
+			// The run goes down the page at font size 10, so it draws under a
+			// transform from its start. The stub canvas reports no font box, so
+			// the middle of the line is 0.38 of the font size above the baseline.
+			const recorder = drawRun({
+				text: 'A\u65e5\u672cB',
+				matrix: [0, 10, -10, 0, 50, 100],
+				advances: [10, 10, 10, 10],
+				upright: [[1, 3]],
+			});
+
+			const middle = -(10 * 0.38);
+			nodeassert.deepStrictEqual(
+				recorder.callsOf('fillText').map((call: any) => call.args),
+				[
+					['A', 0, 0],
+					['\u65e5', 0, 0],
+					['\u672c', 0, 0],
+					['B', 30, 0],
+				],
+			);
+			nodeassert.deepStrictEqual(
+				recorder.callsOf('translate').map((call: any) => call.args),
+				[
+					[15, middle],
+					[25, middle],
+				],
+			);
+			nodeassert.deepStrictEqual(
+				recorder.callsOf('rotate').map((call: any) => call.args),
+				[[-Math.PI / 2], [-Math.PI / 2]],
+			);
+		});
+
+		it('stretches a right-to-left word to its advances', function () {
+			// The browser orders and shapes right-to-left text. The engine ends
+			// the word after its advances, 70 wide, and the browser measures 20.
+			const recorder = drawRun({
+				rtl: true,
+				advances: [30, 40],
+			});
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 1);
+			nodeassert.deepStrictEqual(fills[0].args, ['ab', 0, 0]);
+			// Brackets and other neutral characters are ordered from the right.
+			nodeassert.strictEqual(fills[0].properties.direction, 'rtl');
+			nodeassert.deepStrictEqual(
+				recorder.callsOf('translate')[0].args,
+				[50, 100],
+			);
+			nodeassert.deepStrictEqual(recorder.callsOf('scale')[0].args, [3.5, 1]);
+		});
+
+		it('places the words of a right-to-left run from its right end', function () {
+			// The space steps 40, as on a justified line, so the run ends at
+			// 50 + 80. The first word is at the right end, 20 wide, and the
+			// second one at the left.
+			const recorder = drawRun({
+				text: 'ab cd',
+				rtl: true,
+				advances: [10, 10, 40, 10, 10],
+			});
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.deepStrictEqual(
+				fills.map((call: any) => call.args),
+				[
+					['ab', 110, 100],
+					['cd', 50, 100],
+				],
+			);
+			nodeassert.ok(
+				fills.every((call: any) => call.properties.direction === 'rtl'),
+			);
+		});
+
+		it('draws a right-to-left run without advances as the browser lays it out', function () {
+			const recorder = drawRun({ rtl: true });
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 1);
+			nodeassert.deepStrictEqual(fills[0].args, ['ab', 50, 100]);
+			nodeassert.strictEqual(recorder.callsOf('scale').length, 0);
+		});
+
+		it('places words by their advances in a transformed run', function () {
+			// The matrix scales by 20 at font size 10, so the run draws under a
+			// transform and the advances are halved into drawing units.
+			const recorder = drawRun({
+				text: 'ab cd',
+				matrix: [20, 0, 0, 20, 50, 100],
+				advances: [20, 20, 80, 20, 20],
+			});
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 2);
+			nodeassert.deepStrictEqual(fills[0].args, ['ab', 0, 0]);
+			nodeassert.deepStrictEqual(fills[1].args, ['cd', 60, 0]);
+		});
+
+		it('spans decorations over the width of the advances', function () {
+			// The advances make the run 70 wide and the browser measures 20, so
+			// the underline's end shows which width was used.
+			const recorder = drawRun({
+				type: 'textDecoratedPortion',
+				underline: true,
+				advances: [30, 40],
+			});
+
+			const lines = recorder.callsOf('lineTo');
+			nodeassert.strictEqual(lines.length, 1);
+			nodeassert.strictEqual(lines[0].args[0], 50 + 70);
+		});
+
+		it('spans the decorations of a right-to-left run over its advances', function () {
+			const recorder = drawRun({
+				type: 'textDecoratedPortion',
+				underline: true,
+				rtl: true,
+				advances: [30, 40],
+			});
+
+			const lines = recorder.callsOf('lineTo');
+			nodeassert.strictEqual(lines.length, 1);
+			nodeassert.strictEqual(lines[0].args[0], 50 + 70);
+		});
+
+		it('draws sheared text with the matrix shear', function () {
+			// The whole matrix, divided by the font size, goes onto
+			// the canvas, so glyphs land sheared and not only rotated.
+			const primitive = {
+				type: 'textSimplePortion',
+				text: 'Hi',
+				fontSize: 20,
+				matrix: [20, 0, 10, 20, 5, 7],
+			} as any;
+
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.renderPrimitive(recorder as any, primitive);
+
+			const transform = recorder.findCall('transform');
+			nodeassert.ok(transform, 'transform not called');
+			nodeassert.deepStrictEqual(transform.args, [1, 0, 0.5, 1, 5, 7]);
+			const fillText = recorder.findCall('fillText');
+			nodeassert.ok(fillText, 'fillText not called');
+			nodeassert.strictEqual(fillText?.args[1], 0);
+			nodeassert.strictEqual(fillText?.args[2], 0);
+		});
+
+		it('draws flipped text with the matrix flip', function () {
+			// An axis-aligned flip has no rotation or shear, only a
+			// negative vertical scale, and still reaches the canvas.
+			const primitive = {
+				type: 'textSimplePortion',
+				text: 'Hi',
+				fontSize: 20,
+				matrix: [20, 0, 0, -20, 5, 7],
+			} as any;
+
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.renderPrimitive(recorder as any, primitive);
+
+			const transform = recorder.findCall('transform');
+			nodeassert.ok(transform, 'transform not called');
+			nodeassert.deepStrictEqual(transform.args, [1, 0, 0, -1, 5, 7]);
+		});
+
+		// A decorated run of "ab" in automatic black text, with the given fields over those
+		// defaults.
+		function decoratedRun(fields: any): any {
+			return {
+				type: 'textDecoratedPortion',
+				text: 'ab',
+				textPosition: 0,
+				textLength: 2,
+				matrix: [24, 0, 0, 24, 50, 100],
+				fontSize: 24,
+				fontcolor: '#000000',
+				familyname: 'Arial',
+				underline: 1,
+				...fields,
+			};
+		}
+
+		const underlineStroke = (color: string): any => ({
+			type: 'polygonStroke',
+			path: 'M50 105h20',
+			line: { color: color, width: 2 },
+		});
+
+		it('draws the decorations of the engine in their own colors', function () {
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				decoratedRun({ decorations: [underlineStroke('#FF0000')] }),
+			);
+
+			const strokes = recorder.callsOf('stroke');
+			nodeassert.strictEqual(strokes.length, 1);
+			nodeassert.strictEqual(strokes[0].properties.strokeStyle, '#FF0000');
+			nodeassert.strictEqual(strokes[0].args[0].path, 'M50 105h20');
+		});
+
+		it('draws the decorations in the text color in the color the automatic text gets', function () {
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				decoratedRun({
+					fontcolor: 'auto',
+					backdrop: '#000000',
+					decorationsInTextColor: [underlineStroke('#000000')],
+				}),
+			);
+
+			// Automatic text on black is white, and so is its underline.
+			nodeassert.strictEqual(
+				recorder.findCall('fillText')!.properties.fillStyle,
+				'#FFFFFF',
+			);
+			const strokes = recorder.callsOf('stroke');
+			nodeassert.strictEqual(strokes.length, 1);
+			nodeassert.strictEqual(strokes[0].properties.strokeStyle, '#FFFFFF');
+		});
+
+		it('draws a light gray shadow a twenty-fourth of the font size under black text', function () {
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				decoratedRun({
+					shadow: true,
+					decorations: [underlineStroke('#000000')],
+				}),
+			);
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 2);
+			nodeassert.strictEqual(fills[0].properties.fillStyle, '#C0C0C0');
+			nodeassert.strictEqual(fills[1].properties.fillStyle, '#000000');
+			nodeassert.deepStrictEqual(recorder.findCall('translate')!.args, [1, 1]);
+
+			// The underline casts a shadow as well.
+			const strokes = recorder.callsOf('stroke');
+			nodeassert.strictEqual(strokes.length, 2);
+			nodeassert.strictEqual(strokes[0].properties.strokeStyle, '#C0C0C0');
+			nodeassert.strictEqual(strokes[1].properties.strokeStyle, '#000000');
+		});
+
+		it('draws engraved black text in white over a black copy up and to the left', function () {
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				decoratedRun({ relief: 2, shadow: true }),
+			);
+
+			// Relief leaves out the shadow.
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 2);
+			nodeassert.strictEqual(fills[0].properties.fillStyle, '#000000');
+			nodeassert.strictEqual(fills[1].properties.fillStyle, '#FFFFFF');
+			const [x, y] = recorder.findCall('translate')!.args;
+			nodeassert.ok(x < 0 && y < 0, 'the copy moves up and to the left');
+			nodeassert.ok(Math.abs(x + 1.1 / Math.SQRT2) < 1e-9);
+		});
+
+		it('draws colored text with relief over a light gray copy down and to the right', function () {
+			// Text in a color other than black gets this relief also when engraved.
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				decoratedRun({ relief: 2, fontcolor: '#0000FF' }),
+			);
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 2);
+			nodeassert.strictEqual(fills[0].properties.fillStyle, '#BFBFBF');
+			nodeassert.strictEqual(fills[1].properties.fillStyle, '#0000FF');
+			const [x, y] = recorder.findCall('translate')!.args;
+			nodeassert.ok(x > 0 && y > 0, 'the copy moves down and to the right');
+		});
+
+		it('fills the highlight behind the text', function () {
+			const recorder = drawRun({
+				fillcolor: '#FFFF00',
+				highlight: { path: 'M50 80h20v25h-20z' },
+			});
+
+			const fill = recorder.findCall('fill')!;
+			nodeassert.strictEqual(fill.properties.fillStyle, '#FFFF00');
+			nodeassert.strictEqual(fill.args[0].path, 'M50 80h20v25h-20z');
+			nodeassert.ok(
+				recorder.calls.indexOf(fill) <
+					recorder.calls.indexOf(recorder.findCall('fillText')!),
+				'the highlight lies behind the text',
+			);
+		});
+
+		it('outlines text with copies a pixel away in eight directions under white', function () {
+			const recorder = drawRun({ outline: true, fontcolor: '#0000FF' });
+
+			const fills = recorder.callsOf('fillText');
+			nodeassert.strictEqual(fills.length, 9);
+			for (let k = 0; k < 8; k++)
+				nodeassert.strictEqual(fills[k].properties.fillStyle, '#0000FF');
+			nodeassert.strictEqual(fills[8].properties.fillStyle, '#FFFFFF');
+			nodeassert.strictEqual(recorder.callsOf('strokeText').length, 0);
+			nodeassert.strictEqual(recorder.callsOf('translate').length, 8);
+		});
+
+		it('changes the colors of a graphic once for every draw', function () {
+			ScratchCanvasStub.install();
+			const primitive = {
+				type: 'graphic',
+				checksum: 7,
+				matrix: [100, 0, 0, 100, 0, 0],
+				colorModifiers: [{ modifier: 'invert' }],
+			} as any;
+			const cachedImage = new ImageRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer(
+				() => cachedImage as unknown as HTMLImageElement,
+			);
+			const first = new CanvasRecorder();
+			const second = new CanvasRecorder();
+			renderer.renderPrimitive(first as any, primitive);
+			renderer.renderPrimitive(second as any, primitive);
+
+			nodeassert.strictEqual(ScratchCanvasStub.created.length, 1);
+			nodeassert.strictEqual(
+				second.findCall('drawImage')?.args[0],
+				ScratchCanvasStub.recorder(0).canvas,
+			);
+
+			// Other changes to the same image get a copy of their own.
+			renderer.renderPrimitive(new CanvasRecorder() as any, {
+				...primitive,
+				colorModifiers: [{ modifier: 'gray' }],
+			});
+			nodeassert.strictEqual(ScratchCanvasStub.created.length, 2);
+		});
+
+		it('draws a graphic in its own colors when no canvas is left for a copy', function () {
+			ScratchCanvasStub.installUnavailable();
+			const primitive = {
+				type: 'graphic',
+				checksum: 7,
+				matrix: [100, 0, 0, 100, 0, 0],
+				colorModifiers: [{ modifier: 'invert' }],
+			} as any;
+			const cachedImage = new ImageRecorder();
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer(
+				() => cachedImage as unknown as HTMLImageElement,
+			).renderPrimitive(recorder as any, primitive);
+
+			nodeassert.strictEqual(
+				recorder.findCall('drawImage')?.args[0],
+				cachedImage,
+			);
+		});
+
+		it('draws a graphic through an SVG filter where the canvas has one', function () {
+			ScratchCanvasStub.install();
+			const primitive = {
+				type: 'graphic',
+				checksum: 7,
+				matrix: [100, 0, 0, 100, 0, 0],
+				colorModifiers: [{ modifier: 'gray' }],
+			} as any;
+			const cachedImage = new ImageRecorder();
+			const recorder = new CanvasRecorder();
+			// A canvas that has filters starts with none.
+			(recorder as any).filter = 'none';
+			const renderer = new cool.VectorPrimitiveRenderer(
+				() => cachedImage as unknown as HTMLImageElement,
+			);
+			renderer.renderPrimitive(recorder as any, primitive);
+
+			// The image itself goes through the filter, with no copy.
+			const draw = recorder.findCall('drawImage');
+			nodeassert.ok(draw, 'drawImage not called');
+			nodeassert.strictEqual(draw.args[0], cachedImage);
+			const match = /^url\(#(.+)\)$/.exec(draw.properties.filter);
+			nodeassert.ok(match, 'drawn through an SVG filter');
+			nodeassert.ok(document.getElementById(match![1]));
+			nodeassert.strictEqual(ScratchCanvasStub.created.length, 0);
+
+			renderer.releaseColorChangedImages();
+			nodeassert.strictEqual(document.getElementById(match![1]), null);
+		});
+
+		it('makes the copy of a graphic at the size it is drawn at', function () {
+			ScratchCanvasStub.install();
+			const cachedImage = new ImageRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer(
+				() => cachedImage as unknown as HTMLImageElement,
+			);
+			// The image is 100 pixels square and drawn at 10.
+			renderer.renderPrimitive(
+				new CanvasRecorder() as any,
+				{
+					type: 'graphic',
+					checksum: 7,
+					matrix: [10, 0, 0, 10, 0, 0],
+					colorModifiers: [{ modifier: 'invert' }],
+				} as any,
+			);
+
+			const copy = ScratchCanvasStub.recorder(0);
+			nodeassert.strictEqual(copy.canvas.width, 13);
+			nodeassert.strictEqual(copy.canvas.height, 13);
+		});
+
+		it('insets a margined image inside its frame', function () {
+			// An image rectangle inside the unit square leaves the
+			// surrounding frame empty.
+			const primitive = {
+				type: 'graphic',
+				checksum: 7,
+				matrix: [100, 0, 0, 100, 0, 0],
+				imageRect: { x: 0.5, y: 0.5, width: 0.75, height: 0.75 },
+			} as any;
+
+			const cachedImage = new ImageRecorder();
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer(
+				() => cachedImage as unknown as HTMLImageElement,
+			);
+			renderer.renderPrimitive(recorder as any, primitive);
+
+			const draw = recorder.findCall('drawImage');
+			nodeassert.ok(draw, 'drawImage not called');
+			nodeassert.deepStrictEqual(draw.args.slice(1), [0.5, 0.5, 0.75, 0.75]);
+			nodeassert.ok(recorder.findCall('clip'), 'clip not called');
+		});
+
+		it('composes nested color modifiers inner first without a scratch canvas', function () {
+			// Both modifiers apply, the inner one first as in the
+			// engine, so its filter leads the canvas filter list.
+			ScratchCanvasStub.installUnavailable();
+			const primitive = {
+				type: 'modifiedColor',
+				modifier: 'gray',
+				children: [
+					{
+						type: 'modifiedColor',
+						modifier: 'invert',
+						children: [
+							{
+								type: 'polyPolygonColor',
+								color: '#ff0000',
+								path: 'M 0 0 L 10 0 L 10 10 Z',
+							},
+						],
+					},
+				],
+			} as any;
+
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.renderPrimitive(recorder as any, primitive);
+
+			const fill = recorder.findCall('fill');
+			nodeassert.ok(fill, 'fill not called');
+			nodeassert.strictEqual(fill?.properties.filter, 'invert(1) grayscale(1)');
+		});
+
+		it('keeps a modified color to the bounds of its subtree', function () {
+			ScratchCanvasStub.install();
+			const recorder = new CanvasRecorder(200, 200);
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				{
+					type: 'modifiedColor',
+					modifier: 'gray',
+					bounds: [10, 10, 50, 50],
+					children: [
+						{
+							type: 'polyPolygonColor',
+							color: '#ff0000',
+							path: 'M 10 10 L 50 10 L 50 50 Z',
+						},
+					],
+				} as any,
+			);
+
+			// A pixel more on each side for the antialiased edge.
+			nodeassert.strictEqual(ScratchCanvasStub.recorder(0).canvas.width, 42);
+			const draw = recorder.findCall('drawImage');
+			nodeassert.ok(draw);
+			nodeassert.deepStrictEqual(draw.args.slice(1), [9, 9]);
+		});
+
+		it('applies a nested color modifier before the one around it', function () {
+			ScratchCanvasStub.install();
+			const recorder = new CanvasRecorder(200, 200);
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				{
+					type: 'modifiedColor',
+					modifier: 'gray',
+					children: [
+						{
+							type: 'modifiedColor',
+							modifier: 'invert',
+							children: [
+								{
+									type: 'polyPolygonColor',
+									color: '#ff0000',
+									path: 'M 0 0 L 10 0 L 10 10 Z',
+								},
+							],
+						},
+					],
+				} as any,
+			);
+
+			// The outer content canvas comes first, then the three of
+			// the inner modifier, whose result lands on the outer
+			// content before the outer grays it.
+			const outerContent = ScratchCanvasStub.recorder(0);
+			const innerColor = ScratchCanvasStub.recorder(2);
+			const outerColor = ScratchCanvasStub.recorder(4);
+			nodeassert.strictEqual(
+				outerContent.findCall('drawImage')?.args[0],
+				innerColor.canvas,
+			);
+			nodeassert.ok(
+				outerColor
+					.callsOf('fillRect')
+					.some(
+						(call) => call.properties.globalCompositeOperation === 'saturation',
+					),
+			);
+			nodeassert.strictEqual(recorder.countOf('drawImage'), 1);
+		});
+
+		it('draws a replaced subtree in its own colors without a scratch canvas', function () {
+			ScratchCanvasStub.installUnavailable();
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				{
+					type: 'modifiedColor',
+					modifier: 'replace',
+					color: '#ff0000',
+					children: [
+						{
+							type: 'polyPolygonColor',
+							color: '#0000ff',
+							path: 'M 0 0 L 10 0 L 10 10 Z',
+						},
+					],
+				} as any,
+			);
+
+			nodeassert.strictEqual(recorder.countOf('fill'), 1);
+			nodeassert.strictEqual(
+				recorder.findCall('fill')?.properties.fillStyle,
+				'#0000ff',
+			);
+		});
+	});
+
+	// Fixtures from documents. Each fixture is a full reply built
+	// by the same pipeline a real Impress document would go through,
+	// so the renderer is exercised against a realistic primitive
+	// tree rather than a single isolated primitive.
+	describe('SVG gradients', function () {
+		// A rectangle from (100, 100) to (300, 200), its unit gradient spanning the width, red
+		// to half transparent blue.
+		function svgGradient(fields: any): any {
+			return {
+				type: 'svgLinearGradient',
+				path: 'M100 100h200v100h-200z',
+				bounds: [100, 100, 300, 200],
+				unitToObject: [200, 0, 0, 1, 100, 100],
+				spreadMethod: 'pad',
+				colorStops: [
+					{ offset: 0, color: '#ff0000' },
+					{ offset: 1, color: '#0000ff', opacity: 0.5 },
+				],
+				...fields,
+			};
+		}
+
+		function draw(primitive: any): CanvasRecorder {
+			const recorder = new CanvasRecorder(400, 300);
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				primitive,
+			);
+			return recorder;
+		}
+
+		it('fills a linear gradient across the shape in the unit gradient', function () {
+			const recorder = draw(svgGradient({}));
+
+			nodeassert.strictEqual(recorder.gradients.length, 1);
+			const ramp = recorder.gradients[0];
+			nodeassert.strictEqual(ramp.kind, 'linear');
+			nodeassert.deepStrictEqual(ramp.args, [0, 0, 1, 0]);
+			nodeassert.deepStrictEqual(ramp.sortedStops(), [
+				{ offset: 0, color: 'rgba(255,0,0,1)' },
+				{ offset: 1, color: 'rgba(0,0,255,0.5)' },
+			]);
+			nodeassert.ok(
+				recorder.findCall('clip'),
+				'the ramp shows through the path',
+			);
+			nodeassert.deepStrictEqual(
+				recorder.findCall('fillRect')!.args,
+				[0, 0, 1, 100],
+			);
+		});
+
+		it('starts the stops over in each unit of a repeating gradient', function () {
+			// The unit gradient is a quarter of the width, so the shape spans four units.
+			const recorder = draw(
+				svgGradient({
+					spreadMethod: 'repeat',
+					unitToObject: [50, 0, 0, 1, 100, 100],
+				}),
+			);
+
+			const ramp = recorder.gradients[0];
+			nodeassert.deepStrictEqual(ramp.args, [0, 0, 4, 0]);
+			// Each unit has its two stops and the colors of its ends.
+			nodeassert.strictEqual(ramp.stops.length, 16);
+			nodeassert.deepStrictEqual(ramp.stops[4], {
+				offset: 0.25,
+				color: 'rgba(255,0,0,1)',
+			});
+		});
+
+		it('runs every other unit backwards in a reflected gradient', function () {
+			const recorder = draw(
+				svgGradient({
+					spreadMethod: 'reflect',
+					unitToObject: [100, 0, 0, 1, 100, 100],
+				}),
+			);
+
+			const ramp = recorder.gradients[0];
+			nodeassert.deepStrictEqual(ramp.args, [0, 0, 2, 0]);
+			// The second unit starts with blue and ends with red.
+			nodeassert.strictEqual(ramp.stops[4].color, 'rgba(0,0,255,0.5)');
+			nodeassert.strictEqual(ramp.stops[7].color, 'rgba(255,0,0,1)');
+		});
+
+		it('fills a gradient with one stop with its color', function () {
+			const recorder = draw(
+				svgGradient({
+					unitToObject: undefined,
+					colorStops: [{ offset: 0.5, color: '#00ff00' }],
+				}),
+			);
+
+			nodeassert.strictEqual(recorder.gradients.length, 0);
+			const fill = recorder.findCall('fill')!;
+			nodeassert.strictEqual(fill.properties.fillStyle, 'rgba(0,255,0,1)');
+		});
+
+		it('draws nothing for a gradient without a mapping', function () {
+			const recorder = draw(svgGradient({ unitToObject: undefined }));
+
+			nodeassert.strictEqual(recorder.gradients.length, 0);
+			nodeassert.strictEqual(recorder.callsOf('fill').length, 0);
+			nodeassert.strictEqual(recorder.callsOf('fillRect').length, 0);
+		});
+
+		it('fills a radial gradient out to the farthest corner of the shape', function () {
+			// The unit circle has radius 100 around (100, 100), the top left corner, so the
+			// farthest corner is sqrt(2^2 + 1^2) units away.
+			const recorder = draw(
+				svgGradient({
+					type: 'svgRadialGradient',
+					unitToObject: [100, 0, 0, 100, 100, 100],
+				}),
+			);
+
+			const ramp = recorder.gradients[0];
+			nodeassert.strictEqual(ramp.kind, 'radial');
+			const reach = Math.sqrt(5);
+			nodeassert.deepStrictEqual(ramp.args, [0, 0, 0, 0, 0, reach]);
+			nodeassert.strictEqual(ramp.stops[1].offset, 1 / reach);
+		});
+
+		it('moves the small circles of a radial gradient towards the focal point', function () {
+			const recorder = draw(
+				svgGradient({
+					type: 'svgRadialGradient',
+					unitToObject: [100, 0, 0, 100, 100, 100],
+					focalStep: [0.1, 0],
+				}),
+			);
+
+			const reach = Math.sqrt(5);
+			const [x0, y0, r0, x1, y1, r1] = recorder.gradients[0].args;
+			nodeassert.ok(Math.abs(x0 - 0.1 * reach) < 1e-9);
+			nodeassert.deepStrictEqual([y0, r0, x1, y1, r1], [0, 0, 0, 0, reach]);
+		});
+	});
+
+	describe('Types without a drawing of their own', function () {
+		// A stroke that every case below holds as its only child.
+		const line = {
+			type: 'polygonHairline',
+			color: '#ff0000',
+			path: 'M 0 0 L 10 10',
+		};
+
+		let warnings: string[];
+		let originalWarn: any;
+
+		beforeEach(function () {
+			warnings = [];
+			originalWarn = window.app.console.warn;
+			window.app.console.warn = (...args: any[]) => {
+				warnings.push(args.join(' '));
+			};
+		});
+
+		afterEach(function () {
+			window.app.console.warn = originalWarn;
+		});
+
+		function render(primitive: any): CanvasRecorder {
+			const recorder = new CanvasRecorder();
+			new cool.VectorPrimitiveRenderer().renderPrimitive(
+				recorder as any,
+				primitive,
+			);
+			return recorder;
+		}
+
+		it('draws the tail of a caption as its line', function () {
+			const recorder = render({ type: 'captionTail', children: [line] });
+			nodeassert.strictEqual(recorder.countOf('stroke'), 1);
+			nodeassert.deepStrictEqual(warnings, []);
+		});
+
+		it('draws the structure of a text and a decomposed primitive quietly', function () {
+			for (const type of ['textHierarchyParagraph', 'svx:12']) {
+				const recorder = render({ type: type, children: [line] });
+				nodeassert.strictEqual(recorder.countOf('stroke'), 1, type);
+			}
+			nodeassert.deepStrictEqual(warnings, []);
+		});
+
+		it('names a type it cannot draw and still draws its children', function () {
+			const recorder = render({
+				type: 'unknownToTheRenderer',
+				children: [line],
+			});
+			nodeassert.strictEqual(recorder.countOf('stroke'), 1);
+			nodeassert.strictEqual(warnings.length, 1);
+			nodeassert.ok(
+				warnings[0].includes('"unknownToTheRenderer"'),
+				warnings[0],
+			);
+		});
+
+		it('names a type it cannot draw only once', function () {
+			render({ type: 'unknownAndRepeated' });
+			render({ type: 'unknownAndRepeated' });
+			nodeassert.strictEqual(warnings.length, 1);
+		});
+	});
+
+	describe('Spell-check marks', function () {
+		// A mark under a word 20 twips high, along a line 80 twips long, in
+		// the editing view.
+		function drawWrongSpell(
+			zoom: number,
+			fontHeight = 20,
+			editView = true,
+		): CanvasRecorder {
+			const recorder = new CanvasRecorder(400, 300);
+			recorder.scale(zoom, zoom);
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setEditViewContentVisible(editView);
+			renderer.renderPrimitive(
+				recorder as any,
+				{
+					type: 'wrongSpell',
+					color: '#ff0000',
+					fontHeight,
+					startX: 0,
+					startY: 0,
+					endX: 80,
+					endY: 0,
+				} as any,
+			);
+			return recorder;
+		}
+
+		it('draws a red hairline wave with one curve every 8 device pixels', function () {
+			const recorder = drawWrongSpell(1);
+
+			const stroke = recorder.findCall('stroke')!;
+			nodeassert.strictEqual(stroke.properties.strokeStyle, '#ff0000');
+			nodeassert.strictEqual(stroke.properties.lineWidth, 1);
+			const curves = recorder.callsOf('bezierCurveTo');
+			nodeassert.strictEqual(curves.length, 10);
+			// The first wave rises 4 pixels to the side and ends 8 pixels along.
+			nodeassert.deepStrictEqual(curves[0].args, [4, 4, 4, -4, 8, 0]);
+		});
+
+		it('keeps the wave the same size on screen at another zoom', function () {
+			const recorder = drawWrongSpell(2);
+
+			nodeassert.strictEqual(
+				recorder.findCall('stroke')!.properties.lineWidth,
+				0.5,
+			);
+			const curves = recorder.callsOf('bezierCurveTo');
+			nodeassert.strictEqual(curves.length, 20);
+			nodeassert.deepStrictEqual(curves[0].args, [2, 2, 2, -2, 4, 0]);
+		});
+
+		it('draws nothing under a word smaller than 5 device pixels', function () {
+			const recorder = drawWrongSpell(1, 4);
+
+			nodeassert.strictEqual(recorder.callsOf('stroke').length, 0);
+		});
+
+		it('draws no mark outside the editing view', function () {
+			const recorder = drawWrongSpell(1, 20, false);
+
+			nodeassert.strictEqual(recorder.callsOf('stroke').length, 0);
+		});
+	});
+
+	describe('Document references', function () {
+		// The page rectangle rides on the entry that stands for the page,
+		// which is the first object of a reply.
+		function pageBounds(primitiveTree: any): [number, number] {
+			for (const object of primitiveTree.objects) {
+				if (object.kind === 'page') return [object.width, object.height];
+			}
+			throw new Error('the reply carries no page entry');
+		}
+		it('renders the filled-rectangle slide from its document reference', function () {
+			const primitiveTree = loadVectorRenderingReference('testSingleRectangle');
+
+			nodeassert.strictEqual(primitiveTree.type, 'vectorprimitives');
+			nodeassert.strictEqual(typeof pageBounds(primitiveTree)[0], 'number');
+
+			const [pageWidth, pageHeight] = pageBounds(primitiveTree);
+			const recorder = new CanvasRecorder(pageWidth, pageHeight);
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setSlideBounds(pageWidth, pageHeight);
+
+			for (const object of primitiveTree.objects)
+				for (const primitive of object.primitives)
+					renderer.renderPrimitive(recorder as any, primitive);
+
+			// The page carries a background that names no color, which fills
+			// the whole slide with the document background of the view.
+			const fillRect = recorder.findCall('fillRect');
+			nodeassert.ok(fillRect, 'backgroundcolor primitive should fillRect');
+			nodeassert.deepStrictEqual(fillRect.args, [0, 0, pageWidth, pageHeight]);
+			nodeassert.strictEqual(
+				fillRect.properties.fillStyle,
+				cool.VectorColors.DEFAULT_DOCUMENT_BACKGROUND,
+			);
+
+			// The slide has no fill of its own, so the rectangle is the only
+			// path that is filled.
+			const fills = recorder.callsOf('fill');
+			nodeassert.strictEqual(fills.length, 1, 'expected one fill');
+
+			// The blue rectangle renders with its declared colour.
+			nodeassert.strictEqual(recorder.properties.fillStyle, '#4472c4');
+
+			// Path2D should match the path string from the reference
+			// for the blue fill.
+			const lastFill = fills[fills.length - 1];
+			nodeassert.ok(
+				(lastFill.args[0] as Path2DRecorder).path.startsWith('m4251'),
+				'last fill path does not match the reference',
+			);
+
+			// The black rectangle border should have stroked once.
+			const strokes = recorder.callsOf('stroke');
+			nodeassert.strictEqual(strokes.length, 1, 'expected one stroke');
+			nodeassert.strictEqual(recorder.properties.strokeStyle, '#000000');
+		});
+
+		it('renders primitives from testStrokedRectangle.json reference', function () {
+			// A stroke-only rectangle exercises polygonStroke against
+			// the full pipeline. The slide carries no fill, so the only
+			// stroke recorded is the rectangle's own border.
+			const primitiveTree = loadVectorRenderingReference(
+				'testStrokedRectangle',
+			);
+
+			const [pageWidth, pageHeight] = pageBounds(primitiveTree);
+			const recorder = new CanvasRecorder(pageWidth, pageHeight);
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setSlideBounds(pageWidth, pageHeight);
+
+			for (const object of primitiveTree.objects)
+				for (const primitive of object.primitives)
+					renderer.renderPrimitive(recorder as any, primitive);
+
+			const stroke = recorder.findCall('stroke');
+			nodeassert.ok(stroke, 'polygonStroke produced no stroke call');
+			nodeassert.strictEqual(stroke?.properties.strokeStyle, '#000000');
+			nodeassert.ok(
+				stroke && stroke.depth > 0,
+				'stroke must be inside save/restore',
+			);
+			nodeassert.ok(recorder.findCall('save'), 'save not called');
+			nodeassert.ok(recorder.findCall('restore'), 'restore not called');
+		});
+
+		it('renders a group nested in a document tree', function () {
+			// The engine test testSingleRectangle wraps the rectangle's
+			// fill and stroke in a group node. Extract that group and
+			// render it standalone to verify the group walks its
+			// children in order in a real document tree.
+			const primitiveTree = loadVectorRenderingReference('testSingleRectangle');
+
+			// The slide object wraps the rectangle in
+			// svx:N -> group -> [fill, stroke].
+			const group = firstShape(primitiveTree).primitives[0].children[0];
+			nodeassert.strictEqual(group.type, 'group');
+			nodeassert.strictEqual(group.children.length, 2);
+
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.renderPrimitive(recorder as any, group);
+
+			nodeassert.strictEqual(recorder.countOf('fill'), 1);
+			nodeassert.strictEqual(recorder.countOf('stroke'), 1);
+			nodeassert.strictEqual(recorder.countOf('fillRect'), 0);
+
+			const fillIndex = recorder.calls.findIndex((c) => c.method === 'fill');
+			const strokeIndex = recorder.calls.findIndex(
+				(c) => c.method === 'stroke',
+			);
+			nodeassert.ok(
+				fillIndex >= 0 && strokeIndex > fillIndex,
+				'fill should be recorded before stroke',
+			);
+
+			const fill = recorder.findCall('fill');
+			const stroke = recorder.findCall('stroke');
+			nodeassert.ok(
+				(fill?.args[0] as Path2DRecorder).path.startsWith('m4251'),
+				'fill path does not match the rectangle',
+			);
+			nodeassert.ok(
+				(stroke?.args[0] as Path2DRecorder).path.startsWith('m4251'),
+				'stroke path does not match the rectangle',
+			);
+			nodeassert.strictEqual(recorder.properties.strokeStyle, '#000000');
+
+			nodeassert.ok(recorder.findCall('save'), 'save not called');
+			nodeassert.ok(recorder.findCall('restore'), 'restore not called');
+		});
+
+		it('renders a rectangle with object metadata', function () {
+			// A rectangle with metadata has its primitive sequence
+			// wrapped in an objectInfo node at the top of the slide
+			// object. The wire carries name, title and description
+			// alongside the rectangle's drawing primitives.
+			const primitiveTree = loadVectorRenderingReference('testObjectInfo');
+			const objectInfoNode = firstShape(primitiveTree).primitives[0];
+			nodeassert.strictEqual(objectInfoNode.type, 'objectInfo');
+			nodeassert.strictEqual(objectInfoNode.name, 'Rectangle 1');
+			nodeassert.strictEqual(objectInfoNode.title, 'My title');
+			nodeassert.strictEqual(objectInfoNode.desc, 'My description');
+
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.renderPrimitive(recorder as any, objectInfoNode);
+
+			const fill = recorder.findCall('fill');
+			nodeassert.ok(fill, 'child fill missing');
+			nodeassert.strictEqual(fill?.properties.fillStyle, '#4472c4');
+		});
+
+		it('renders a transparent rectangle from a polyPolygonRGBA node', function () {
+			// A solid-fill rectangle with a non-zero fill transparency
+			// arrives as a polyPolygonRGBA node carrying the colour and
+			// the transparency, nested under the slide object's svx and
+			// group wrappers.
+			const primitiveTree = loadVectorRenderingReference('testPolyPolygonRGBA');
+			const rgbaNode =
+				firstShape(primitiveTree).primitives[0].children[0].children[0];
+			nodeassert.strictEqual(rgbaNode.type, 'polyPolygonRGBA');
+			nodeassert.strictEqual(typeof rgbaNode.color, 'string');
+			const transparency: number = parseFloat(rgbaNode.transparency);
+			nodeassert.ok(
+				transparency > 0 && transparency < 1,
+				'expected non-zero transparency less than 1',
+			);
+
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.renderPrimitive(recorder as any, rgbaNode);
+
+			const fill = recorder.findCall('fill');
+			nodeassert.ok(fill, 'fill not called');
+			nodeassert.strictEqual(fill?.properties.fillStyle, rgbaNode.color);
+			nodeassert.ok(
+				Math.abs(fill!.properties.globalAlpha - (1 - transparency)) < 1e-9,
+				'globalAlpha at fill time does not match 1 - transparency',
+			);
+			nodeassert.ok(recorder.findCall('save'), 'save not called');
+			nodeassert.ok(recorder.findCall('restore'), 'restore not called');
+		});
+	});
+
+	it('renders polygonHairline from a document reference', function () {
+		// Fixture: a slide with a single polygonHairline outline.
+		const primitiveTree = loadVectorRenderingReference('testPolygonHairline');
+		const hairlineNode = firstShape(primitiveTree).primitives[0];
+		nodeassert.strictEqual(hairlineNode.type, 'polygonHairline');
+		nodeassert.ok(hairlineNode.path, 'hairline must carry a path string');
+
+		const recorder = new CanvasRecorder();
+		const renderer = new cool.VectorPrimitiveRenderer();
+		renderer.renderPrimitive(recorder as any, hairlineNode);
+
+		// The hairline strokes at one canvas pixel in the wire colour.
+		const stroke = recorder.findCall('stroke');
+		nodeassert.ok(stroke, 'stroke not called');
+		nodeassert.strictEqual(stroke?.properties.lineWidth, 1);
+		nodeassert.strictEqual(stroke?.properties.strokeStyle, hairlineNode.color);
+		nodeassert.strictEqual(
+			(stroke!.args[0] as Path2DRecorder).path,
+			hairlineNode.path,
+		);
+		// Stroke settings do not leak to anything drawn after.
+		nodeassert.ok(recorder.findCall('save'), 'save not called');
+		nodeassert.ok(recorder.findCall('restore'), 'restore not called');
+	});
+
+	it('defaults polygonHairline color to black', function () {
+		const recorder = new CanvasRecorder();
+		const renderer = new cool.VectorPrimitiveRenderer();
+		const primitive = { type: 'polygonHairline', path: 'M 0 0 L 1 1' };
+
+		renderer.renderPrimitive(recorder as any, primitive);
+
+		nodeassert.ok(recorder.findCall('stroke'), 'stroke not called');
+		nodeassert.strictEqual(recorder.properties.strokeStyle, '#000000');
+		nodeassert.strictEqual(recorder.properties.lineWidth, 1);
+	});
+
+	it('skips polygonHairline with missing path', function () {
+		const recorder = new CanvasRecorder();
+		const renderer = new cool.VectorPrimitiveRenderer();
+		const primitive = { type: 'polygonHairline', color: '#000' };
+
+		renderer.renderPrimitive(recorder as any, primitive);
+
+		nodeassert.strictEqual(recorder.countOf('stroke'), 0);
+	});
+
+	// A hairline is one device pixel whatever the zoom. The context is in
+	// twips, so a width of 1 would come out around 0.05 pixels.
+	it('draws a hairline one device pixel wide under a scaled context', function () {
+		const renderer = new cool.VectorPrimitiveRenderer();
+		const recorder = new CanvasRecorder(200, 150);
+
+		// twips to pixels, a typical zoom
+		const scale = 0.05;
+		recorder.scale(scale, scale);
+		renderer.renderPrimitive(
+			recorder as any,
+			{
+				type: 'polygonHairline',
+				path: 'm0 0h1000v1000h-1000z',
+				color: '#c0c0c0',
+			} as any,
+		);
+
+		const stroke = recorder.calls.find((call: any) => call.method === 'stroke');
+		nodeassert.ok(stroke, 'nothing was stroked');
+		nodeassert.ok(
+			Math.abs(stroke.properties.lineWidth * scale - 1) < 0.001,
+			'the hairline came out ' +
+				String(stroke.properties.lineWidth * scale) +
+				' device pixels wide',
+		);
+	});
+
+	// Only a width of exactly 0 asks for a hairline. A thin line keeps the
+	// width the engine sent, even when that is under a device pixel.
+	it('keeps a thin stroke width as given under a scaled context', function () {
+		const renderer = new cool.VectorPrimitiveRenderer();
+		const recorder = new CanvasRecorder(200, 150);
+
+		const scale = 0.05;
+		recorder.scale(scale, scale);
+		renderer.renderPrimitive(
+			recorder as any,
+			{
+				type: 'polygonStroke',
+				path: 'm0 0h1000v1000h-1000z',
+				line: { color: '#000000', width: 5 },
+			} as any,
+		);
+
+		const stroke = recorder.calls.find((call: any) => call.method === 'stroke');
+		nodeassert.ok(stroke, 'nothing was stroked');
+		nodeassert.strictEqual(stroke.properties.lineWidth, 5);
+	});
+
+	describe('Bold and italic text', function () {
+		// weight 8 is bold on the wire, with a face of its own.
+		const boldItalic: any = {
+			type: 'textSimplePortion',
+			text: 'Heading',
+			fontSize: 400,
+			familyname: 'Liberation Sans',
+			weight: 8,
+			italic: true,
+			fontId: 'abc123',
+			fontcolor: '#000000',
+		};
+
+		it('asks the face the engine sent for no further weight or slant', function () {
+			const recorder = new CanvasRecorder();
+			// The face has loaded, so it is the one that gets used.
+			const renderer = new cool.VectorPrimitiveRenderer(undefined, () => true);
+
+			renderer.renderPrimitive(recorder as any, boldItalic);
+
+			// The face is already the bold italic cut, so asking again would
+			// apply it twice.
+			nodeassert.strictEqual(
+				recorder.properties.font,
+				'normal 400 400px "vecfont-abc123"',
+			);
+		});
+
+		it('asks for the weight the face itself lacks', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer(undefined, () => true);
+
+			// No bold cut, so the face is the regular one and the browser
+			// has to thicken it.
+			renderer.renderPrimitive(recorder as any, {
+				...boldItalic,
+				italic: false,
+				syntheticBold: true,
+			});
+
+			nodeassert.strictEqual(
+				recorder.properties.font,
+				'normal 700 400px "vecfont-abc123"',
+			);
+		});
+
+		it('asks for the slant the face itself lacks', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer(undefined, () => true);
+
+			renderer.renderPrimitive(recorder as any, {
+				...boldItalic,
+				weight: 5,
+				syntheticItalic: true,
+			});
+
+			nodeassert.strictEqual(
+				recorder.properties.font,
+				'italic 400 400px "vecfont-abc123"',
+			);
+		});
+
+		// A family with no bold cut resolves both runs to one file, so both
+		// portions name the same face and only the flag separates them. Keying
+		// the flag to the face instead of the run would lose that.
+		it('separates two runs that share one face by the flag', function () {
+			const renderer = new cool.VectorPrimitiveRenderer(undefined, () => true);
+
+			const plain = new CanvasRecorder();
+			renderer.renderPrimitive(plain as any, {
+				...boldItalic,
+				italic: false,
+				weight: 5,
+			});
+
+			const bold = new CanvasRecorder();
+			renderer.renderPrimitive(bold as any, {
+				...boldItalic,
+				italic: false,
+				weight: 8,
+				syntheticBold: true,
+			});
+
+			nodeassert.strictEqual(
+				plain.properties.font,
+				'normal 400 400px "vecfont-abc123"',
+			);
+			nodeassert.strictEqual(
+				bold.properties.font,
+				'normal 700 400px "vecfont-abc123"',
+			);
+		});
+
+		it('asks the family for bold and italic when the face is missing', function () {
+			const recorder = new CanvasRecorder();
+			// No face has loaded, so the family name has to carry the style.
+			const renderer = new cool.VectorPrimitiveRenderer(undefined, () => false);
+
+			renderer.renderPrimitive(recorder as any, boldItalic);
+
+			nodeassert.strictEqual(
+				recorder.properties.font,
+				'italic 700 400px "Liberation Sans"',
+			);
+		});
+	});
+
+	describe('Automatic colors', function () {
+		const DARK = '#1C1C1C';
+		const LIGHT = '#FFFFFF';
+
+		const textPrimitive = (fontcolor: string): any => ({
+			type: 'textSimplePortion',
+			text: 'Hi',
+			fontSize: 20,
+			matrix: [20, 0, 0, 20, 5, 7],
+			fontcolor: fontcolor,
+			familyname: 'Liberation Sans',
+		});
+
+		// backdrop is the fill right under the text, such as the fill of
+		// its shape or of its table cell.
+		const fillStyleOfText = (
+			renderer: any,
+			fontcolor: string,
+			backdrop?: string,
+		): string => {
+			const recorder = new CanvasRecorder();
+			const text = textPrimitive(fontcolor);
+			text.backdrop = backdrop;
+			renderer.renderPrimitive(recorder as any, text);
+			const fillText = recorder.findCall('fillText');
+			nodeassert.ok(fillText, 'fillText not called');
+			return fillText.properties.fillStyle;
+		};
+
+		it('fills the slide with the document background of a dark view', function () {
+			const recorder = new CanvasRecorder(200, 150);
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setSlideBounds(200, 150);
+			renderer.setDocumentBackground(DARK);
+
+			const background: cool.BackgroundColorPrimitive = {
+				type: cool.BackgroundColorPrimitive.type,
+			};
+			renderer.renderPrimitive(recorder as any, background);
+
+			const fillRect = recorder.findCall('fillRect');
+			nodeassert.ok(fillRect, 'fillRect not called');
+			nodeassert.strictEqual(fillRect?.properties.fillStyle, DARK);
+		});
+
+		it('draws automatic text white on a dark view', function () {
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(DARK);
+
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, cool.VectorColors.AUTOMATIC),
+				'#FFFFFF',
+			);
+		});
+
+		it('draws automatic text white on a dark view over a light shape', function () {
+			// The light shape fill turns dark on a dark view, and the text
+			// on it turns light with it.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(DARK);
+
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, cool.VectorColors.AUTOMATIC, '#FFEE99'),
+				'#FFFFFF',
+			);
+		});
+
+		it('draws automatic text black over a light shape in the colors of the document', function () {
+			// The surface right behind the text decides, so a light shape
+			// fill that keeps its color keeps the text dark.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(DARK);
+			renderer.setAuthoredColors(true);
+
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, cool.VectorColors.AUTOMATIC, '#FFEE99'),
+				'#000000',
+			);
+		});
+
+		it('draws automatic text white over a dark page background', function () {
+			// The slide carries a dark background of its own, so the
+			// text on it is light even in a light view.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(LIGHT);
+			renderer.setPageBackdrop('#102030');
+
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, cool.VectorColors.AUTOMATIC),
+				'#FFFFFF',
+			);
+		});
+
+		it('mixes a see-through page fill with the background of the view', function () {
+			// A tenth of white over each document background: the page
+			// stays light in a light view and dark in a dark one, so the
+			// automatic text follows the view.
+			const light = new cool.VectorPrimitiveRenderer();
+			light.setDocumentBackground(LIGHT);
+			light.setPageBackdrop('#FFFFFF', 0.9);
+			nodeassert.strictEqual(
+				fillStyleOfText(light, cool.VectorColors.AUTOMATIC),
+				'#000000',
+			);
+
+			const dark = new cool.VectorPrimitiveRenderer();
+			dark.setDocumentBackground(DARK);
+			dark.setPageBackdrop('#FFFFFF', 0.9);
+			nodeassert.strictEqual(
+				fillStyleOfText(dark, cool.VectorColors.AUTOMATIC),
+				'#FFFFFF',
+			);
+		});
+
+		it('takes the fill under the text over the page background', function () {
+			// A light shape on a dark slide: the surface right behind
+			// the text is the shape.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(LIGHT);
+			renderer.setPageBackdrop('#102030');
+
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, cool.VectorColors.AUTOMATIC, '#FFEE99'),
+				'#000000',
+			);
+		});
+
+		it('mixes a see-through shape fill with the page behind it', function () {
+			// A tenth of white over each document background: the shape
+			// stays light in a light view and dark in a dark one, so the
+			// automatic text on it follows the view.
+			const light = new cool.VectorPrimitiveRenderer();
+			light.setDocumentBackground(LIGHT);
+			const lightText = textPrimitive(cool.VectorColors.AUTOMATIC);
+			lightText.backdrop = '#FFFFFF';
+			lightText.backdropTransparency = 0.9;
+			const lightRecorder = new CanvasRecorder();
+			light.renderPrimitive(lightRecorder as any, lightText);
+			nodeassert.strictEqual(
+				lightRecorder.findCall('fillText')?.properties.fillStyle,
+				'#000000',
+			);
+
+			const dark = new cool.VectorPrimitiveRenderer();
+			dark.setDocumentBackground(DARK);
+			const darkText = textPrimitive(cool.VectorColors.AUTOMATIC);
+			darkText.backdrop = '#FFFFFF';
+			darkText.backdropTransparency = 0.9;
+			const darkRecorder = new CanvasRecorder();
+			dark.renderPrimitive(darkRecorder as any, darkText);
+			nodeassert.strictEqual(
+				darkRecorder.findCall('fillText')?.properties.fillStyle,
+				'#FFFFFF',
+			);
+		});
+
+		it('lightens a dark text color on a dark view', function () {
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(DARK);
+
+			const drawn = fillStyleOfText(renderer, '#000080');
+			nodeassert.strictEqual(
+				drawn,
+				cool.VectorColors.getLightVariant('#000080'),
+			);
+			nodeassert.notStrictEqual(drawn, '#000080');
+		});
+
+		it('keeps a text color that sits on a light surface', function () {
+			// A light shape fill that keeps its color behind the text: the
+			// color the document carries is readable as it is.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(DARK);
+			renderer.setAuthoredColors(true);
+
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, '#000080', '#FFEE99'),
+				'#000080',
+			);
+		});
+
+		it('lightens a text color on a light shape of a dark view', function () {
+			// The shape fill turns dark first, and the text is read against
+			// the color the fill is drawn in.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(DARK);
+
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, '#000080', '#FFEE99'),
+				cool.VectorColors.getLightVariant('#000080'),
+			);
+		});
+
+		it('keeps a text color on a light view', function () {
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(LIGHT);
+
+			nodeassert.strictEqual(fillStyleOfText(renderer, '#000080'), '#000080');
+		});
+
+		it('takes the character highlight as the surface behind the text', function () {
+			// A dark highlight in a dark view lightens the text even
+			// where the shape around it is light.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(DARK);
+
+			const primitive = textPrimitive('#000080');
+			primitive.fillcolor = '#101010';
+			primitive.backdrop = '#FFEE99';
+
+			const recorder = new CanvasRecorder();
+			renderer.renderPrimitive(recorder as any, primitive);
+
+			const fillText = recorder.findCall('fillText');
+			nodeassert.ok(fillText, 'fillText not called');
+			nodeassert.strictEqual(
+				fillText?.properties.fillStyle,
+				cool.VectorColors.getLightVariant('#000080'),
+			);
+		});
+
+		it('draws automatic text in a slide preview against the shown slide', function () {
+			// A light notes page shows a dark slide. The text on that slide
+			// sits on the dark fill of the slide, not on the notes page.
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(LIGHT);
+			renderer.setPageBackdrop('#FFFFFF');
+
+			const preview: cool.PagePreviewPrimitive = {
+				type: cool.PagePreviewPrimitive.type,
+				backdrop: '#102030',
+				children: [textPrimitive(cool.VectorColors.AUTOMATIC)],
+			};
+			const recorder = new CanvasRecorder();
+			renderer.renderPrimitive(recorder as any, preview);
+			nodeassert.strictEqual(
+				recorder.findCall('fillText')?.properties.fillStyle,
+				'#FFFFFF',
+			);
+
+			// Text of the notes page itself, after the preview, sits on the
+			// notes page again.
+			nodeassert.strictEqual(
+				fillStyleOfText(renderer, cool.VectorColors.AUTOMATIC),
+				'#000000',
+			);
+		});
+	});
+
+	describe('Fills and lines on a dark view', function () {
+		const DARK = '#1C1C1C';
+		const LIGHT = '#FFFFFF';
+
+		const shape = (color: string): any => ({
+			type: 'polyPolygonColor',
+			color: color,
+			path: 'M 0 0 L 10 0 L 10 10 Z',
+		});
+
+		const hairline = (color: string): any => ({
+			type: 'polygonHairline',
+			color: color,
+			path: 'M 0 0 L 10 10',
+		});
+
+		const darkRenderer = (): any => {
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setSlideBounds(200, 150);
+			renderer.setDocumentBackground(DARK);
+			return renderer;
+		};
+
+		const fillStyleOf = (renderer: any, primitive: any): string => {
+			const recorder = new CanvasRecorder(200, 150);
+			renderer.renderPrimitive(recorder as any, primitive);
+			const fill = recorder.findCall('fill');
+			nodeassert.ok(fill, 'fill not called');
+			return fill.properties.fillStyle;
+		};
+
+		const strokeStyleOf = (renderer: any, primitive: any): string => {
+			const recorder = new CanvasRecorder(200, 150);
+			renderer.renderPrimitive(recorder as any, primitive);
+			const stroke = recorder.findCall('stroke');
+			nodeassert.ok(stroke, 'stroke not called');
+			return stroke.properties.strokeStyle;
+		};
+
+		it('draws a white shape as dark as the view', function () {
+			nodeassert.strictEqual(
+				fillStyleOf(darkRenderer(), shape('#FFFFFF')),
+				DARK,
+			);
+		});
+
+		it('draws a light shape in a dark color', function () {
+			const drawn = fillStyleOf(darkRenderer(), shape('#FFEE99'));
+			nodeassert.strictEqual(
+				drawn,
+				cool.VectorColors.getDarkVariant('#FFEE99', DARK),
+			);
+			nodeassert.ok(cool.VectorColors.isDark(drawn), drawn);
+		});
+
+		it('keeps a dark shape as it is', function () {
+			nodeassert.strictEqual(
+				fillStyleOf(darkRenderer(), shape('#102030')),
+				'#102030',
+			);
+		});
+
+		it('keeps the colors of a shape on a light view', function () {
+			const renderer = new cool.VectorPrimitiveRenderer();
+			renderer.setDocumentBackground(LIGHT);
+			nodeassert.strictEqual(
+				fillStyleOf(renderer, shape('#FFEE99')),
+				'#FFEE99',
+			);
+		});
+
+		it('keeps the colors of a shape where the document colors are asked for', function () {
+			const renderer = darkRenderer();
+			renderer.setAuthoredColors(true);
+			nodeassert.strictEqual(
+				fillStyleOf(renderer, shape('#FFEE99')),
+				'#FFEE99',
+			);
+			nodeassert.strictEqual(
+				strokeStyleOf(renderer, hairline('#000000')),
+				'#000000',
+			);
+		});
+
+		it('draws the page fill of the document dark', function () {
+			const recorder = new CanvasRecorder(200, 150);
+			darkRenderer().renderPrimitive(recorder as any, {
+				type: cool.BackgroundColorPrimitive.type,
+				color: '#FFFFFF',
+			});
+			nodeassert.strictEqual(
+				recorder.findCall('fillRect')?.properties.fillStyle,
+				DARK,
+			);
+		});
+
+		it('draws a dark line light', function () {
+			nodeassert.strictEqual(
+				strokeStyleOf(darkRenderer(), hairline('#000000')),
+				cool.VectorColors.getLightVariant('#000000'),
+			);
+		});
+
+		it('keeps a light line as it is', function () {
+			nodeassert.strictEqual(
+				strokeStyleOf(darkRenderer(), hairline('#FFEE99')),
+				'#FFEE99',
+			);
+		});
+
+		it('keeps the colors of a picture', function () {
+			const renderer = darkRenderer();
+			const recorder = new CanvasRecorder(200, 150);
+			renderer.renderPrimitive(recorder as any, {
+				type: 'graphic',
+				vector: true,
+				children: [shape('#FFFFFF'), hairline('#000000')],
+			});
+			nodeassert.strictEqual(
+				recorder.findCall('fill')?.properties.fillStyle,
+				'#FFFFFF',
+			);
+			nodeassert.strictEqual(
+				recorder.findCall('stroke')?.properties.strokeStyle,
+				'#000000',
+			);
+
+			// A shape drawn after the picture follows the view again.
+			nodeassert.strictEqual(fillStyleOf(renderer, shape('#FFFFFF')), DARK);
+		});
+
+		it('draws automatic text white on a white page of a dark view', function () {
+			// The page fill turns dark first, and the text is read against
+			// it.
+			const renderer = darkRenderer();
+			renderer.setPageBackdrop('#FFFFFF');
+			const recorder = new CanvasRecorder();
+			renderer.renderPrimitive(recorder as any, {
+				type: 'textSimplePortion',
+				text: 'Hi',
+				fontSize: 20,
+				matrix: [20, 0, 0, 20, 5, 7],
+				fontcolor: cool.VectorColors.AUTOMATIC,
+				familyname: 'Liberation Sans',
+			});
+			nodeassert.strictEqual(
+				recorder.findCall('fillText')?.properties.fillStyle,
+				'#FFFFFF',
+			);
+		});
+
+		it('reads text against a light highlight that turned dark', function () {
+			const renderer = darkRenderer();
+			const recorder = new CanvasRecorder();
+			renderer.renderPrimitive(recorder as any, {
+				type: 'textSimplePortion',
+				text: 'Hi',
+				fontSize: 20,
+				matrix: [20, 0, 0, 20, 5, 7],
+				fontcolor: '#000000',
+				fillcolor: '#FFFF00',
+				familyname: 'Liberation Sans',
+			});
+			nodeassert.strictEqual(
+				recorder.findCall('fillText')?.properties.fillStyle,
+				cool.VectorColors.getLightVariant('#000000'),
+			);
+		});
+
+		it('draws the light stops of a gradient dark', function () {
+			const recorder = new CanvasRecorder(200, 200);
+			darkRenderer().renderPrimitive(recorder as any, {
+				type: 'fillGradient',
+				outputRange: [0, 0, 100, 100],
+				gradient: {
+					style: 'linear',
+					colorStops: [
+						{ offset: 0, color: '#000000' },
+						{ offset: 1, color: '#FFFFFF' },
+					],
+				},
+			});
+			const stops = recorder.gradients[0].sortedStops();
+			nodeassert.strictEqual(stops[0].color, 'rgba(0,0,0,1)');
+			nodeassert.strictEqual(stops[stops.length - 1].color, 'rgba(28,28,28,1)');
+		});
+
+		it('keeps the text colors of a picture', function () {
+			// Dark text on the white area of a picture stays dark, the same
+			// as the area under it.
+			const recorder = new CanvasRecorder();
+			darkRenderer().renderPrimitive(recorder as any, {
+				type: 'graphic',
+				vector: true,
+				children: [
+					shape('#FFFFFF'),
+					{
+						type: 'textSimplePortion',
+						text: 'Hi',
+						fontSize: 20,
+						matrix: [20, 0, 0, 20, 5, 7],
+						fontcolor: '#000000',
+						familyname: 'Liberation Sans',
+					},
+				],
+			});
+			nodeassert.strictEqual(
+				recorder.findCall('fillText')?.properties.fillStyle,
+				'#000000',
+			);
+		});
+
+		it('draws an underline of its own color light on a shape that turned dark', function () {
+			const recorder = new CanvasRecorder();
+			darkRenderer().renderPrimitive(recorder as any, {
+				type: 'textDecoratedPortion',
+				text: 'Hi',
+				fontSize: 20,
+				matrix: [20, 0, 0, 20, 5, 7],
+				fontcolor: '#FFFFFF',
+				familyname: 'Liberation Sans',
+				backdrop: '#FFFFFF',
+				underline: 1,
+				underlineColor: '#000000',
+			});
+			nodeassert.strictEqual(
+				recorder.findCall('stroke')?.properties.strokeStyle,
+				cool.VectorColors.getLightVariant('#000000'),
+			);
+		});
+	});
+
+	describe('Color override', function () {
+		const filledPolygon = {
+			type: 'polyPolygonColor',
+			path: 'M 0 0 L 10 0 L 10 10 Z',
+			color: '#112233',
+		};
+		const strokedPolygon = {
+			type: 'polygonStroke',
+			path: 'M 0 0 L 10 10',
+			line: { color: '#112233', width: 2 },
+		};
+		const textPortion = {
+			type: 'textSimplePortion',
+			text: 'Hi',
+			fontSize: 20,
+			matrix: [20, 0, 0, 20, 5, 7],
+			fontcolor: '#112233',
+			familyname: 'Liberation Sans',
+		};
+
+		it('fills an area in the override color', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setColorOverride({ fill: 'rgb(10,20,30)' });
+			renderer.renderPrimitive(recorder as any, filledPolygon);
+
+			nodeassert.strictEqual(
+				recorder.findCall('fill')?.properties.fillStyle,
+				'rgb(10,20,30)',
+			);
+		});
+
+		it('strokes a line in the override color', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setColorOverride({ stroke: 'rgb(10,20,30)' });
+			renderer.renderPrimitive(recorder as any, strokedPolygon);
+
+			nodeassert.strictEqual(
+				recorder.findCall('stroke')?.properties.strokeStyle,
+				'rgb(10,20,30)',
+			);
+		});
+
+		it('draws text in the override color', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setColorOverride({ text: 'rgb(10,20,30)' });
+			renderer.renderPrimitive(recorder as any, textPortion);
+
+			nodeassert.strictEqual(
+				recorder.findCall('fillText')?.properties.fillStyle,
+				'rgb(10,20,30)',
+			);
+		});
+
+		it('keeps the text color when only the area fill is overridden', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setColorOverride({ fill: 'rgb(10,20,30)' });
+			renderer.renderPrimitive(recorder as any, textPortion);
+
+			nodeassert.strictEqual(
+				recorder.findCall('fillText')?.properties.fillStyle,
+				textPortion.fontcolor,
+			);
+		});
+
+		it('draws the primitive colors again once the override is cleared', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setColorOverride({ fill: 'rgb(10,20,30)' });
+			renderer.setColorOverride(null);
+			renderer.renderPrimitive(recorder as any, filledPolygon);
+
+			nodeassert.strictEqual(
+				recorder.findCall('fill')?.properties.fillStyle,
+				filledPolygon.color,
+			);
+		});
+	});
+
+	describe('Paragraphs', function () {
+		// A text holds its paragraphs under a block node, and each paragraph
+		// holds the portions that carry the text.
+		function paragraph(text: string): any {
+			return {
+				type: 'textHierarchyParagraph',
+				bounds: [0, 0, 100, 20],
+				children: [
+					{
+						type: 'textSimplePortion',
+						text: text,
+						fontSize: 20,
+						matrix: [20, 0, 0, 20, 5, 7],
+						fontcolor: '#112233',
+						familyname: 'Liberation Sans',
+					},
+				],
+			};
+		}
+
+		function textObject(): any {
+			return {
+				type: 'textHierarchyBlock',
+				children: [paragraph('One'), paragraph('Two'), paragraph('Three')],
+			};
+		}
+
+		function drawnText(recorder: CanvasRecorder): string[] {
+			return recorder.callsOf('fillText').map((call) => call.args[0] as string);
+		}
+
+		it('draws every paragraph when no filter is set', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.renderPrimitive(recorder as any, textObject());
+
+			nodeassert.deepStrictEqual(drawnText(recorder), ['One', 'Two', 'Three']);
+		});
+
+		it('draws one paragraph alone', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setParagraphFilter({ only: 1 });
+			renderer.renderPrimitive(recorder as any, textObject());
+
+			nodeassert.deepStrictEqual(drawnText(recorder), ['Two']);
+		});
+
+		it('leaves out the skipped paragraphs', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setParagraphFilter({ skip: [1] });
+			renderer.renderPrimitive(recorder as any, textObject());
+
+			nodeassert.deepStrictEqual(drawnText(recorder), ['One', 'Three']);
+		});
+
+		it('counts the paragraphs from the start of each text', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setParagraphFilter({ only: 0 });
+			renderer.renderPrimitive(recorder as any, textObject());
+			renderer.setParagraphFilter({ only: 0 });
+			renderer.renderPrimitive(recorder as any, textObject());
+
+			nodeassert.deepStrictEqual(drawnText(recorder), ['One', 'One']);
+		});
+
+		it('numbers the paragraphs of a shadow the same as the text', function () {
+			const recorder = new CanvasRecorder();
+			const renderer = new cool.VectorPrimitiveRenderer();
+
+			renderer.setParagraphFilter({ only: 1 });
+			renderer.renderPrimitive(recorder as any, {
+				type: 'group',
+				children: [textObject(), textObject()],
+			});
+
+			nodeassert.deepStrictEqual(drawnText(recorder), ['Two', 'Two']);
+		});
+
+		it('finds the paragraphs of the text and not of its shadow', function () {
+			const shadowText = textObject();
+			shadowText.children[0].children[0].text = 'Shadow';
+			const paragraphs = cool.TextHierarchyParagraphPrimitive.collect([
+				{ type: 'shadow', children: [shadowText] },
+				textObject(),
+			]);
+
+			nodeassert.strictEqual(paragraphs.length, 3);
+			nodeassert.strictEqual((paragraphs[0] as any).children[0].text, 'One');
+		});
+
+		it('finds the paragraphs of a tree in the order of the text', function () {
+			const paragraphs = cool.TextHierarchyParagraphPrimitive.collect([
+				{ type: 'group', children: [textObject()] },
+			]);
+
+			nodeassert.strictEqual(paragraphs.length, 3);
+			nodeassert.deepStrictEqual(
+				paragraphs.map((paragraph: any) => paragraph.children[0].text),
+				['One', 'Two', 'Three'],
+			);
+		});
+	});
+});

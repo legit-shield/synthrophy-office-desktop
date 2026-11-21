@@ -1,0 +1,49 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** The theme colors of a page and the concrete colors they stand for.
+
+    No call returns this object yet.
+
+    @gas ColorScheme
+ */
+interface XColorScheme : XBase
+{
+    /** @unimplemented @gas ColorScheme.getConcreteColor */
+    XColor getConcreteColor([in] ThemeColorType themeColorType);
+
+    /** @unimplemented @gas ColorScheme.getThemeColors */
+    sequence<ThemeColorType> getThemeColors();
+
+    /** @param color
+            A Color or a color string.
+
+        @unimplemented
+        @gas ColorScheme.setConcreteColor
+     */
+    [overload setConcreteColor] XColorScheme setConcreteColor(
+        [in] ThemeColorType themeColorType, [in] any color);
+
+    /** Red, green and blue each run from 0 to 255.
+
+        @unimplemented
+        @gas ColorScheme.setConcreteColor
+     */
+    [overload setConcreteColor] XColorScheme setConcreteColorRgb(
+        [in] ThemeColorType themeColorType, [in] long red, [in] long green, [in] long blue);
+
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

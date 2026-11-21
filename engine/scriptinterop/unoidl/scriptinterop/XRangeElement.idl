@@ -1,0 +1,60 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+module scriptinterop {
+
+/** One part of a selection: the selected stretch of one paragraph, or an element that is selected
+    as a whole, such as a paragraph, a table cell or an inline image.
+
+    @gas RangeElement
+ */
+interface XRangeElement: XBase {
+    /** Returns the element that this part lies in.
+
+        For a partial part this is the run of text that holds it, a child of the paragraph, and the
+        offsets count in that text. Otherwise it is the element that is selected as a whole.
+
+        @throws RuntimeException
+            if the part is not inside a paragraph.
+
+        @gas RangeElement.getElement
+     */
+    XElement getElement();
+
+    /** Returns the offset of the last selected character in the text from getElement(), inclusive.
+
+        Offsets count as in XText. An empty part returns its start offset. Returns -1 if the part is
+        not partial.
+
+        @gas RangeElement.getEndOffsetInclusive
+     */
+    long getEndOffsetInclusive();
+
+    /** Returns the offset of the first selected character in the text from getElement().
+
+        Offsets count as in XText. Returns -1 if the part is not partial.
+
+        @gas RangeElement.getStartOffset
+     */
+    long getStartOffset();
+
+    /** Returns whether only part of a text is selected.
+
+        An element that is selected as a whole, such as an inline image, is never partial.
+
+        @gas RangeElement.isPartial
+     */
+    boolean isPartial();
+};
+
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

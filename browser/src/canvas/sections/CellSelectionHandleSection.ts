@@ -1,0 +1,94 @@
+/* global Proxy _ */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
+
+class CellSelectionHandle extends CanvasSectionObject {
+	showSection: boolean = false;
+	processingOrder: number = app.CSections.DefaultForDocumentObjects.processingOrder;
+	drawingOrder: number = app.CSections.DefaultForDocumentObjects.drawingOrder;
+	zIndex: number = app.CSections.DefaultForDocumentObjects.zIndex;
+	documentObject: boolean = true;
+	// Text span of the formula reference under the handle, or null on the cell selection.
+	textSelection: string | null = null;
+	// True on the reference nearest to the formula selection.
+	active: boolean = false;
+	private readonly isStart: boolean;
+
+	constructor (name: string, isStart: boolean) {
+        super(name);
+
+		this.isStart = isStart;
+		this.sectionProperties.circleRadius = 10 * app.dpiScale;
+		this.size = [this.sectionProperties.circleRadius * 2, this.sectionProperties.circleRadius * 2];
+	}
+
+	private onDragEnd(point: cool.SimplePoint) {
+		app.map.focus();
+		app.map.fire('scrollvelocity', {vx: 0, vy: 0});
+
+		point.pX += this.position[0];
+		point.pY += this.position[1];
+
+		this.sharedOnDragAndEnd(point);
+		CellSelectionMarkers.update();
+		app.map.scrollingIsHandled = false;
+	}
+
+	private sharedOnDragAndEnd(point: cool.SimplePoint) {
+		const type = this.isStart ? 'start' : 'end';
+		app.map._docLayer._postSelectTextEvent(type, point.x, point.y);
+	}
+
+	private onDrag(point: cool.SimplePoint) {
+		// The pointer's position on screen, relative to the canvas. The point is shifted into
+		// document coordinates afterwards.
+		const viewportPoint = cool.SimplePoint.fromCorePixels([this.myTopLeft[0] + point.pX, this.myTopLeft[1] + point.pY]);
+		app.map.fire('handleautoscroll', { pos: { x: viewportPoint.cX, y: viewportPoint.cY }, map: app.map });
+
+		point.pX += this.position[0];
+		point.pY += this.position[1];
+
+		this.sharedOnDragAndEnd(point);
+	}
+
+	public onDraw() {
+		this.context.strokeStyle = (<any>window).prefs.getBoolean('darkTheme') ? 'white' : 'black';
+		this.context.lineWidth = 2;
+
+		this.context.beginPath();
+		this.context.arc(this.sectionProperties.circleRadius, this.sectionProperties.circleRadius, this.sectionProperties.circleRadius, 0, 2 * Math.PI);
+		this.context.stroke();
+	}
+
+	onMouseMove(point: cool.SimplePoint, dragDistance: number[], e: MouseEvent): void {
+		e.stopPropagation();
+		if (this.containerObject.isDraggingSomething()) {
+			app.map.scrollingIsHandled = true;
+			this.stopPropagating();
+			this.onDrag(point);
+		}
+	}
+
+	onMouseDown(point: cool.SimplePoint, e: MouseEvent): void {
+		e.stopPropagation();
+		this.stopPropagating();
+		// The engine drags the active reference, so select any other one first.
+		if (this.textSelection !== null && !this.active && app.map.formulabar)
+			app.map.formulabar.selectText(this.textSelection);
+	}
+
+	onMouseUp(point: cool.SimplePoint, e: MouseEvent): void {
+		e.stopPropagation();
+		if (this.containerObject.isDraggingSomething()) {
+			this.stopPropagating();
+			this.onDragEnd(point);
+		}
+	}
+}

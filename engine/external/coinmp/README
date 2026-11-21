@@ -1,0 +1,7 @@
+Cbc (Coin Branch-and-Cut) solves linear and mixed integer programming problems.
+It is built together with the COIN-OR projects it uses: Cgl (Cut Generation
+Library), Clp (Coin LP), Osi (Open Solver Interface) and CoinUtils.
+
+Info [https://github.com/coin-or/Cbc].
+From [https://github.com/coin-or/Cbc/releases] and the matching releases of
+Cgl, Clp, Osi and CoinUtils.

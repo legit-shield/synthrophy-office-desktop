@@ -1,0 +1,96 @@
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: com.collaboraoffice.demo-text\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-11-20 11:57+0000\n"
+"PO-Revision-Date: 2026-11-16 11:08+0000\n"
+"Last-Translator: Stuart Swales <skswales@users.noreply.hosted.weblate.org>\n"
+"Language-Team: English (United Kingdom) <https://hosted.weblate.org/projects/"
+"collabora-online/extensions/demo-text/en_GB/>\n"
+"Language: en_GB\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=n != 1;\n"
+"X-Generator: Weblate 2026.12.dev0\n"
+
+#: index.html:73
+msgid "%1 (%2) applied"
+msgstr "%1 (%2) applied"
+
+#: index.html:31
+msgid "Apply"
+msgstr "Apply"
+
+#: index.html:28
+msgid "Colorize paragraphs"
+msgstr "Colourise paragraphs"
+
+#: index.html:23
+msgid "Greeting:"
+msgstr "Greeting:"
+
+#: index.html:35
+msgid "Paragraph number (1-based):"
+msgstr "Paragraph number (1-based):"
+
+#: index.html:55
+msgid "Pick a color"
+msgstr "Pick a colour"
+
+#: index.html:42
+msgid "Pick paragraph color..."
+msgstr "Pick paragraph colour..."
+
+#: index.html:37
+msgid "Read Nth paragraph"
+msgstr "Read Nth paragraph"
+
+#: manifest.json:name
+msgid "Text demo"
+msgstr "Text demo"
+
+#: index.html:70
+msgid "applying %1 (%2)..."
+msgstr "applying %1 (%2)..."
+
+#: picker.html:31
+msgid "black"
+msgstr "black"
+
+#: picker.html:28
+msgid "blue"
+msgstr "blue"
+
+#: index.html:60
+msgid "cancelled"
+msgstr "cancelled"
+
+#: picker.html:27
+msgid "green"
+msgstr "green"
+
+#: picker.html:29
+msgid "indigo"
+msgstr "indigo"
+
+#: index.html:43
+msgid "no color picked yet"
+msgstr "no colour picked yet"
+
+#: picker.html:25
+msgid "orange"
+msgstr "orange"
+
+#: picker.html:24
+msgid "red"
+msgstr "red"
+
+#: picker.html:30
+msgid "violet"
+msgstr "violet"
+
+#: picker.html:26
+msgid "yellow"
+msgstr "yellow"

@@ -1,0 +1,282 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <sfx2/cokitfilepicker.hxx>
+
+#include <COKit/COKit.hxx>
+#include <comphelper/dispatchcommand.hxx>
+#include <comphelper/kit.hxx>
+#include <comphelper/propertyvalue.hxx>
+#include <comphelper/scopeguard.hxx>
+#include <comphelper/sequence.hxx>
+#include <rtl/ustrbuf.hxx>
+#include <set>
+#include <sfx2/docfilt.hxx>
+#include <sfx2/fcontnr.hxx>
+#include <sfx2/kit/helper.hxx>
+#include <tools/link.hxx>
+#include <vcl/graphicfilter.hxx>
+#include <vcl/svapp.hxx>
+
+namespace sfx2::COKitFilePicker
+{
+namespace
+{
+std::optional<COKitFilePickerProvider>& getProvider()
+{
+    static std::optional<COKitFilePickerProvider> oProvider;
+    return oProvider;
+}
+
+/** One in-flight pick: the strings the provider's C arrays point into, kept alive until
+    the provider answered, and the completion to run with the answer. */
+struct PickContext
+{
+    std::vector<OString> aStrings;
+    std::vector<COKitFilePickerFilter> aFilters;
+    std::function<void(std::optional<OUString>)> aOnPicked;
+    std::optional<OUString> oUrl;
+    /// For a pick of a file to link to, instead of aOnPicked and oUrl.
+    std::function<void(std::optional<LinkTarget>)> aOnPickedLink;
+    std::optional<LinkTarget> oLinkTarget;
+};
+
+// The main-loop half of a completed pick, run as a posted user event.
+void PickCompletedEvent(void* pEv, void*)
+{
+    std::unique_ptr<PickContext> pContext(static_cast<PickContext*>(pEv));
+    if (pContext->aOnPickedLink)
+        pContext->aOnPickedLink(pContext->oLinkTarget);
+    else
+        pContext->aOnPicked(pContext->oUrl);
+}
+
+/** The completion the provider calls, on whichever thread. The answer travels to the
+    engine's main-loop thread as a posted user event, so the completion in the context
+    runs where a uno command may run. */
+void pickedCallback(void* pContext, const char* pUrl)
+{
+    PickContext* pPickContext = static_cast<PickContext*>(pContext);
+    if (pUrl)
+        pPickContext->oUrl = OUString::fromUtf8(pUrl);
+
+    Application::PostUserEvent(LINK_NONMEMBER(pPickContext, PickCompletedEvent));
+}
+
+/// The completion of a pick of a file to link to, as pickedCallback.
+void pickedLinkCallback(void* pContext, const char* pLinkUrl, const char* pReadUrl)
+{
+    PickContext* pPickContext = static_cast<PickContext*>(pContext);
+    if (pLinkUrl && pReadUrl)
+        pPickContext->oLinkTarget
+            = LinkTarget{ OUString::fromUtf8(pLinkUrl), OUString::fromUtf8(pReadUrl) };
+
+    Application::PostUserEvent(LINK_NONMEMBER(pPickContext, PickCompletedEvent));
+}
+}
+
+void installProvider(const COKitFilePickerProvider* pProvider)
+{
+    if (pProvider)
+        getProvider() = *pProvider;
+    else
+        getProvider().reset();
+}
+
+bool isAvailable()
+{
+    return comphelper::COKit::isActive() && getProvider().has_value() && getProvider()->pick;
+}
+
+bool picksFilesInPlace() { return isAvailable() && getProvider()->picksFilesInPlace; }
+
+namespace
+{
+/** A context for a pick, holding the title, the filters and the given strings for the C arrays,
+    with a pointer to each string in the order given. */
+std::unique_ptr<PickContext> makePickContext(const std::vector<OUString>& rStrings,
+                                             const std::vector<Filter>& rFilters,
+                                             std::function<void(std::optional<OUString>)> aOnPicked,
+                                             std::vector<const char*>& rStringPointers)
+{
+    auto pContext = std::make_unique<PickContext>();
+    pContext->aOnPicked = std::move(aOnPicked);
+
+    // Reserve so the C pointers stay valid.
+    pContext->aStrings.reserve(2 * rFilters.size() + rStrings.size());
+    for (const OUString& rString : rStrings)
+    {
+        pContext->aStrings.push_back(rString.toUtf8());
+        rStringPointers.push_back(pContext->aStrings.back().getStr());
+    }
+
+    for (const Filter& rFilter : rFilters)
+    {
+        pContext->aStrings.push_back(rFilter.sName.toUtf8());
+        const char* pName = pContext->aStrings.back().getStr();
+        pContext->aStrings.push_back(rFilter.sWildcards.toUtf8());
+        pContext->aFilters.push_back({ pName, pContext->aStrings.back().getStr() });
+    }
+    return pContext;
+}
+}
+
+void pick(const OUString& rTitle, const std::vector<Filter>& rFilters,
+          std::function<void(std::optional<OUString>)> aOnPicked)
+{
+    if (!isAvailable())
+        return;
+
+    std::vector<const char*> aStrings;
+    std::unique_ptr<PickContext> pContext
+        = makePickContext({ rTitle }, rFilters, std::move(aOnPicked), aStrings);
+    const COKitFilePickerFilter* pFilters = pContext->aFilters.data();
+    const size_t nFilters = pContext->aFilters.size();
+    getProvider()->pick(aStrings[0], pFilters, nFilters, pickedCallback, pContext.release());
+}
+
+bool canPickSaveLocation() { return getProvider().has_value() && getProvider()->pickSaveLocation; }
+
+void pickSaveLocation(const OUString& rTitle, const OUString& rSuggestedUrl,
+                      const std::vector<Filter>& rFilters,
+                      std::function<void(std::optional<OUString>)> aOnPicked)
+{
+    if (!canPickSaveLocation())
+        return;
+
+    std::vector<const char*> aStrings;
+    std::unique_ptr<PickContext> pContext
+        = makePickContext({ rTitle, rSuggestedUrl }, rFilters, std::move(aOnPicked), aStrings);
+    const COKitFilePickerFilter* pFilters = pContext->aFilters.data();
+    const size_t nFilters = pContext->aFilters.size();
+    getProvider()->pickSaveLocation(aStrings[0], aStrings[1], pFilters, nFilters, pickedCallback,
+                                    pContext.release());
+}
+
+bool canPickLinkTarget() { return getProvider().has_value() && getProvider()->pickLinkTarget; }
+
+void pickLinkTarget(const OUString& rTitle, const std::vector<Filter>& rFilters,
+                    std::function<void(std::optional<LinkTarget>)> aOnPicked)
+{
+    if (!canPickLinkTarget())
+        return;
+
+    std::vector<const char*> aStrings;
+    std::unique_ptr<PickContext> pContext = makePickContext({ rTitle }, rFilters, {}, aStrings);
+    pContext->aOnPickedLink = std::move(aOnPicked);
+    const COKitFilePickerFilter* pFilters = pContext->aFilters.data();
+    const size_t nFilters = pContext->aFilters.size();
+    getProvider()->pickLinkTarget(aStrings[0], pFilters, nFilters, pickedLinkCallback,
+                                  pContext.release());
+}
+
+bool requestAndRedispatch(const OUString& rCommand, const OUString& rArgument,
+                          const std::vector<Filter>& rFilters, const OUString& rTitle,
+                          const std::vector<css::beans::PropertyValue>& rExtraArguments)
+{
+    if (!isAvailable())
+        return false;
+
+    const int nView = KitHelper::getCurrentView();
+
+    pick(rTitle, rFilters,
+         [rCommand, rArgument, rExtraArguments, nView](const std::optional<OUString>& roUrl)
+         {
+             if (!roUrl)
+                 return;
+
+             // Switch to the view that asked for the file, and switch back when done.
+             comphelper::ScopeGuard aRestoreView(
+                 [nSavedView = KitHelper::getCurrentView()]
+                 {
+                     if (nSavedView >= 0 && KitHelper::getCurrentView() != nSavedView)
+                         KitHelper::setView(nSavedView);
+                 });
+             if (nView >= 0 && KitHelper::getCurrentView() != nView)
+                 KitHelper::setView(nView);
+
+             std::vector<css::beans::PropertyValue> aArguments{ comphelper::makePropertyValue(
+                 rArgument, *roUrl) };
+             aArguments.insert(aArguments.end(), rExtraArguments.begin(), rExtraArguments.end());
+             comphelper::dispatchCommand(rCommand, comphelper::containerToSequence(aArguments));
+         });
+
+    return true;
+}
+
+OUString joinWildcards(const std::set<OUString>& rWildcards)
+{
+    OUStringBuffer aJoined;
+    for (const OUString& rWildcard : rWildcards)
+    {
+        if (!aJoined.isEmpty())
+            aJoined.append(';');
+        aJoined.append(rWildcard);
+    }
+    return aJoined.makeStringAndClear();
+}
+
+std::set<OUString> graphicImportWildcards()
+{
+    GraphicFilter& rGraphicFilter = GraphicFilter::GetGraphicFilter();
+
+    std::set<OUString> aWildcards;
+    for (sal_uInt16 nFormat = 0; nFormat < rGraphicFilter.GetImportFormatCount(); ++nFormat)
+    {
+        for (sal_Int32 nEntry = 0;; ++nEntry)
+        {
+            const OUString sWildcard = rGraphicFilter.GetImportWildcard(nFormat, nEntry);
+            if (sWildcard.isEmpty())
+                break;
+            aWildcards.insert(sWildcard.toAsciiLowerCase());
+        }
+    }
+    return aWildcards;
+}
+
+std::vector<Filter> graphicImportFilters()
+{
+    std::vector<Filter> aFilters;
+    const OUString sWildcards = joinWildcards(graphicImportWildcards());
+    // FIXME: We should use a translation of "Images" here and not an empty string.
+    if (!sWildcards.isEmpty())
+        aFilters.push_back({ u""_ustr, sWildcards });
+
+    return aFilters;
+}
+
+std::vector<Filter> documentImportFilters(const OUString& rFactoryName)
+{
+    std::vector<Filter> aFilters;
+    SfxFilterMatcher aMatcher(rFactoryName);
+    SfxFilterMatcherIter aIter(aMatcher, SfxFilterFlags::IMPORT);
+
+    OUStringBuffer aWildcards;
+    for (std::shared_ptr<const SfxFilter> pFilter = aIter.First(); pFilter;
+         pFilter = aIter.Next())
+    {
+        const OUString& sGlob = pFilter->GetWildcard().getGlob();
+        if (!sGlob.isEmpty())
+        {
+            if (!aWildcards.isEmpty())
+                aWildcards.append(';');
+            aWildcards.append(sGlob);
+        }
+    }
+    // FIXME: We should use a translation of "Documents" here and not an empty string.
+    if (!aWildcards.isEmpty())
+        aFilters.push_back({ u""_ustr, aWildcards.makeStringAndClear() });
+
+    return aFilters;
+}
+}
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

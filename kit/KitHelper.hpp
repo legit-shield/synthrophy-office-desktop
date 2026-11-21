@@ -1,0 +1,282 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#pragma once
+
+#include <common/JsonUtil.hpp>
+#include <common/Util.hpp>
+
+#include <COKit/COKit.hxx>
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+namespace LOKitHelper
+{
+    constexpr auto tunnelledDialogImageCacheSize = 100;
+
+    /// Returns the pixel size, as (width, height), of a page rendered to fit inside a box
+    /// while keeping the aspect ratio of the page. The page fills the box along one side and
+    /// is at least 1x1. A box or a page with a side of zero or less gives 1x1.
+    inline std::pair<int, int> fitPageInBox(int boxWidth, int boxHeight, int64_t pageWidthTwips,
+                                            int64_t pageHeightTwips)
+    {
+        if (boxWidth <= 0 || boxHeight <= 0 || pageWidthTwips <= 0 || pageHeightTwips <= 0)
+            return { 1, 1 };
+
+        // Comparing the products compares the two aspect ratios without a division, so the
+        // comparison is exact. The side of the page that limits the scale takes the full length
+        // of the box on that side, and the other side is scaled by the same factor, rounded down.
+        if (pageWidthTwips * boxHeight <= pageHeightTwips * boxWidth)
+        {
+            const int64_t width = pageWidthTwips * boxHeight / pageHeightTwips;
+            return { static_cast<int>(std::max<int64_t>(1, width)), boxHeight };
+        }
+
+        const int64_t height = pageHeightTwips * boxWidth / pageWidthTwips;
+        return { boxWidth, static_cast<int>(std::max<int64_t>(1, height)) };
+    }
+
+    inline std::string documentTypeToString(COKitDocumentType type)
+    {
+        switch (type)
+        {
+        case COKitDocumentType::TEXT:
+            return "text";
+        case COKitDocumentType::SPREADSHEET:
+            return "spreadsheet";
+        case COKitDocumentType::PRESENTATION:
+            return "presentation";
+        case COKitDocumentType::DRAWING:
+            return "drawing";
+        default:
+            return "other-" + std::to_string(static_cast<int>(type));
+        }
+    }
+
+    inline std::string getPartData(COKitDocument *loKitDocument, int part)
+    {
+        return loKitDocument->getPartInfo(part);
+    }
+
+    inline std::string MapToJSONString(std::unordered_map<std::string, std::string> &map)
+    {
+        std::string resultingString = "{";
+        for (std::unordered_map<std::string, std::string>::iterator i = map.begin(); i != map.end(); i++)
+        {
+            resultingString += "\"" + i->first + "\": " + i->second + ',';
+        }
+        resultingString.pop_back();
+        resultingString += "}";
+
+        return resultingString;
+    }
+
+    inline int getMode(const std::string &partData)
+    {
+        Poco::JSON::Parser parser;
+        Poco::Dynamic::Var partJsonVar = parser.parse(partData);
+        const Poco::SharedPtr<Poco::JSON::Object>& partObject = partJsonVar.extract<Poco::JSON::Object::Ptr>();
+
+        if (partObject->has("mode"))
+            return std::atoi(partObject->get("mode").toString().c_str());
+        return 0;
+    }
+
+    inline std::string partHasComments(const std::string &partData)
+    {
+        Poco::JSON::Parser parser;
+        Poco::Dynamic::Var partJsonVar = parser.parse(partData);
+        const Poco::SharedPtr<Poco::JSON::Object>& partObject = partJsonVar.extract<Poco::JSON::Object::Ptr>();
+        if (partObject->has("partHasComments"))
+            return partObject->get("partHasComments").toString();
+        return "false";
+    }
+
+    inline void fetchPartsData(COKitDocument *loKitDocument, std::unordered_map<std::string, std::string> &resultInfo, int partsCount, int &mode)
+    {
+        /*
+            Except for Writer.
+
+            Since parts should be an array, we will start an array and put parts into it.
+            We are building a JSON array.
+        */
+
+        std::string resultingPartsArray = "[";
+
+        for (int i = 0; i < partsCount; ++i)
+        {
+            std::string partData = getPartData(loKitDocument, i); // Part data is sent from the core side as JSON string.
+            resultingPartsArray += partData + (i < partsCount - 1 ? ", ": "]");
+
+            if (i == 0)
+                mode = getMode(partData);
+        }
+
+        resultInfo["parts"] = std::move(resultingPartsArray);
+    }
+
+    // TODO: create a struct with all the resultInfo properties and
+    inline void fetchWriterSpecificData(COKitDocument *loKitDocument, std::unordered_map<std::string, std::string> &resultInfo, int& mode, std::string& hasComments)
+    {
+        std::string rectangles = loKitDocument->getWriterPageRectangles();
+
+        rectangles = Util::replace(rectangles, ";", "], [");
+
+        resultInfo["pagerectangles"] = "[ [" + rectangles + "] ]";
+
+        // Fetch mode for a potentially non-standard redline render mode.
+        std::string partData = getPartData(loKitDocument, 0);
+        mode = getMode(partData);
+        hasComments = partHasComments(partData);
+    }
+
+    inline void fetchCalcSpecificData(COKitDocument *loKitDocument, std::unordered_map<std::string, std::string> &resultInfo, int part)
+    {
+        const COKitDataArea aDataArea = loKitDocument->getDataArea(part);
+        resultInfo["lastcolumn"] = std::to_string(aDataArea.nLastColumn);
+        resultInfo["lastrow"] = std::to_string(aDataArea.nLastRow);
+
+        std::string value(loKitDocument->getCommandValues(".uno:DefinePrintArea"));
+        if (!value.empty())
+        {
+            resultInfo["printranges"] = std::move(value);
+        }
+    }
+
+    inline std::string getDocumentTypeAsString(COKitDocument *loKitDocument)
+    {
+        assert(loKitDocument && "null loKitDocument");
+        const auto type = loKitDocument->getDocumentType();
+        return documentTypeToString(type);
+    }
+
+    /// True when the document was loaded from a hybrid PDF, a PDF that carries the ODF document
+    /// it was exported from. Such a document is edited as that ODF document.
+    inline bool isHybridPDF(COKitDocument* loKitDocument)
+    {
+        const std::string value(loKitDocument->getCommandValues(".uno:HybridPDF"));
+        Poco::JSON::Object::Ptr object;
+        if (!JsonUtil::parseJSON(value, object))
+            return false;
+        return JsonUtil::getJSONValue<std::string>(object, "hybridpdf") == "true";
+    }
+
+    /// True when the document is a master document, a text document that links its chapters.
+    inline bool isMasterDocument(COKitDocument* document)
+    {
+        const std::string value(document->getCommandValues(".uno:MasterDocument"));
+        Poco::JSON::Object::Ptr object;
+        if (!JsonUtil::parseJSON(value, object))
+            return false;
+        return JsonUtil::getJSONValue<std::string>(object, "masterdocument") == "true";
+    }
+
+    inline std::string documentStatus(COKitDocument *loKitDocument, bool diffSizePages = false)
+    {
+        assert(loKitDocument && "null loKitDocument");
+        const auto type = loKitDocument->getDocumentType();
+
+        std::unordered_map<std::string, std::string> resultInfo;
+
+        const int partsCount = loKitDocument->getParts();
+        const std::string selectedPart = loKitDocument->getPart();
+
+        const COKitSize aDocSize = loKitDocument->getDocumentSize();
+        int viewId = loKitDocument->getView();
+
+        resultInfo["type"] = '"' + documentTypeToString(type) + '"';
+        resultInfo["partscount"] = std::to_string(partsCount);
+        resultInfo["selectedpart"] = '"' + selectedPart + '"';
+        resultInfo["width"] = std::to_string(aDocSize.nWidth);
+        resultInfo["height"] = std::to_string(aDocSize.nHeight);
+        resultInfo["viewid"] = std::to_string(viewId);
+
+        std::string value(loKitDocument->getCommandValues(".uno:ReadOnly"));
+        if (!value.empty())
+        {
+            bool readOnly = (value.find("true") != std::string::npos);
+            resultInfo["readonly"] = readOnly ? "true": "false";
+        }
+
+        std::string externalLinks(loKitDocument->getCommandValues(".uno:ExternalLinksDisabled"));
+        if (!externalLinks.empty())
+        {
+            bool externalLinksDisabled = (externalLinks.find("true") != std::string::npos);
+            resultInfo["externallinksdisabled"] = externalLinksDisabled ? "true": "false";
+        }
+
+        if (isHybridPDF(loKitDocument))
+            resultInfo["hybridpdf"] = "true";
+
+        if (type == COKitDocumentType::TEXT && isMasterDocument(loKitDocument))
+            resultInfo["masterdocument"] = "true";
+
+        std::string values(loKitDocument->getCommandValues(".uno:AllPageSize"));
+        if (!values.empty())
+        {
+            Poco::JSON::Parser parser;
+            const auto var = parser.parse(values);
+            const auto& obj = var.extract<Poco::JSON::Object::Ptr>();
+            if (obj && obj->has("parts"))
+            {
+                const auto parts = obj->getArray("parts");
+                std::ostringstream os;
+                parts->stringify(os);
+                resultInfo["partdimensions"] = os.str();
+            }
+        }
+
+        if (diffSizePages)
+        {
+            resultInfo["currentpageresized"] = "true";
+            return MapToJSONString(resultInfo);
+        }
+
+        int mode = 0;
+        std::string hasComments = "false";
+
+        if (type == COKitDocumentType::SPREADSHEET)
+            // A spreadsheet's part identifier is the sheet index in decimal form.
+            fetchCalcSpecificData(loKitDocument, resultInfo, std::atoi(selectedPart.c_str()));
+        else if (type == COKitDocumentType::TEXT)
+            fetchWriterSpecificData(loKitDocument, resultInfo, mode, hasComments);
+
+        if (type == COKitDocumentType::SPREADSHEET || type == COKitDocumentType::PRESENTATION || type == COKitDocumentType::DRAWING)
+            fetchPartsData(loKitDocument, resultInfo, partsCount, mode);
+
+        // The ids that the vector primitives name the parts by, in the order of the parts, as
+        // pageids. An id names its part for as long as the part exists. The answer holds them as
+        // the array "ids", which is empty for a document that has none.
+        const std::string partIds(loKitDocument->getCommandValues(".uno:VectorPartIds"));
+        Poco::JSON::Object::Ptr partIdsObject;
+        if (JsonUtil::parseJSON(partIds, partIdsObject) && partIdsObject)
+        {
+            const Poco::JSON::Array::Ptr ids = partIdsObject->getArray("ids");
+            if (ids && ids->size() > 0)
+            {
+                std::ostringstream os;
+                ids->stringify(os);
+                resultInfo["pageids"] = os.str();
+            }
+        }
+
+        resultInfo["mode"] = std::to_string(mode);
+        resultInfo["partHasComments"] = std::move(hasComments);
+
+        return MapToJSONString(resultInfo);
+    }
+}
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

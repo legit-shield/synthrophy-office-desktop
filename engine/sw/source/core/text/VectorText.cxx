@@ -1,0 +1,422 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <VectorText.hxx>
+
+#include <drawfont.hxx>
+#include <EnhancedPDFExportHelper.hxx>
+#include <editeng/adjustitem.hxx>
+#include <ndtxt.hxx>
+#include <pagefrm.hxx>
+#include <paratr.hxx>
+#include <rootfrm.hxx>
+#include <swfont.hxx>
+#include <txtfrm.hxx>
+#include <VectorCollector.hxx>
+#include <viewopt.hxx>
+#include <viewsh.hxx>
+#include "inftxt.hxx"
+#include "itrpaint.hxx"
+#include "txtpaint.hxx"
+
+#include <basegfx/matrix/b2dhommatrixtools.hxx>
+#include <basegfx/polygon/b2dpolygontools.hxx>
+#include <basegfx/polygon/b2dpolypolygon.hxx>
+#include <drawinglayer/primitive2d/PolyPolygonHairlinePrimitive2D.hxx>
+#include <drawinglayer/primitive2d/fonttextprimitive.hxx>
+#include <drawinglayer/primitive2d/graphicprimitive2d.hxx>
+#include <drawinglayer/primitive2d/maskprimitive2d.hxx>
+#include <drawinglayer/primitive2d/texthierarchyprimitive2d.hxx>
+#include <drawinglayer/primitive2d/unifiedtransparenceprimitive2d.hxx>
+#include <o3tl/safeint.hxx>
+#include <o3tl/string_view.hxx>
+#include <tools/degree.hxx>
+#include <vcl/GraphicObject.hxx>
+#include <vcl/outdev.hxx>
+#include <vcl/rendercontext/State.hxx>
+#include <vcl/svapp.hxx>
+
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <optional>
+
+namespace sw::vector
+{
+namespace
+{
+/// Hairlines in rColor along rLines, which are in document twips, relative to rOrigin.
+drawinglayer::primitive2d::Primitive2DReference
+createHairlines(const basegfx::B2DPolyPolygon& rLines, const Color& rColor, const Point& rOrigin)
+{
+    basegfx::B2DPolyPolygon aLines(rLines);
+    aLines.transform(basegfx::utils::createTranslateB2DHomMatrix(-rOrigin.X(), -rOrigin.Y()));
+    return new drawinglayer::primitive2d::PolyPolygonHairlinePrimitive2D(std::move(aLines),
+                                                                          rColor.getBColor());
+}
+}
+
+/// rPrimitives cut to rArea, which is in document twips. The primitives and the result are
+/// relative to rOrigin.
+drawinglayer::primitive2d::Primitive2DReference
+createMask(const SwRect& rArea, const Point& rOrigin,
+           drawinglayer::primitive2d::Primitive2DContainer&& rPrimitives)
+{
+    return new drawinglayer::primitive2d::MaskPrimitive2D(
+        basegfx::B2DPolyPolygon(
+            basegfx::utils::createPolygonFromRect(rangeRelativeTo(rArea, rOrigin))),
+        std::move(rPrimitives));
+}
+
+const SwViewOption& optionsForAnyView()
+{
+    // The options as they are constructed, with no setting of a view applied: the changes are
+    // drawn in the text in the standard way and none of them in the margin, the placeholder fields
+    // are shown, and no formatting mark is. The colors are the ones the application started with.
+    static const SwViewOption aOptions;
+    return aOptions;
+}
+
+TextSink::TextSink(const Point& rOrigin, const SwRect& rTextArea,
+                   drawinglayer::primitive2d::TextPortionAlign eAlign, const Context& rContext)
+    : maOrigin(rOrigin)
+    , maTextArea(rTextArea)
+    , mrContext(rContext)
+    , mbParagraph(true)
+{
+    // A text frame shows a single paragraph.
+    maLayout.mnParagraph = 0;
+    maLayout.meAlign = eAlign;
+    maLayout.mfTextAreaWidth = rTextArea.Width();
+    maLayout.mfTextAreaHeight = rTextArea.Height();
+}
+
+TextSink::TextSink(const Point& rOrigin, const Context& rContext)
+    : maOrigin(rOrigin)
+    , mrContext(rContext)
+    , mbParagraph(false)
+{
+}
+
+void TextSink::startLine(SwTwips nLeft, SwTwips nWidth, SwTwips nAscent, SwTwips nHeight)
+{
+    finishLine();
+    maLayout.mfLineIndent = nLeft - maTextArea.Left();
+    maLayout.mfLineWidth = nWidth;
+    maLayout.mfLineAscent = nAscent;
+    maLayout.mfLineHeight = nHeight;
+}
+
+void TextSink::addText(const OutputDevice& rDevice, const Point& rPosition, const OUString& rText,
+                       sal_Int32 nIndex, sal_Int32 nLength, KernArraySpan aAdvances,
+                       std::span<const bool> aKashida, bool bFillerBlanks)
+{
+    if (nLength <= 0)
+        return;
+
+    // The array starts with the advances of the range. Any past it belong to another draw call.
+    std::vector<double> aDXArray(aAdvances.begin(), aAdvances.end());
+    if (aDXArray.empty())
+    {
+        KernArray aMeasured;
+        rDevice.GetTextArray(rText, &aMeasured, nIndex, nLength);
+        aDXArray.assign(aMeasured.begin(), aMeasured.end());
+    }
+    if (aDXArray.size() > o3tl::make_unsigned(nLength))
+        aDXArray.resize(nLength);
+
+    // The kashida flags start with the range too. Flags shorter than the range count as none.
+    boost::container::vector<bool> aKashidaArray;
+    if (aKashida.size() >= o3tl::make_unsigned(nLength))
+        aKashidaArray.assign(aKashida.begin(), aKashida.begin() + nLength);
+
+    // Writer draws the background of characters itself, so the text takes no fill of its own.
+    drawinglayer::primitive2d::TextDrawState aState;
+    aState.maTextColor = rDevice.GetTextColor().getBColor();
+    // Text left in the automatic color stays automatic, which means the color that reads on the
+    // paper under it.
+    if (!mrContext.isForView() && rDevice.GetFont().GetColor() == COL_AUTO)
+    {
+        aState.maTextColor = basegfx::BColor();
+        aState.maTextColor.setAutomatic(true);
+    }
+    if (rDevice.IsOverlineColor())
+        aState.moOverlineColor = rDevice.GetOverlineColor().getBColor();
+    if (rDevice.IsTextLineColor())
+        aState.moTextLineColor = rDevice.GetTextLineColor().getBColor();
+    aState.meLayoutMode = rDevice.GetLayoutMode();
+    aState.meLanguage = rDevice.GetFont().GetLanguage();
+    if (mbParagraph)
+    {
+        aState.moLayout = maLayout;
+        aState.moLayout->mbFillerBlanks = bFillerBlanks;
+    }
+
+    // The device puts the right end of a right-to-left run at rPosition unless the layout mode
+    // asks for the left end. A text primitive starts at the left end, so the start moves back
+    // along the baseline by the width of the run. The last advance is the distance from the start
+    // of the run to the end of its last character, which is that width.
+    basegfx::B2DPoint aStart(rPosition.X() - maOrigin.X(), rPosition.Y() - maOrigin.Y());
+    const vcl::text::ComplexTextLayoutFlags eLayoutMode = aState.meLayoutMode;
+    const bool bRightToLeft(eLayoutMode & vcl::text::ComplexTextLayoutFlags::BiDiRtl);
+    const bool bOriginLeft(eLayoutMode & vcl::text::ComplexTextLayoutFlags::TextOriginLeft);
+    const bool bOriginRight(eLayoutMode & vcl::text::ComplexTextLayoutFlags::TextOriginRight);
+    if (((bRightToLeft && !bOriginLeft) || bOriginRight) && !aDXArray.empty())
+    {
+        const double fAngle = -toRadians(rDevice.GetFont().GetOrientation());
+        const double fWidth = aDXArray.back();
+        aStart.adjustX(-std::cos(fAngle) * fWidth);
+        aStart.adjustY(-std::sin(fAngle) * fWidth);
+    }
+
+    // The device draws the digits of the range in the script of its digit language, so the text
+    // of the primitive holds those digits. Each of them takes the place of one digit of the range,
+    // so the range and the advances stay as they are.
+    const OUString aText = localizeDigits(rText, rDevice.GetDigitLanguage(), nIndex, nLength);
+
+    const drawinglayer::primitive2d::Primitive2DReference xText(
+        drawinglayer::primitive2d::createTextPrimitiveFromFont(
+            aStart, aText, nIndex, nLength, std::move(aDXArray),
+            std::move(aKashidaArray), rDevice.GetFont(), aState));
+    if (!xText)
+        return;
+
+    const Color aFontColor(rDevice.GetFont().GetColor());
+    if (aFontColor != COL_AUTO && aFontColor.IsTransparent())
+        maLine.push_back(new drawinglayer::primitive2d::UnifiedTransparencePrimitive2D(
+            drawinglayer::primitive2d::Primitive2DContainer{ xText },
+            1.0 - aFontColor.GetAlpha() / 255.0));
+    else
+        maLine.push_back(xText);
+}
+
+OUString TextSink::localizeDigits(const OUString& rText, LanguageType eDigitLanguage,
+                                  sal_Int32 nIndex, sal_Int32 nLength)
+{
+    const bool bSameText = rText == maDigitSource;
+    if (bSameText && eDigitLanguage == meDigitLanguage)
+        return maLocalizedDigits;
+
+    // A range without digits looks the same in any digit language, so it keeps the string of the
+    // portion before it.
+    const std::u16string_view aRange(rText.subView(nIndex, nLength));
+    const bool bDigits = o3tl::containsAsciiDigit(aRange);
+    if (bSameText && !bDigits)
+        return maLocalizedDigits;
+
+    // The digits of the whole string change, so the next portions of the paragraph in the same
+    // digit language get this string too. Every digit script is in the basic multilingual plane,
+    // so a digit stays one code unit and the ranges of all portions stay valid.
+    sal_Int32 nTextLength = rText.getLength();
+    maLocalizedDigits = LocalizeDigitsInString(rText, eDigitLanguage, 0, nTextLength);
+    maDigitSource = rText;
+    meDigitLanguage = eDigitLanguage;
+    return maLocalizedDigits;
+}
+
+void TextSink::addFill(const SwRect& rArea, const Color& rColor)
+{
+    if (!rArea.HasArea())
+        return;
+
+    addColorFill(maLine,
+                 basegfx::B2DPolyPolygon(
+                     basegfx::utils::createPolygonFromRect(rangeRelativeTo(rArea, maOrigin))),
+                 rColor);
+}
+
+void TextSink::addLines(const basegfx::B2DPolyPolygon& rLines, const Color& rColor)
+{
+    if (rLines.count() != 0)
+        maLine.push_back(createHairlines(rLines, rColor, maOrigin));
+}
+
+void TextSink::addLinesOverObjects(const basegfx::B2DPolyPolygon& rLines, const Color& rColor)
+{
+    if (rLines.count() != 0)
+        maOverObjects.push_back(createHairlines(rLines, rColor, maOrigin));
+}
+
+void TextSink::startClip(const SwRect& rArea)
+{
+    endClip();
+    moClipArea = rArea;
+    mnClipStart = maLine.size();
+}
+
+void TextSink::endClip()
+{
+    if (!moClipArea)
+        return;
+
+    const SwRect aArea(*moClipArea);
+    moClipArea.reset();
+    if (maLine.size() <= mnClipStart)
+        return;
+
+    drawinglayer::primitive2d::Primitive2DContainer aClipped;
+    aClipped.insert(aClipped.end(), maLine.begin() + mnClipStart, maLine.end());
+    maLine.erase(maLine.begin() + mnClipStart, maLine.end());
+    maLine.push_back(createMask(aArea, maOrigin, std::move(aClipped)));
+}
+
+void TextSink::addGraphic(const SwRect& rArea, const GraphicObject& rGraphic)
+{
+    if (!rArea.HasArea())
+        return;
+
+    maLine.push_back(new drawinglayer::primitive2d::GraphicPrimitive2D(
+        basegfx::utils::createScaleTranslateB2DHomMatrix(
+            rArea.Width(), rArea.Height(), rArea.Left() - maOrigin.X(),
+            rArea.Top() - maOrigin.Y()),
+        rGraphic, rGraphic.GetAttr()));
+}
+
+void TextSink::add(drawinglayer::primitive2d::Primitive2DContainer&& rPrimitives)
+{
+    if (!rPrimitives.empty())
+        maLine.append(std::move(rPrimitives));
+}
+
+void TextSink::startGroup() { mnGroupStart = maLine.size(); }
+
+void TextSink::endGroup(PortionGroup eGroup)
+{
+    if (mnGroupStart >= maLine.size())
+        return;
+
+    const auto aStart = maLine.begin() + mnGroupStart;
+    drawinglayer::primitive2d::Primitive2DContainer aGroup;
+    std::move(aStart, maLine.end(), std::back_inserter(aGroup));
+    maLine.erase(aStart, maLine.end());
+    // A label is the bullet of the paragraph, as the text of a drawing object marks it. Its
+    // text is not text of the paragraph.
+    if (eGroup == PortionGroup::Label)
+        maLine.push_back(
+            new drawinglayer::primitive2d::TextHierarchyBulletPrimitive2D(std::move(aGroup)));
+    else
+        maLine.push_back(new drawinglayer::primitive2d::TextHierarchyFieldPrimitive2D(
+            std::move(aGroup), drawinglayer::primitive2d::FIELD_TYPE_COMMON));
+}
+
+void TextSink::shiftLineStart(SwTwips nDistance)
+{
+    maLayout.mfLineIndent += nDistance;
+    maLayout.mfLineWidth -= nDistance;
+}
+
+void TextSink::finishLine()
+{
+    endClip();
+    if (maLine.empty())
+        return;
+
+    maLines.push_back(
+        new drawinglayer::primitive2d::TextHierarchyLinePrimitive2D(std::move(maLine)));
+    maLine = drawinglayer::primitive2d::Primitive2DContainer();
+}
+
+drawinglayer::primitive2d::Primitive2DContainer TextSink::take()
+{
+    if (!mbParagraph)
+    {
+        endClip();
+        drawinglayer::primitive2d::Primitive2DContainer aDrawn(std::move(maLine));
+        maLine = drawinglayer::primitive2d::Primitive2DContainer();
+        return aDrawn;
+    }
+
+    finishLine();
+    drawinglayer::primitive2d::Primitive2DContainer aBlock;
+    if (maLines.empty())
+        return aBlock;
+
+    drawinglayer::primitive2d::Primitive2DContainer aParagraph{
+        new drawinglayer::primitive2d::TextHierarchyParagraphPrimitive2D(std::move(maLines))
+    };
+    maLines = drawinglayer::primitive2d::Primitive2DContainer();
+    aBlock.push_back(
+        new drawinglayer::primitive2d::TextHierarchyBlockPrimitive2D(std::move(aParagraph)));
+    return aBlock;
+}
+
+drawinglayer::primitive2d::Primitive2DContainer TextSink::takeOverObjects()
+{
+    drawinglayer::primitive2d::Primitive2DContainer aOverObjects(std::move(maOverObjects));
+    maOverObjects = drawinglayer::primitive2d::Primitive2DContainer();
+    return aOverObjects;
+}
+
+namespace
+{
+/// Whether aText is a string of blanks of its own in place of a range of the text of the frame
+/// that rInfo draws. The paint draws such blanks for the underline, the overline, the strikeout
+/// or the background along them: across a tab, across the space between two portions, and along
+/// a run of mixed font sizes that shares one underline.
+bool isFillerBlanks(const SwDrawTextInfo& rInfo, std::u16string_view aText)
+{
+    const SwTextFrame* pFrame = rInfo.GetFrame();
+    if (!pFrame || aText.empty() || pFrame->GetText() == aText)
+        return false;
+
+    return std::ranges::all_of(aText,
+                               [](sal_Unicode cCharacter) { return cCharacter == CH_BLANK; });
+}
+}
+
+void drawTextArray(SwDrawTextInfo& rInfo, const Point& rPosition, const OUString& rText,
+                   KernArraySpan aAdvances, std::span<const bool> aKashida, sal_Int32 nIndex,
+                   sal_Int32 nLength)
+{
+    if (TextSink* pSink = rInfo.GetPrimitiveSink())
+    {
+        pSink->addText(rInfo.GetOut(), rPosition, rText, nIndex, nLength, aAdvances, aKashida,
+                       isFillerBlanks(rInfo, rText));
+        return;
+    }
+    rInfo.GetOut().DrawTextArray(rPosition, rText, aAdvances, aKashida, nIndex, nLength);
+}
+
+void drawText(SwDrawTextInfo& rInfo, const Point& rPosition, const OUString& rText,
+              sal_Int32 nIndex, sal_Int32 nLength)
+{
+    if (TextSink* pSink = rInfo.GetPrimitiveSink())
+    {
+        pSink->addText(rInfo.GetOut(), rPosition, rText, nIndex, nLength, {}, {},
+                       isFillerBlanks(rInfo, rText));
+        return;
+    }
+    rInfo.GetOut().DrawText(rPosition, rText, nIndex, nLength);
+}
+
+void drawStretchText(SwDrawTextInfo& rInfo, const Point& rPosition, tools::Long nWidth,
+                     const OUString& rText, sal_Int32 nIndex, sal_Int32 nLength)
+{
+    if (TextSink* pSink = rInfo.GetPrimitiveSink())
+    {
+        // Scale the natural advances so the text ends at nWidth.
+        KernArray aAdvances;
+        rInfo.GetOut().GetTextArray(rText, &aAdvances, nIndex, nLength);
+        if (!aAdvances.empty() && aAdvances.back() > 0.0)
+        {
+            const double fScale = double(nWidth) / aAdvances.back();
+            for (double& rAdvance : aAdvances)
+                rAdvance *= fScale;
+        }
+        pSink->addText(rInfo.GetOut(), rPosition, rText, nIndex, nLength, aAdvances, {},
+                       isFillerBlanks(rInfo, rText));
+        return;
+    }
+    rInfo.GetOut().DrawStretchText(rPosition, nWidth, rText, nIndex, nLength);
+}
+}
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

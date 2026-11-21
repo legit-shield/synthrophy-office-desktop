@@ -1,0 +1,25 @@
+--- coinmp.orig/Clp/src/CbcOrClpParam.cpp
++++ coinmp/Clp/src/CbcOrClpParam.cpp
+@@ -29,9 +29,9 @@
+ #endif
+ #ifdef COIN_HAS_CBC
+ // from CoinSolve
+-static char coin_prompt[] = "Coin:";
++static const char coin_prompt[] = "Coin:";
+ #else
+-static char coin_prompt[] = "Clp:";
++static const char coin_prompt[] = "Clp:";
+ #endif
+ #ifdef CLP_CILK
+ #ifndef CBC_THREAD
+--- coinmp.orig/Clp/src/ClpLsqr.cpp
++++ coinmp/Clp/src/ClpLsqr.cpp
+@@ -19,7 +19,7 @@
+      */
+ 
+   //     Initialize.
+-  static char term_msg[8][80] = {
++  static const char term_msg[8][80] = {
+     "The exact solution is x = 0",
+     "The residual Ax - b is small enough, given ATOL and BTOL",
+     "The least squares error is small enough, given ATOL",

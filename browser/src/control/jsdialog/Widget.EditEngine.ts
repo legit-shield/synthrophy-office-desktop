@@ -1,0 +1,862 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * JSDialog.EditEngine - a contenteditable view of an engine-side EditEngine.
+ *
+ * The engine keeps the text model and the caret. EditEngineWidgetController serializes both as
+ * paragraphs with formatting runs plus a selection, and this widget renders that into a
+ * contenteditable element. The widget is a view: every input event is prevented and forwarded, and
+ * the next model the engine sends replaces both the text on screen and the caret position. It
+ * never guesses where a keystroke will leave the caret.
+ *
+ * Keystrokes travel as UNO key codes and become real key events on the engine side, so paragraph
+ * splitting, outline promote and demote, word navigation, autocorrect and undo grouping all come
+ * from the engine. Composed text and pasted text cannot be expressed as a keystroke and are sent
+ * as their own command. A pointer gesture is the one caret move reported back, because it is the
+ * only one the engine has no other way to learn about.
+ *
+ * Expected JSON payload (in data.data): see EditEngineWidgetJSON.
+ *
+ * Sent back as 'key' { keyCode, charCode, repeat }, 'text' { text },
+ * 'selection' { startPara, startIndex, endPara, endIndex }, and 'focus', 'blur' and 'contextmenu'
+ * with no data.
+ */
+
+declare var JSDialog: any;
+declare var UNOKey: any;
+
+interface EditEngineContainer extends HTMLElement {
+	builder: JSBuilder;
+	editEngineHandlersAttached?: boolean;
+	onEditEngineUpdate?: (data: EditEngineWidgetJSON) => void;
+	// Takes true when a context menu for this widget opens and false when it closes.
+	onEditEngineMenu?: (open: boolean) => void;
+	// True while a context menu for this widget is open. The menu holds the focus then.
+	editEngineMenuOpen?: boolean;
+	// The engine still counts the widget as focused while a control holds the focus.
+	editEngineFocusOnControl?: boolean;
+	// The point of the last mouse press in viewport pixels, or undefined when a key was pressed
+	// after it.
+	editEngineMousePoint?: { x: number; y: number };
+	// The selection the engine last reported or was last told about. A pointer gesture that lands
+	// on the same caret is not reported twice. Held on the element so it goes away when the widget
+	// does.
+	editEngineLastSelection?: EditEngineSelection;
+	// Paste text for a pending paste event's clipboardData.
+	editEnginePendingPasteText?: string;
+}
+
+const EDITENGINE_PARAGRAPH_CLASS = 'ui-editengine-paragraph';
+
+/// The name of the highlight that marks the selection while another element holds the focus.
+const EDITENGINE_MENU_HIGHLIGHT = 'editengine-menu-selection';
+
+/// The class of the container while the highlight marks its selection.
+const EDITENGINE_MARKED_CLASS = 'ui-editengine-selection-marked';
+
+let editEngineControlHolder: EditEngineContainer | null = null;
+let editEngineDocumentListenersAttached = false;
+
+/// One outline level indents by this much.
+const EDITENGINE_DEPTH_INDENT_PX = 24;
+
+/// True only for the rest of the turn after a keydown was turned into a key event, so a beforeinput
+/// that some engines still fire for that same key is not sent again as text.
+let editEngineKeyEventPending = false;
+
+/// The layouting task that drops editEngineKeyEventPending after the current turn, kept so a new
+/// keydown can cancel a stale clear before scheduling its own.
+let editEngineKeyEventClearTask: TaskId | undefined;
+
+function editEngineSendAction(
+	container: EditEngineContainer,
+	action: string,
+	data: any,
+): void {
+	if (!container.builder || !container.builder.callback) return;
+	container.builder.callback(
+		'customwidget',
+		action,
+		container,
+		JSON.stringify(data),
+		container.builder,
+	);
+}
+
+function editEngineParagraphElements(container: HTMLElement): HTMLElement[] {
+	return Array.from(
+		container.querySelectorAll<HTMLElement>('.' + EDITENGINE_PARAGRAPH_CLASS),
+	);
+}
+
+/// The paragraph plus character index a DOM position sits at, clamped into the rendered text.
+function editEnginePositionFromNode(
+	container: HTMLElement,
+	node: Node,
+	offset: number,
+): EditEnginePosition | null {
+	const paragraphs = editEngineParagraphElements(container);
+	for (let i = 0; i < paragraphs.length; ++i) {
+		if (paragraphs[i] === node || paragraphs[i].contains(node)) {
+			return {
+				para: i,
+				index: JSDialog.ContentEditable.offsetWithin(
+					paragraphs[i],
+					node,
+					offset,
+				),
+			};
+		}
+	}
+	return null;
+}
+
+function editEngineGetSelection(
+	container: HTMLElement,
+): EditEngineSelection | null {
+	const selection = window.getSelection();
+	if (!selection || selection.rangeCount === 0) return null;
+
+	const range = selection.getRangeAt(0);
+	if (
+		!container.contains(range.startContainer) ||
+		!container.contains(range.endContainer)
+	)
+		return null;
+
+	const start = editEnginePositionFromNode(
+		container,
+		range.startContainer,
+		range.startOffset,
+	);
+	const end = editEnginePositionFromNode(
+		container,
+		range.endContainer,
+		range.endOffset,
+	);
+	if (!start || !end) return null;
+
+	return {
+		startPara: start.para,
+		startIndex: start.index,
+		endPara: end.para,
+		endIndex: end.index,
+	};
+}
+
+function editEngineApplySelection(
+	container: HTMLElement,
+	selection: EditEngineSelection,
+): void {
+	// Only take over the document selection while this widget has focus. An update pushed by the
+	// engine, or a rebuild, must not drag the caret here and clear what the user had selected in
+	// another field.
+	if (document.activeElement !== container) return;
+
+	const range = editEngineSelectionRange(container, selection);
+	if (!range) return;
+
+	JSDialog.ContentEditable.setCaretRange(
+		range.startContainer,
+		range.startOffset,
+		range.endContainer,
+		range.endOffset,
+	);
+}
+
+/// The DOM range that covers the selection, or null when the widget has no paragraphs.
+function editEngineSelectionRange(
+	container: HTMLElement,
+	selection: EditEngineSelection,
+): Range | null {
+	const paragraphs = editEngineParagraphElements(container);
+	if (!paragraphs.length) return null;
+
+	const clampPara = (para: number): number =>
+		Math.max(0, Math.min(para, paragraphs.length - 1));
+
+	const [startNode, startOffset] = JSDialog.ContentEditable.findNodeAtOffset(
+		paragraphs[clampPara(selection.startPara)],
+		selection.startIndex,
+	);
+	const [endNode, endOffset] = JSDialog.ContentEditable.findNodeAtOffset(
+		paragraphs[clampPara(selection.endPara)],
+		selection.endIndex,
+	);
+
+	const range = document.createRange();
+	try {
+		range.setStart(startNode, startOffset);
+		range.setEnd(endNode, endOffset);
+	} catch {
+		return null;
+	}
+	return range;
+}
+
+/// Marks the selection with a highlight, which shows without the focus and without a document
+/// selection, or removes the mark when the selection is null. Browsers without the CSS Custom
+/// Highlight API show no mark. While the mark is on, the document selection in the container has
+/// no fill, so the selected text has a single fill whether the document selection is there or not.
+function editEngineHighlightSelection(
+	container: HTMLElement,
+	selection: EditEngineSelection | null,
+): void {
+	const highlights = (window.CSS as any)?.highlights;
+	const Highlight = (window as any).Highlight;
+	if (!highlights || !Highlight) return;
+
+	const range = selection
+		? editEngineSelectionRange(container, selection)
+		: null;
+	const marked = !!range && !range.collapsed;
+	if (marked) highlights.set(EDITENGINE_MENU_HIGHLIGHT, new Highlight(range));
+	else highlights.delete(EDITENGINE_MENU_HIGHLIGHT);
+	container.classList.toggle(EDITENGINE_MARKED_CLASS, marked);
+}
+
+/// Scrolls the widget by the least distance that shows the end of the selection, where the caret
+/// is.
+function editEngineScrollCaretIntoView(container: HTMLElement): void {
+	const selection = window.getSelection();
+	if (!selection || selection.rangeCount === 0 || !selection.focusNode) return;
+
+	const caret = document.createRange();
+	caret.setStart(selection.focusNode, selection.focusOffset);
+	let rect = caret.getBoundingClientRect();
+	// A caret in an empty paragraph has no box, so the paragraph gives the line.
+	if (!rect.height) {
+		const node = selection.focusNode;
+		const line = node instanceof Element ? node : node.parentElement;
+		if (!line) return;
+		rect = line.getBoundingClientRect();
+	}
+
+	const view = container.getBoundingClientRect();
+	if (rect.top < view.top) container.scrollTop -= view.top - rect.top;
+	else if (rect.bottom > view.bottom)
+		container.scrollTop += rect.bottom - view.bottom;
+}
+
+/// Drops the document selection when it lies in the container.
+function editEngineDropSelection(container: HTMLElement): void {
+	const selection = window.getSelection();
+	if (!selection || selection.rangeCount === 0) return;
+
+	const range = selection.getRangeAt(0);
+	if (
+		!container.contains(range.startContainer) &&
+		!container.contains(range.endContainer)
+	)
+		return;
+
+	selection.removeAllRanges();
+}
+
+function editEngineKey(selection: EditEngineSelection): string {
+	return (
+		selection.startPara +
+		':' +
+		selection.startIndex +
+		':' +
+		selection.endPara +
+		':' +
+		selection.endIndex
+	);
+}
+
+function editEngineSendSelection(container: EditEngineContainer): void {
+	const selection = editEngineGetSelection(container);
+	if (!selection) return;
+
+	const last = container.editEngineLastSelection;
+	if (last && editEngineKey(last) === editEngineKey(selection)) return;
+	container.editEngineLastSelection = selection;
+
+	editEngineSendAction(container, 'selection', selection);
+}
+
+/// The UNO key code for a keyboard event, reusing the document keymap so there is one table.
+function editEngineToUNOKeyCode(
+	event: KeyboardEvent,
+	builder: JSBuilder,
+): number {
+	const keyboard = builder.map ? (builder.map as any).keyboard : null;
+	let keyCode = keyboard
+		? keyboard._toUNOKeyCode(event.keyCode)
+		: event.keyCode;
+
+	if (event.shiftKey) keyCode |= app.UNOModifier.SHIFT;
+	if (event.ctrlKey || event.metaKey) keyCode |= app.UNOModifier.CTRL;
+	if (event.altKey) keyCode |= app.UNOModifier.ALT;
+
+	return keyCode;
+}
+
+function editEngineOnKeyDown(
+	container: EditEngineContainer,
+	event: KeyboardEvent,
+): void {
+	editEngineKeyEventPending = false;
+
+	// keyCode 229 is what browsers report while an input method owns the keystroke.
+	if (event.isComposing || event.keyCode === 229) return;
+
+	// Let the browser handle clipboard shortcuts for the contenteditable element.
+	if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+		const key = event.key.toLowerCase();
+		if (!event.shiftKey && (key === 'x' || key === 'c' || key === 'v')) return;
+		// Paste unformatted. The paste only ever takes the plain text, so it is a normal paste.
+		if (event.shiftKey && key === 'v') return;
+	}
+
+	event.preventDefault();
+
+	const keyCode = editEngineToUNOKeyCode(event, container.builder);
+	const printable = event.key.length === 1 && !event.ctrlKey && !event.metaKey;
+	const charCode = printable ? (event.key.codePointAt(0) ?? 0) : 0;
+
+	editEngineSendAction(container, 'key', {
+		keyCode: keyCode,
+		charCode: charCode,
+		repeat: event.repeat ? 1 : 0,
+	});
+
+	// A prevented keydown normally suppresses the beforeinput for the same key, but some engines
+	// still fire it. Guard against sending that character a second time, then drop the guard after
+	// this turn so a later keystroke-less input (virtual keyboard, autocorrect, drop) is not
+	// swallowed. A same-key beforeinput runs in this turn, before the layouting task clears it.
+	editEngineKeyEventPending = true;
+	if (editEngineKeyEventClearTask !== undefined)
+		app.layoutingService.cancelLayoutingTask(editEngineKeyEventClearTask);
+	editEngineKeyEventClearTask = app.layoutingService.appendLayoutingTask(() => {
+		editEngineKeyEventPending = false;
+		editEngineKeyEventClearTask = undefined;
+	});
+}
+
+function editEngineOnBeforeInput(
+	container: EditEngineContainer,
+	event: InputEvent,
+): void {
+	event.preventDefault();
+
+	if (event.isComposing) return;
+
+	if (editEngineKeyEventPending) {
+		editEngineKeyEventPending = false;
+		return;
+	}
+
+	// Input with no keystroke behind it: a virtual keyboard, an autocorrection or a drop.
+	if (event.inputType.startsWith('insert') && event.data) {
+		editEngineSendAction(container, 'text', { text: event.data });
+	} else if (event.inputType.startsWith('delete')) {
+		const forward = event.inputType.indexOf('Forward') !== -1;
+		editEngineSendAction(container, 'key', {
+			keyCode: forward ? UNOKey.DELETE : UNOKey.BACKSPACE,
+			charCode: 0,
+			repeat: 0,
+		});
+	}
+}
+
+/// Re-fires the .uno:Copy / .uno:Cut state the server last broadcasted.
+function editEngineRestoreClipboardState(container: EditEngineContainer): void {
+	const map = container.builder.map;
+	const handler = map.stateChangeHandler;
+	if (!handler) return;
+	map.fire('commandstatechanged', {
+		commandName: '.uno:Copy',
+		state: handler.getItemValue('.uno:Copy') || '',
+	});
+	map.fire('commandstatechanged', {
+		commandName: '.uno:Cut',
+		state: handler.getItemValue('.uno:Cut') || '',
+	});
+}
+
+/// Watch selection changes on 'container' and fire 'commandstatechanged' accordingly.
+function editEngineUpdateClipboardState(container: EditEngineContainer): void {
+	if (document.activeElement !== container) return;
+
+	// Update the cut/copy buttons based on if a range is selected.
+	const selection = window.getSelection();
+	let hasSelection = false;
+	if (selection && selection.rangeCount > 0) {
+		const range = selection.getRangeAt(0);
+		if (
+			!range.collapsed &&
+			container.contains(range.startContainer) &&
+			container.contains(range.endContainer)
+		)
+			hasSelection = true;
+	}
+	const state = hasSelection ? 'enabled' : 'disabled';
+	container.builder.map.fire('commandstatechanged', {
+		commandName: '.uno:Copy',
+		state: state,
+		uiOnly: true,
+	});
+	container.builder.map.fire('commandstatechanged', {
+		commandName: '.uno:Cut',
+		state: state,
+		uiOnly: true,
+	});
+}
+
+function editEngineSendBlur(container: EditEngineContainer): void {
+	editEngineSendAction(container, 'blur', {});
+	editEngineRestoreClipboardState(container);
+}
+
+/// True for an element in the context menu or in one of its submenus. Their ids all start with the
+/// id of the context menu.
+function editEngineIsInContextMenu(target: EventTarget | null): boolean {
+	return (
+		target instanceof Element &&
+		!!target.closest('[id^="' + ContextMenuControl.menuID + '"]')
+	);
+}
+
+/// Waits for the focus to leave the context menu. Focus that comes back to the widget keeps the
+/// text in editing, and focus that goes anywhere else ends it. The widget is matched by its id,
+/// because an update from the engine can rebuild it while the menu is open.
+function editEngineBlurAfterContextMenu(container: EditEngineContainer): void {
+	const onFocusIn = (e: FocusEvent) => {
+		if (editEngineIsInContextMenu(e.target)) return;
+		container.ownerDocument.removeEventListener('focusin', onFocusIn);
+		const target = e.target instanceof Element ? e.target : null;
+		if (!target || target.id !== container.id) editEngineSendBlur(container);
+	};
+	container.ownerDocument.addEventListener('focusin', onFocusIn);
+}
+
+/// Popups can be attached inside the document container, so they are matched by class.
+function editEngineIsCommandControl(target: EventTarget | null): boolean {
+	if (!(target instanceof Element)) return false;
+	if (
+		target.closest(
+			'#toolbar-wrapper, #sidebar-dock-wrapper, .modalpopup, .jsdialog-window, .jsdialog-overlay',
+		)
+	)
+		return true;
+	const content = document.getElementById('main-document-content');
+	return !!content && !content.contains(target);
+}
+
+/// A press on the slide moves the focus to the body, which fires no focusin, so the press itself
+/// releases the text before map.focus() could hand the focus back to it.
+function editEngineAttachDocumentListeners(): void {
+	if (editEngineDocumentListenersAttached) return;
+	editEngineDocumentListenersAttached = true;
+	const leaveFor = (target: EventTarget | null) => {
+		const holder = editEngineControlHolder;
+		if (
+			!holder ||
+			(target instanceof Node && holder.contains(target)) ||
+			editEngineIsCommandControl(target)
+		)
+			return;
+		editEngineControlHolder = null;
+		holder.editEngineFocusOnControl = false;
+		editEngineHighlightSelection(holder, null);
+		editEngineSendAction(holder, 'blur', {});
+	};
+	document.addEventListener('focusin', (e: FocusEvent) => leaveFor(e.target));
+	document.addEventListener(
+		'pointerdown',
+		(e: PointerEvent) => leaveFor(e.target),
+		true,
+	);
+}
+
+function editEngineAttachHandlers(container: EditEngineContainer): void {
+	container.addEventListener('keydown', (e: KeyboardEvent) => {
+		container.editEngineMousePoint = undefined;
+		editEngineOnKeyDown(container, e);
+	});
+
+	container.addEventListener('beforeinput', (e: Event) =>
+		editEngineOnBeforeInput(container, e as InputEvent),
+	);
+
+	// The engine switches the text in and out of editing on focus changes, for example to clear a
+	// placeholder text on entry and to restore it when the text is left empty.
+	// The widget shows no selection while it lacks the focus, so the engine's selection comes
+	// back with the focus. A click that gives the focus places its own caret after this.
+	container.addEventListener('focus', () => {
+		const engineHasFocus = container.editEngineFocusOnControl;
+		container.editEngineFocusOnControl = false;
+		if (editEngineControlHolder === container) editEngineControlHolder = null;
+		// With the focus, the document selection shows the selection, so the highlight goes.
+		editEngineHighlightSelection(container, null);
+		if (container.editEngineLastSelection)
+			editEngineApplySelection(container, container.editEngineLastSelection);
+		if (!engineHasFocus) editEngineSendAction(container, 'focus', {});
+	});
+
+	// The text stays in editing while the context menu opened on it holds the focus, as it does on
+	// desktop, so empty text under the menu shows no placeholder. The blur goes out when the focus
+	// leaves the menu for anywhere other than this widget.
+	// The engine also keeps the text in editing while a control applies its command to it.
+	container.addEventListener('blur', (e: FocusEvent) => {
+		if (editEngineIsInContextMenu(e.relatedTarget))
+			editEngineBlurAfterContextMenu(container);
+		else if (editEngineIsCommandControl(e.relatedTarget)) {
+			container.editEngineFocusOnControl = true;
+			editEngineControlHolder = container;
+			editEngineHighlightSelection(
+				container,
+				container.editEngineLastSelection || null,
+			);
+			editEngineRestoreClipboardState(container);
+		} else editEngineSendBlur(container);
+	});
+
+	editEngineAttachDocumentListeners();
+
+	container.addEventListener('compositionend', (e: CompositionEvent) => {
+		if (e.data) editEngineSendAction(container, 'text', { text: e.data });
+	});
+
+	container.addEventListener('paste', (e: ClipboardEvent) => {
+		e.preventDefault();
+		// Get the pasted text: either what we remembered or from the event.
+		const pending = container.editEnginePendingPasteText;
+		container.editEnginePendingPasteText = undefined;
+		const text =
+			pending || (e.clipboardData ? e.clipboardData.getData('text/plain') : '');
+		if (text) editEngineSendAction(container, 'text', { text: text });
+	});
+
+	container.addEventListener('cut', (e: ClipboardEvent) => {
+		e.preventDefault();
+		const selected = window.getSelection()?.toString() || '';
+		if (!selected) return;
+		if (e.clipboardData) e.clipboardData.setData('text/plain', selected);
+		editEngineSendAction(container, 'key', {
+			keyCode: UNOKey.DELETE,
+			charCode: 0,
+			repeat: 0,
+		});
+	});
+
+	// A pointer gesture is the one caret move the engine cannot know about, so it is reported.
+	// Keyboard caret moves are not: those went to the engine as key events, and the model that
+	// comes back says where the caret ended up. The gesture ends at the mouseup wherever it is
+	// released, because a drag that selects text can finish outside the widget. A click inside a
+	// selection collapses it only after the mouseup has been handled, so the selection is read in a
+	// later task.
+	container.addEventListener('mousedown', (e: MouseEvent) => {
+		container.editEngineMousePoint = { x: e.clientX, y: e.clientY };
+		window.addEventListener(
+			'mouseup',
+			() =>
+				app.layoutingService.appendLayoutingTask(() =>
+					editEngineSendSelection(container),
+				),
+			{ once: true },
+		);
+	});
+
+	// The engine builds the menu for the caret, so the caret the right click placed goes first.
+	container.addEventListener('contextmenu', (e: MouseEvent) => {
+		e.preventDefault();
+		editEngineSendSelection(container);
+		editEngineSendAction(container, 'contextmenu', {});
+	});
+
+	// Keep the notebookbar Copy and Cut button states up to date.
+	document.addEventListener('selectionchange', () =>
+		editEngineUpdateClipboardState(container),
+	);
+}
+
+function editEngineFontSize(points: number): string {
+	return (
+		'max(var(--editengine-min-font-size, 0pt), calc(' +
+		points +
+		'pt * var(--editengine-font-scale, 1)))'
+	);
+}
+
+function editEngineRenderRun(
+	run: EditEngineRun,
+	text: string,
+	placeholder: boolean,
+): HTMLElement {
+	const span = document.createElement('span');
+
+	if (run.spellError) {
+		// The squiggle sits on a child so that it draws alongside an underline the run itself
+		// carries, rather than one replacing the other.
+		const marked = document.createElement('span');
+		marked.classList.add('ui-editengine-spell-error');
+		marked.setAttribute('aria-invalid', 'spelling');
+		marked.textContent = text;
+		span.appendChild(marked);
+	} else {
+		span.textContent = text;
+	}
+
+	if (run.bold) span.style.fontWeight = 'bold';
+	if (run.italic) span.style.fontStyle = 'italic';
+	if (run.color && !placeholder) span.style.color = run.color;
+	if (run.family) span.style.fontFamily = run.family;
+	if (run.size) span.style.fontSize = editEngineFontSize(run.size);
+
+	const decorations = [];
+	if (run.underline) decorations.push('underline');
+	if (run.strikeout) decorations.push('line-through');
+	if (decorations.length) {
+		span.style.textDecorationLine = decorations.join(' ');
+		if (run.underline && run.underline !== 'single')
+			span.style.textDecorationStyle =
+				run.underline === 'wave' ? 'wavy' : run.underline;
+	}
+
+	if (run.escapement === 'super') span.style.verticalAlign = 'super';
+	else if (run.escapement === 'sub') span.style.verticalAlign = 'sub';
+
+	return span;
+}
+
+function editEngineRenderParagraph(
+	paragraph: EditEngineParagraph,
+	placeholder: boolean,
+): HTMLElement {
+	const element = document.createElement('div');
+	element.classList.add(EDITENGINE_PARAGRAPH_CLASS);
+
+	if (paragraph.align) element.style.textAlign = paragraph.align;
+	// A paragraph outside the outline reports a depth of -1, which must not indent.
+	if (paragraph.depth && paragraph.depth > 0)
+		element.style.paddingInlineStart =
+			paragraph.depth * EDITENGINE_DEPTH_INDENT_PX + 'px';
+
+	// The paragraph's default font, which its runs inherit unless they carry their own.
+	if (paragraph.family) element.style.fontFamily = paragraph.family;
+	if (paragraph.size)
+		element.style.fontSize = editEngineFontSize(paragraph.size);
+	if (paragraph.color && !placeholder) element.style.color = paragraph.color;
+
+	// The bullet is rendered as generated content from this attribute, so its characters stay out
+	// of the paragraph text. Selection offsets then line up with the engine, which numbers indices
+	// over the text alone and treats the bullet as generated.
+	if (paragraph.bulletText)
+		element.setAttribute('data-bullet', paragraph.bulletText);
+
+	const text = paragraph.text || '';
+	const runs = paragraph.runs || [];
+
+	if (!text.length) {
+		// An empty paragraph still has to occupy a line and be a caret target.
+		element.appendChild(document.createElement('br'));
+		return element;
+	}
+
+	if (!runs.length) {
+		element.appendChild(document.createTextNode(text));
+		return element;
+	}
+
+	for (const run of runs) {
+		const part = text.substring(run.start, run.end);
+		if (!part) continue;
+		element.appendChild(editEngineRenderRun(run, part, placeholder));
+	}
+
+	return element;
+}
+
+/// Names the user of the view that holds the text, in the color that marks that user elsewhere,
+/// or removes the name when no other view holds it.
+function editEngineApplyLock(
+	container: EditEngineContainer,
+	lockedBy: number | undefined,
+): void {
+	if (lockedBy === undefined) {
+		container.removeAttribute('data-locked-by');
+		container.style.removeProperty('--editengine-locked-color');
+		return;
+	}
+
+	const map = container.builder.map as any;
+	const name = map && map.getViewName ? map.getViewName(lockedBy) : null;
+	const notice = name
+		? _('%1 is editing').replace('%1', name)
+		: _('Another user is editing');
+	container.setAttribute('data-locked-by', notice);
+	container.style.setProperty(
+		'--editengine-locked-color',
+		app.LOUtil.rgbToHex(app.LOUtil.getViewIdColor(lockedBy)),
+	);
+}
+
+/// Applies a fresh model to an existing widget without recreating the container. The engine sends
+/// these after the first build, so the contenteditable element that holds focus and the input
+/// method state is kept, and only its paragraphs and caret are replaced.
+/// It already happens in JSDialog action handling so inside LayoutingTask.
+function editEngineUpdateInPlace(
+	container: EditEngineContainer,
+	widgetData: EditEngineWidgetJSON,
+): void {
+	const wasReadOnly = container.getAttribute('contenteditable') === 'false';
+	const readOnly = widgetData.readOnly === true;
+	container.setAttribute('contenteditable', readOnly ? 'false' : 'true');
+	container.setAttribute('aria-readonly', readOnly ? 'true' : 'false');
+	editEngineApplyLock(container, widgetData.lockedBy);
+	if (!readOnly && !container.editEngineHandlersAttached) {
+		editEngineAttachHandlers(container);
+		container.editEngineHandlersAttached = true;
+	}
+
+	// A widget that kept the focus while it was read-only reports the focus once it can be
+	// edited, which is when the engine lets it in. A window in the background reports it when it
+	// gets the focus back.
+	if (
+		wasReadOnly &&
+		!readOnly &&
+		document.activeElement === container &&
+		document.hasFocus()
+	)
+		editEngineSendAction(container, 'focus', {});
+
+	const placeholder = widgetData.placeholder === true;
+	container.classList.toggle('ui-editengine-placeholder', placeholder);
+	const paragraphs = (widgetData.paragraphs || []).map((paragraph) =>
+		editEngineRenderParagraph(paragraph, placeholder),
+	);
+
+	container.replaceChildren(...paragraphs);
+
+	const selection = widgetData.selection || {
+		startPara: 0,
+		startIndex: 0,
+		endPara: 0,
+		endIndex: 0,
+	};
+	container.editEngineLastSelection = selection;
+
+	// An open context menu acts on the selection, so the selection stays marked while the menu is
+	// open. The menu can open while the widget still has the focus.
+	if (container.editEngineMenuOpen || container.editEngineFocusOnControl)
+		editEngineHighlightSelection(container, selection);
+
+	// The engine owns the caret, so its selection is applied as given. The container stays in the
+	// document across the update, so the caret can be placed at once with no wait for a frame.
+	if (document.activeElement === container) {
+		editEngineApplySelection(container, selection);
+		// Placing the selection from code does not scroll, so the view follows the caret here.
+		editEngineScrollCaretIntoView(container);
+		return;
+	}
+
+	// Without the focus the widget shows no caret. A document selection that sat in the replaced
+	// paragraphs now rests on the container itself, and WebKit draws a caret for a selection in
+	// editable content whether or not that content has the focus, so the selection is dropped.
+	editEngineDropSelection(container);
+}
+
+function _editEngineControl(
+	parentContainer: Element,
+	data: any,
+	builder: JSBuilder,
+): boolean {
+	const widgetData: EditEngineWidgetJSON = data.data || data;
+
+	const container = window.L.DomUtil.create(
+		'div',
+		'ui-editengine ' + (builder.options.cssClass || ''),
+		parentContainer,
+	) as EditEngineContainer;
+	container.id = data.id;
+	container.builder = builder;
+
+	container.setAttribute('role', 'textbox');
+	container.setAttribute('aria-multiline', 'true');
+	container.setAttribute('spellcheck', 'false');
+	container.setAttribute('autocorrect', 'off');
+	container.tabIndex = 0;
+
+	const placeholder = widgetData.placeholder === true;
+	container.classList.toggle('ui-editengine-placeholder', placeholder);
+	for (const paragraph of widgetData.paragraphs || [])
+		container.appendChild(editEngineRenderParagraph(paragraph, placeholder));
+
+	const readOnly = widgetData.readOnly === true;
+	container.setAttribute('contenteditable', readOnly ? 'false' : 'true');
+	container.setAttribute('aria-readonly', readOnly ? 'true' : 'false');
+	editEngineApplyLock(container, widgetData.lockedBy);
+	if (!readOnly) {
+		editEngineAttachHandlers(container);
+		container.editEngineHandlersAttached = true;
+	}
+
+	container.onEditEngineUpdate = (updateData: EditEngineWidgetJSON) =>
+		editEngineUpdateInPlace(container, updateData);
+
+	container.onEditEngineMenu = (open: boolean) => {
+		container.editEngineMenuOpen = open;
+		// The menu takes the focus, so the selection the engine last reported is marked as it
+		// opens.
+		editEngineHighlightSelection(
+			container,
+			open ? container.editEngineLastSelection || null : null,
+		);
+	};
+
+	// The engine owns the caret. Whatever it says is where the caret goes, with no local guess
+	// about where a keystroke will have moved it.
+	const selection = widgetData.selection || {
+		startPara: 0,
+		startIndex: 0,
+		endPara: 0,
+		endIndex: 0,
+	};
+	container.editEngineLastSelection = selection;
+
+	// An update builds into a detached fragment and swaps the node in afterwards, and a caret
+	// cannot be placed on a node that is not in the document yet, so this waits a frame.
+	app.layoutingService.appendLayoutingTask(() => {
+		if (container.isConnected) editEngineApplySelection(container, selection);
+	});
+
+	return false;
+}
+
+JSDialog.editEngine = function (
+	parentContainer: Element,
+	data: any,
+	builder: JSBuilder,
+): boolean {
+	return _editEngineControl(parentContainer, data, builder);
+};
+
+JSDialog.focusEditEngineHoldingFocus = function (): boolean {
+	const active = document.activeElement;
+	if (active instanceof Element && active.classList.contains('ui-editengine'))
+		return true;
+	const holder = editEngineControlHolder;
+	if (!holder || !holder.isConnected) {
+		editEngineControlHolder = null;
+		return false;
+	}
+	holder.focus();
+	return true;
+};
+
+// TODO: editengine might become regular widget, not a custom one
+if (JSDialog.registerCustomWidgetHandler) {
+	JSDialog.registerCustomWidgetHandler('editengine', _editEngineControl);
+}

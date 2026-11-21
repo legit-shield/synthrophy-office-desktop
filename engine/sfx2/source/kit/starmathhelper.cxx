@@ -1,0 +1,322 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <sal/config.h>
+
+#include <cmath>
+
+#include <sfx2/ipclient.hxx>
+#include <sfx2/kit/componenthelpers.hxx>
+#include <sfx2/kit/helper.hxx>
+#include <sfx2/objsh.hxx>
+#include <sfx2/viewsh.hxx>
+
+#include <comphelper/dispatchcommand.hxx>
+#include <com/sun/star/frame/XDispatchResultListener.hpp>
+#include <toolkit/helper/vclunohelper.hxx>
+#include <tools/fract.hxx>
+#include <tools/UnitConversion.hxx>
+#include <vcl/layout.hxx>
+#include <vcl/virdev.hxx>
+#include <vcl/window.hxx>
+
+#include <com/sun/star/embed/XEmbeddedObject.hpp>
+#include <com/sun/star/frame/XModel.hpp>
+#include <com/sun/star/lang/XServiceInfo.hpp>
+
+KitStarMathHelper::KitStarMathHelper(const SfxViewShell* pViewShell)
+    : mpViewShell(pViewShell)
+{
+    if (mpViewShell)
+    {
+        if (const SfxInPlaceClient* pIPClient = mpViewShell->GetIPClient())
+        {
+            if (const auto& xEmbObj = pIPClient->GetObject())
+            {
+                cpo::uno::Reference<css::lang::XServiceInfo> xComp(xEmbObj->getComponent(),
+                                                                   cpo::uno::UNO_QUERY);
+                if (xComp && xComp->supportsService(u"com.sun.star.formula.FormulaProperties"_ustr))
+                {
+                    if (cpo::uno::Reference<css::frame::XModel> xModel{ xComp,
+                                                                        cpo::uno::UNO_QUERY })
+                    {
+                        if (auto xController = xModel->getCurrentController())
+                        {
+                            mpIPClient = pIPClient;
+                            mxFrame = xController->getFrame();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void KitStarMathHelper::Dispatch(
+    const OUString& cmd, const cpo::uno::Sequence<css::beans::PropertyValue>& rArguments) const
+{
+    if (mxFrame)
+        comphelper::dispatchCommand(cmd, mxFrame, rArguments);
+}
+
+bool KitStarMathHelper::Dispatch(
+    const OUString& cmd, const cpo::uno::Sequence<css::beans::PropertyValue>& rArguments,
+    const cpo::uno::Reference<css::frame::XDispatchResultListener>& xListener) const
+{
+    return mxFrame && comphelper::dispatchCommand(cmd, mxFrame, rArguments, xListener);
+}
+
+namespace
+{
+// Find a child SmGraphicWindow*
+vcl::Window* FindSmGraphicWindow(vcl::Window* pWin)
+{
+    if (!pWin)
+        return nullptr;
+
+    if (pWin->IsStarMath())
+        return pWin;
+
+    pWin = pWin->GetWindow(GetWindowType::FirstChild);
+    while (pWin)
+    {
+        if (vcl::Window* pSmGraphicWindow = FindSmGraphicWindow(pWin))
+            return pSmGraphicWindow;
+        pWin = pWin->GetWindow(GetWindowType::Next);
+    }
+    return nullptr;
+}
+
+// Find a child window that corresponds to SmGraphicWidget
+vcl::Window* FindChildSmGraphicWidgetWindow(vcl::Window* pWin)
+{
+    if (!pWin)
+        return nullptr;
+
+    // The needed window is a VclDrawingArea
+    if (dynamic_cast<VclDrawingArea*>(pWin))
+        return pWin;
+
+    pWin = pWin->GetWindow(GetWindowType::FirstChild);
+    while (pWin)
+    {
+        if (vcl::Window* pSmGraphicWidgetWindow = FindChildSmGraphicWidgetWindow(pWin))
+            return pSmGraphicWidgetWindow;
+        pWin = pWin->GetWindow(GetWindowType::Next);
+    }
+    return nullptr;
+}
+}
+
+vcl::Window* KitStarMathHelper::GetGraphicWindow()
+{
+    if (!mpGraphicWindow)
+    {
+        if (mxFrame)
+        {
+            cpo::uno::Reference<css::awt::XWindow> xDockerWin = mxFrame->getContainerWindow();
+            mpGraphicWindow.reset(FindSmGraphicWindow(VCLUnoHelper::GetWindow(xDockerWin)));
+        }
+    }
+
+    return mpGraphicWindow.get();
+}
+
+vcl::Window* KitStarMathHelper::GetWidgetWindow()
+{
+    if (!mpWidgetWindow)
+        mpWidgetWindow.reset(FindChildSmGraphicWidgetWindow(GetGraphicWindow()));
+
+    return mpWidgetWindow.get();
+}
+
+const SfxViewShell* KitStarMathHelper::GetSmViewShell()
+{
+    if (vcl::Window* pGraphWindow = GetGraphicWindow())
+    {
+        return SfxViewShell::GetFirst(false, [pGraphWindow](const SfxViewShell& shell) {
+            return shell.GetWindow() && shell.GetWindow()->IsChild(pGraphWindow);
+        });
+    }
+    return nullptr;
+}
+
+const SfxViewShell* KitStarMathHelper::FindContainerViewShell(const SfxViewShell* pSmViewShell)
+{
+    if (!pSmViewShell)
+        return nullptr;
+
+    const vcl::Window* pSmWindow = pSmViewShell->GetWindow();
+    if (!pSmWindow)
+        return nullptr;
+
+    return SfxViewShell::GetFirst(false, [pSmViewShell, pSmWindow](const SfxViewShell& rShell) {
+        if (&rShell == pSmViewShell || !rShell.GetIPClient())
+            return false;
+        const vcl::Window* pGraphicWindow = KitStarMathHelper(&rShell).GetGraphicWindow();
+        return pGraphicWindow
+               && (pGraphicWindow == pSmWindow || pSmWindow->IsChild(pGraphicWindow));
+    });
+}
+
+void KitStarMathHelper::SendCaret(const SfxViewShell& rSmViewShell)
+{
+    const SfxViewShell* pContainerViewShell = FindContainerViewShell(&rSmViewShell);
+    const int nViewId = sal_Int32(
+        (pContainerViewShell ? *pContainerViewShell : rSmViewShell).GetViewShellId());
+    if (const auto payload
+        = rSmViewShell.getKitPayload(COKitCallbackType::INVALIDATE_VISIBLE_CURSOR, nViewId))
+    {
+        rSmViewShell.viewCallbackWithViewId(COKitCallbackType::INVALIDATE_VISIBLE_CURSOR, *payload,
+                                            nViewId);
+    }
+    if (const auto payload = rSmViewShell.getKitPayload(COKitCallbackType::TEXT_SELECTION, nViewId))
+    {
+        rSmViewShell.viewCallback(COKitCallbackType::TEXT_SELECTION, *payload);
+    }
+}
+
+tools::Rectangle KitStarMathHelper::GetBoundingBox() const
+{
+    if (mpIPClient)
+    {
+        tools::Rectangle r(mpIPClient->GetObjArea());
+        if (SfxObjectShell* pObjShell = const_cast<SfxViewShell*>(mpViewShell)->GetObjectShell())
+        {
+            const o3tl::Length unit = MapToO3tlLength(pObjShell->GetMapUnit());
+            if (unit != o3tl::Length::twip && unit != o3tl::Length::invalid)
+                r = o3tl::convert(r, unit, o3tl::Length::twip);
+        }
+        return r;
+    }
+    return {};
+}
+
+tools::Rectangle KitStarMathHelper::ToDocument(const tools::Rectangle& rInView) const
+{
+    // the in-place client scales the formula's own area onto its frame, as the office shows it
+    const double fScaleX(mpIPClient ? mpIPClient->GetScaleWidth() : 1.0);
+    const double fScaleY(mpIPClient ? mpIPClient->GetScaleHeight() : 1.0);
+    const Point aTopLeft(GetBoundingBox().TopLeft());
+    return tools::Rectangle(
+        Point(aTopLeft.X() + std::round(rInView.Left() * fScaleX),
+              aTopLeft.Y() + std::round(rInView.Top() * fScaleY)),
+        Size(std::round(rInView.GetWidth() * fScaleX), std::round(rInView.GetHeight() * fScaleY)));
+}
+
+bool KitStarMathHelper::postMouseEvent(COKitMouseEventType eType, int nX, int nY, int nCount,
+                                       int nButtons,
+                                       int nModifier, double fPPTScaleX, double fPPTScaleY)
+{
+    // the area of the object is the formula's own size, which shows at the scale of its frame,
+    // and the frame takes the presses
+    const tools::Rectangle rBBox
+        = ToDocument(tools::Rectangle(Point(), GetBoundingBox().GetSize()));
+    if (Point aMousePos(nX, nY); rBBox.Contains(aMousePos))
+    {
+        if (vcl::Window* pWindow = GetWidgetWindow())
+        {
+            aMousePos -= rBBox.TopLeft();
+
+            // the formula shows at the scale its frame gives it, its view is in its own size
+            if (mpIPClient && mpIPClient->GetScaleWidth() > 0.0
+                && mpIPClient->GetScaleHeight() > 0.0)
+                aMousePos = Point(std::round(aMousePos.X() / mpIPClient->GetScaleWidth()),
+                                  std::round(aMousePos.Y() / mpIPClient->GetScaleHeight()));
+
+            // In Kit, Math does not convert coordinates (see SmGraphicWidget::SetDrawingArea,
+            // which disables MapMode), and uses twips internally (see SmDocShell ctor and
+            // SmMapUnit), but the conversion factor can depend on the client zoom.
+            // 1. Remove the twip->pixel factor in the passed scales
+            double fScaleX = o3tl::convert(fPPTScaleX, o3tl::Length::px, o3tl::Length::twip);
+            double fScaleY = o3tl::convert(fPPTScaleY, o3tl::Length::px, o3tl::Length::twip);
+            // 2. Adjust the position according to the scales
+            aMousePos
+                = Point(std::round(aMousePos.X() * fScaleX), std::round(aMousePos.Y() * fScaleY));
+            // 3. Take window own scaling into account (reverses the conversion done in
+            // SmGraphicWidget::MouseButtonDown, which then subtracts the formula's margins)
+            aMousePos = pWindow->LogicToPixel(aMousePos);
+
+            KitMouseEventData aMouseEventData(
+                eType, aMousePos, nCount, MouseEventModifiers::SIMPLECLICK, nButtons, nModifier);
+            KitHelper::postMouseEventAsync(pWindow, aMouseEventData);
+
+            return true;
+        }
+    }
+    return false;
+}
+
+void KitStarMathHelper::PaintTile(VirtualDevice& rDevice, const tools::Rectangle& rTileRect)
+{
+    // the formula shows on its frame, at the scale the in-place client gives it
+    const tools::Rectangle aMathRect = GetBoundingBox();
+    if (rTileRect.GetIntersection(ToDocument(tools::Rectangle(Point(), aMathRect.GetSize())))
+            .IsEmpty())
+        return;
+
+    vcl::Window* pWidgetWindow = GetWidgetWindow();
+    if (!pWidgetWindow)
+        return;
+
+    // the in-place client scales the formula's own area onto its frame, as the office shows it,
+    // so the formula is drawn at that scale, and its origin, in the scaled units, keeps the
+    // upper left corner on the frame's
+    const double fScaleX(mpIPClient && mpIPClient->GetScaleWidth() > 0.0
+                             ? mpIPClient->GetScaleWidth()
+                             : 1.0);
+    const double fScaleY(mpIPClient && mpIPClient->GetScaleHeight() > 0.0
+                             ? mpIPClient->GetScaleHeight()
+                             : 1.0);
+    Point aOffset(std::round((aMathRect.Left() - rTileRect.Left()) / fScaleX),
+                  std::round((aMathRect.Top() - rTileRect.Top()) / fScaleY));
+
+    MapMode newMode = rDevice.GetMapMode();
+    newMode.SetScaleX(newMode.GetScaleX() * fScaleX);
+    newMode.SetScaleY(newMode.GetScaleY() * fScaleY);
+    newMode.SetOrigin(aOffset);
+    rDevice.SetMapMode(newMode); // Push/Pop is done in PaintAllInPlaceOnTile
+
+    pWidgetWindow->Paint(rDevice, {}); // SmGraphicWidget::Paint does not use the passed rectangle
+}
+
+void KitStarMathHelper::PaintAllInPlaceOnTile(VirtualDevice& rDevice, int nOutputWidth,
+                                              int nOutputHeight, int nTilePosX, int nTilePosY,
+                                              tools::Long nTileWidth, tools::Long nTileHeight)
+{
+    SfxViewShell* pCurView = SfxViewShell::Current();
+    if (!pCurView)
+        return;
+    const ViewShellDocId nDocId = pCurView->GetDocId();
+    const int nPartForCurView = pCurView->getPart();
+
+    // Resizes the virtual device to contain the entries context
+    rDevice.SetOutputSizePixel({ nOutputWidth, nOutputHeight }, /*bErase*/ false);
+
+    auto popIt = rDevice.ScopedPush(vcl::PushFlags::MAPMODE);
+    MapMode aMapMode(rDevice.GetMapMode());
+
+    // Scaling. Must convert from pixels to twips. We know that VirtualDevices use a DPI of 96.
+    const double scale = conversionFract(o3tl::Length::px, o3tl::Length::twip);
+    const double scaleX = double(nOutputWidth) / nTileWidth * scale;
+    const double scaleY = double(nOutputHeight) / nTileHeight * scale;
+    aMapMode.SetScaleX(scaleX);
+    aMapMode.SetScaleY(scaleY);
+    aMapMode.SetMapUnit(MapUnit::MapTwip);
+    rDevice.SetMapMode(aMapMode);
+
+    const tools::Rectangle aTileRect(Point(nTilePosX, nTilePosY), Size(nTileWidth, nTileHeight));
+
+    for (SfxViewShell* pViewShell = SfxViewShell::GetFirst(); pViewShell;
+         pViewShell = SfxViewShell::GetNext(*pViewShell))
+        if (pViewShell->GetDocId() == nDocId && pViewShell->getPart() == nPartForCurView)
+            KitStarMathHelper(pViewShell).PaintTile(rDevice, aTileRect);
+}
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */

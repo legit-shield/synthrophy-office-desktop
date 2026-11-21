@@ -1,0 +1,352 @@
+/* -*- js-indent-level: 8; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * Text runs as the prediction sees them, and the measurer that turns text into widths.
+ */
+
+namespace cool {
+	// The width in twips of text in the run's font.
+	export type TextRunMeasure = (
+		run: TextSimplePortionPrimitive,
+		text: string,
+	) => number;
+
+	export function isHighSurrogate(code: number): boolean {
+		return code >= 0xd800 && code <= 0xdbff;
+	}
+
+	export function isLowSurrogate(code: number): boolean {
+		return code >= 0xdc00 && code <= 0xdfff;
+	}
+
+	// Characters of scripts written right to left, and the controls that change the direction.
+	const rightToLeft =
+		/[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
+	// True when the text has a character written right to left or a direction control.
+	export function hasRightToLeft(text: string): boolean {
+		return rightToLeft.test(text);
+	}
+
+	// The start and the length in UTF-16 units of the part of its buffer a run shows.
+	export function textWindow(run: TextSimplePortionPrimitive): {
+		start: number;
+		length: number;
+	} {
+		const start = run.textPosition ?? 0;
+		return { start, length: run.textLength ?? (run.text ?? '').length - start };
+	}
+
+	// The part of its buffer a run shows.
+	export function visibleText(run: TextSimplePortionPrimitive): string {
+		const { start, length } = textWindow(run);
+		return (run.text ?? '').substring(start, start + length);
+	}
+
+	// The lines and marks the engine sends with a run fit the text and the place it sent. A run
+	// that changes drops them and is drawn with plain lines until the engine answers.
+	export function dropDecorations(run: TextSimplePortionPrimitive): void {
+		const decorated = run as Primitive as TextDecoratedPortionPrimitive;
+		delete decorated.decorations;
+		delete decorated.decorationsInTextColor;
+	}
+
+	// Shared off-screen 2d context for measuring text, created on first use.
+	let measureContext: CanvasRenderingContext2D | null | undefined;
+
+	/// The width of a string as the renderer draws the run, in a loaded font or the fallback
+	/// family. Zero without a 2d context.
+	export function canvasTextMeasure(hasFont: FontLoadedLookup): TextRunMeasure {
+		return (run, text) => {
+			if (measureContext === undefined) {
+				const canvas = document.createElement('canvas');
+				measureContext = canvas.getContext('2d');
+				// Widths are summed per code point. Without kerning the sum matches the whole.
+				if (measureContext && 'fontKerning' in measureContext)
+					measureContext.fontKerning = 'none';
+			}
+			if (!measureContext) return 0;
+			const family = VectorPrimitiveRenderer.resolveFontFamily(run, hasFont);
+			measureContext.font = VectorPrimitiveRenderer.cssFont(run, family);
+			return measureContext.measureText(text).width;
+		};
+	}
+
+	/// Measures text in a run's font and scales it to the server's measure. Widths are sums of
+	/// single code points, so the parts of a text add up to the whole. Kerning is lost, and the
+	/// server's layout restores it.
+	export class TextMeasurer {
+		constructor(private readonly measure: TextRunMeasure) {}
+
+		width(run: TextSimplePortionPrimitive, text: string): number {
+			let width = 0;
+			for (const character of text) width += this.measure(run, character);
+			return width;
+		}
+
+		// The step to each UTF-16 unit from the one before. A surrogate pair puts its width
+		// on its first unit.
+		unitAdvances(run: TextSimplePortionPrimitive, text: string): number[] {
+			const advances: number[] = [];
+			for (const character of text) {
+				advances.push(this.measure(run, character));
+				for (let k = 1; k < character.length; k++) advances.push(0);
+			}
+			return advances;
+		}
+
+		// The ratio of the run's server advances to its browser width, from its letters
+		// only, since justification stretches spaces. A run of spaces uses all its text,
+		// and a run without advances has the factor 1.
+		serverScale(run: TextRun): number {
+			const steps = run.coveringAdvances();
+			if (!steps) return 1;
+			let letterServer = 0;
+			let letterBrowser = 0;
+			let allServer = 0;
+			let allBrowser = 0;
+			let unit = 0;
+			for (const character of run.visibleText) {
+				let server = 0;
+				for (let k = 0; k < character.length; k++) server += steps[unit + k];
+				unit += character.length;
+				const browser = this.measure(run.primitive, character);
+				allServer += server;
+				allBrowser += browser;
+				if (character !== ' ') {
+					letterServer += server;
+					letterBrowser += browser;
+				}
+			}
+			if (letterServer > 0 && letterBrowser > 0)
+				return letterServer / letterBrowser;
+			if (allServer > 0 && allBrowser > 0) return allServer / allBrowser;
+			return 1;
+		}
+	}
+
+	/// A text run primitive with its place on the slide. The primitive is the cached tree's,
+	/// so edits through the run change the tree.
+	export class TextRun {
+		// True when the run's own matrix rotates or skews it.
+		readonly rotated: boolean;
+
+		constructor(
+			readonly primitive: TextSimplePortionPrimitive,
+			// Run origin in slide twips.
+			readonly x: number,
+			readonly baseline: number,
+			// The accumulated transform above the run.
+			readonly transform: Matrix2D,
+			// The children array that holds the run.
+			readonly container: Primitive[],
+		) {
+			const matrix = Matrix2D.fromArray(primitive.matrix) ?? Matrix2D.IDENTITY;
+			this.rotated = matrix.b !== 0 || matrix.c !== 0;
+		}
+
+		get fontSize(): number {
+			return this.primitive.fontSize ?? 12;
+		}
+
+		// The scale from the run's local space to the slide.
+		get scaleX(): number {
+			return this.transform.a || 1;
+		}
+
+		get scaleY(): number {
+			return Math.abs(this.transform.d) || 1;
+		}
+
+		// The line's ascent and height in local space, estimated from the font size when
+		// the run has none.
+		get lineAscent(): number {
+			return this.primitive.lineAscent || this.fontSize * 0.8;
+		}
+
+		get lineHeight(): number {
+			return this.primitive.lineHeight || this.fontSize * 1.2;
+		}
+
+		// The slide x of a local distance from the run's origin.
+		slideX(local: number): number {
+			return this.x + local * this.scaleX;
+		}
+
+		get paragraph(): number | undefined {
+			return this.primitive.paragraph;
+		}
+
+		// The buffer, which holds the paragraph text around the run's window.
+		get text(): string {
+			return this.primitive.text ?? '';
+		}
+
+		set text(text: string) {
+			this.primitive.text = text;
+			dropDecorations(this.primitive);
+		}
+
+		// The window of the buffer that the run shows, in UTF-16 units.
+		get start(): number {
+			return this.primitive.textPosition ?? 0;
+		}
+
+		set start(start: number) {
+			this.primitive.textPosition = start;
+			dropDecorations(this.primitive);
+		}
+
+		get length(): number {
+			return textWindow(this.primitive).length;
+		}
+
+		set length(length: number) {
+			this.primitive.textLength = length;
+			dropDecorations(this.primitive);
+		}
+
+		get end(): number {
+			return this.start + this.length;
+		}
+
+		get visibleText(): string {
+			return visibleText(this.primitive);
+		}
+
+		// The run's origin in local space, where advances and wrapping work.
+		get localX(): number {
+			return this.primitive.matrix?.[4] ?? 0;
+		}
+
+		get localBaseline(): number {
+			return this.primitive.matrix?.[5] ?? 0;
+		}
+
+		// The advances when they cover the visible text, otherwise null.
+		coveringAdvances(): number[] | null {
+			const advances = this.primitive.advances;
+			const length = this.length;
+			return advances && advances.length >= length && length > 0
+				? advances
+				: null;
+		}
+
+		// Replaces the advances of units [cutFrom, cutTo). A run with too few advances
+		// drops them and is measured.
+		spliceAdvances(cutFrom: number, cutTo: number, inserted: number[]): void {
+			const steps = this.coveringAdvances();
+			if (steps)
+				this.primitive.advances = [
+					...steps.slice(0, cutFrom),
+					...inserted,
+					...steps.slice(cutTo, this.length),
+				];
+			else if (this.primitive.advances) this.primitive.advances = undefined;
+			dropDecorations(this.primitive);
+		}
+
+		// The local x before each character, from the advances or measured. The last entry
+		// is the run width.
+		characterPositions(measurer: TextMeasurer): number[] {
+			const text = this.visibleText;
+			const length = text.length;
+			const positions: number[] = new Array(length + 1);
+			positions[0] = 0;
+			const advances =
+				this.coveringAdvances() ?? measurer.unitAdvances(this.primitive, text);
+			for (let k = 1; k <= length; k++)
+				positions[k] = positions[k - 1] + advances[k - 1];
+			return positions;
+		}
+
+		// The width of the visible text in local space.
+		width(measurer: TextMeasurer): number {
+			const positions = this.characterPositions(measurer);
+			return positions[positions.length - 1];
+		}
+
+		// Moves the run's origin by a distance in slide twips.
+		shift(delta: number): void {
+			const matrix = this.primitive.matrix;
+			if (matrix && matrix.length === 6)
+				matrix[4] += delta / (this.transform.a || 1);
+			dropDecorations(this.primitive);
+		}
+
+		// The text runs of a subtree, with their origins in slide twips. A bullet or a numbering
+		// label is text of its own in front of the paragraph, so its runs are left out.
+		static collect(
+			primitives: Primitive[] | undefined,
+			matrix: Matrix2D = Matrix2D.IDENTITY,
+			out: TextRun[] = [],
+		): TextRun[] {
+			if (!primitives) return out;
+			for (const primitive of primitives) {
+				if (primitive.type === TextHierarchyBulletPrimitive.type) continue;
+				if (TextRun.isTextRun(primitive)) {
+					const run = primitive as TextSimplePortionPrimitive;
+					const runMatrix = Matrix2D.fromArray(run.matrix) ?? Matrix2D.IDENTITY;
+					const origin = matrix.apply(runMatrix.e, runMatrix.f);
+					out.push(new TextRun(run, origin.x, origin.y, matrix, primitives));
+				}
+				TextRun.collect(
+					primitive.children,
+					TextRun.childMatrix(primitive, matrix),
+					out,
+				);
+			}
+			return out;
+		}
+
+		// The text runs that draw the bullets and the numbers in front of the paragraphs of a
+		// subtree, with their origins in slide twips.
+		static collectLabels(
+			primitives: Primitive[] | undefined,
+			matrix: Matrix2D = Matrix2D.IDENTITY,
+			out: TextRun[] = [],
+		): TextRun[] {
+			if (!primitives) return out;
+			for (const primitive of primitives) {
+				if (primitive.type === TextHierarchyBulletPrimitive.type)
+					TextRun.collect(primitive.children, matrix, out);
+				else
+					TextRun.collectLabels(
+						primitive.children,
+						TextRun.childMatrix(primitive, matrix),
+						out,
+					);
+			}
+			return out;
+		}
+
+		// The transform from the children of the primitive to the slide, given the one from the
+		// primitive to the slide.
+		private static childMatrix(
+			primitive: Primitive,
+			matrix: Matrix2D,
+		): Matrix2D {
+			if (primitive.type !== TransformPrimitive.type) return matrix;
+			const transformMatrix = Matrix2D.fromArray(
+				(primitive as TransformPrimitive).matrix,
+			);
+			return transformMatrix ? transformMatrix.then(matrix) : matrix;
+		}
+
+		private static isTextRun(primitive: Primitive): boolean {
+			return (
+				primitive.type === TextSimplePortionPrimitive.type ||
+				primitive.type === TextDecoratedPortionPrimitive.type
+			);
+		}
+	}
+}

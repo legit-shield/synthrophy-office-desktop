@@ -1,0 +1,1099 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+/*
+ * This file is part of the Collabora Office project.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include "sdmodeltestbase.hxx"
+
+#include <set>
+#include <com/sun/star/drawing/XControlShape.hpp>
+#include <test/unoapi_test.hxx>
+#include <tools/color.hxx>
+#include <tools/stream.hxx>
+#include <com/sun/star/container/XNamed.hpp>
+#include <com/sun/star/drawing/XDrawPages.hpp>
+#include <com/sun/star/drawing/XDrawPagesSupplier.hpp>
+#include <com/sun/star/drawing/XMasterPagesSupplier.hpp>
+#include <com/sun/star/document/UpdateDocMode.hpp>
+#include <comphelper/propertyvalue.hxx>
+#include <comphelper/scopeguard.hxx>
+#include <comphelper/sequenceashashmap.hxx>
+#include <editeng/eeitem.hxx>
+#include <editeng/editobj.hxx>
+#include <editeng/numitem.hxx>
+#include <docmodel/uno/UnoGradientTools.hxx>
+#include <officecfg/Office/Common.hxx>
+#include <test/commontesttools.hxx>
+
+#include <com/sun/star/table/XCellRange.hpp>
+#include <com/sun/star/table/BorderLine2.hpp>
+#include <com/sun/star/table/BorderLineStyle.hpp>
+#include <svx/xlineit0.hxx>
+#include <svx/xlndsit.hxx>
+#include <svx/svdograf.hxx>
+#include <svx/svdoole2.hxx>
+#include <svx/svdotable.hxx>
+#include <svx/unoapi.hxx>
+#include <unotools/tempfile.hxx>
+#include <vcl/filter/PngImageReader.hxx>
+#include <vcl/settings.hxx>
+#include <vcl/themecolors.hxx>
+#include <xmloff/autolayout.hxx>
+
+#include <com/sun/star/awt/FontFamily.hpp>
+#include <com/sun/star/awt/FontPitch.hpp>
+#include <com/sun/star/awt/FontSlant.hpp>
+#include <com/sun/star/awt/FontUnderline.hpp>
+#include <com/sun/star/drawing/EnhancedCustomShapeParameterPair.hpp>
+#include <com/sun/star/drawing/FillStyle.hpp>
+#include <com/sun/star/drawing/GraphicExportFilter.hpp>
+#include <com/sun/star/drawing/TextHorizontalAdjust.hpp>
+#include <com/sun/star/lang/IndexOutOfBoundsException.hpp>
+#include <com/sun/star/lang/Locale.hpp>
+#include <com/sun/star/lang/XComponent.hpp>
+#include <com/sun/star/style/LineSpacing.hpp>
+#include <com/sun/star/style/ParagraphAdjust.hpp>
+#include <com/sun/star/text/GraphicCrop.hpp>
+#include <com/sun/star/text/WritingMode2.hpp>
+
+#include <sdpage.hxx>
+#include <SlideSectionManager.hxx>
+#include <unomodel.hxx>
+
+using namespace css;
+using namespace ::cpo;
+using namespace ::cpo::uno;
+
+class SdOOXMLExportTest6 : public SdModelTestBase
+{
+public:
+    SdOOXMLExportTest6()
+        : SdModelTestBase(u"/sd/qa/unit/data/"_ustr)
+    {
+    }
+};
+
+// A presentation written under a dark appearance keeps automatic text readable: the saved colour
+// is decided by the page background, not by the colour the application paints behind the page.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testAutomaticTextColorFollowsPageBackground)
+{
+    // The view takes the document background colour when it is created, so the dark appearance
+    // has to be in place before the document is loaded.
+    const AppearanceMode eOldMode = MiscSettings::GetAppColorMode();
+    MiscSettings::SetAppColorMode(AppearanceMode::DARK);
+    comphelper::ScopeGuard aResetMode([eOldMode] { MiscSettings::SetAppColorMode(eOldMode); });
+
+    createSdImpressDoc("odp/automatic-text-color.fodp");
+    save(TestFilter::PPTX);
+
+    // The page carries no fill of its own, so its background is light and the text stays black.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:sp/p:txBody/a:p/a:r/a:rPr/a:solidFill/a:srgbClr",
+                "val", u"000000");
+
+    // Text that takes its colour from the master stays readable as well: the default run
+    // properties the master carries hold no white text colour.
+    xmlDocUniquePtr pXmlMaster = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    assertXPath(pXmlMaster, "//a:defRPr/a:solidFill/a:srgbClr[@val='FFFFFF']", 0);
+}
+
+// The placeholders of a master page are still there after the file has been saved twice. They are
+// written to the layout, which is where reading the file back looks for them, so a master that
+// went out once comes back whole and goes out whole again.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testMasterPlaceholdersSurviveRepeatedSaves)
+{
+    createSdImpressDoc("pptx/ShapeLineProperties.pptx");
+
+    auto* pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pDocument);
+    const size_t nShapes
+        = pDocument->GetDoc()->GetMasterSdPage(0, PageKind::Standard)->GetObjCount();
+    CPPUNIT_ASSERT_GREATER(size_t(1), nShapes);
+
+    saveAndReload(TestFilter::PPTX);
+
+    xmlDocUniquePtr pLayout = parseExport(u"ppt/slideLayouts/slideLayout1.xml"_ustr);
+    assertXPath(pLayout, "/p:sldLayout/p:cSld/p:spTree/p:sp/p:nvSpPr/p:nvPr/p:ph", 5);
+
+    pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pDocument);
+    CPPUNIT_ASSERT_EQUAL(
+        nShapes, pDocument->GetDoc()->GetMasterSdPage(0, PageKind::Standard)->GetObjCount());
+
+    saveAndReload(TestFilter::PPTX);
+
+    pDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pDocument);
+    CPPUNIT_ASSERT_EQUAL(
+        nShapes, pDocument->GetDoc()->GetMasterSdPage(0, PageKind::Standard)->GetObjCount());
+}
+
+// A paragraph that hangs its punctuation still does after the document has been saved. The
+// attribute that carries it was never written, so every paragraph of a saved file came back
+// with punctuation set inside the margin instead.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testHangingPunctuationSurvivesASave)
+{
+    createSdImpressDoc("pptx/3columns.pptx");
+
+    uno::Reference<beans::XPropertySet> xParagraph(
+        getParagraphFromShape(0, getShapeFromPage(0, 0)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(true,
+                         xParagraph->getPropertyValue(u"ParaIsHangingPunctuation"_ustr).get<bool>());
+
+    saveAndReload(TestFilter::PPTX);
+
+    xParagraph.set(getParagraphFromShape(0, getShapeFromPage(0, 0)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(true,
+                         xParagraph->getPropertyValue(u"ParaIsHangingPunctuation"_ustr).get<bool>());
+}
+
+// A diagram keeps the name the document gave it. Every diagram was written under a name made from
+// the number it was counted with, so the name a reader shows for it changed on every save.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testDiagramKeepsItsName)
+{
+    createSdImpressDoc("pptx/Bar_List.pptx");
+
+    uno::Reference<container::XNamed> xDiagram(getShapeFromPage(0, 0), uno::UNO_QUERY_THROW);
+    const OUString aName = xDiagram->getName();
+    CPPUNIT_ASSERT(!aName.isEmpty());
+
+    saveAndReload(TestFilter::PPTX);
+
+    xDiagram.set(getShapeFromPage(0, 0), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(aName, xDiagram->getName());
+}
+
+// A placeholder keeps the name the document gave it. Every placeholder was written under a name
+// made from the number it was counted with, so the name a reader shows for the title of a slide
+// changed to a generic one on every save.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testPlaceholderKeepsItsName)
+{
+    createSdImpressDoc("pptx/3columns.pptx");
+
+    uno::Reference<container::XNamed> xPlaceholder(getShapeFromPage(0, 0), uno::UNO_QUERY_THROW);
+    const OUString aName = xPlaceholder->getName();
+    CPPUNIT_ASSERT(!aName.isEmpty());
+    CPPUNIT_ASSERT(!aName.startsWith("PlaceHolder"));
+
+    saveAndReload(TestFilter::PPTX);
+
+    xPlaceholder.set(getShapeFromPage(0, 0), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(aName, xPlaceholder->getName());
+}
+
+// The list style of a shape says nothing about the language, so the level it stands for does not
+// hand the language of one run to every paragraph written at that level.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testListStyleStatesNoLanguage)
+{
+    createSdImpressDoc("pptx/tdf145162.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pMaster = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    // The run keeps the language it is written in, and the level beside it states none, which
+    // is what lets the text styles of the master name one.
+    assertXPathNoAttribute(
+        pMaster, "/p:sldMaster/p:cSld/p:spTree/p:sp[1]/p:txBody/a:lstStyle/a:lvl1pPr/a:defRPr",
+        "lang");
+    assertXPath(pMaster, "/p:sldMaster/p:cSld/p:spTree/p:sp[1]/p:txBody/a:p/a:r/a:rPr", "lang",
+                u"en-US");
+}
+
+// A list style states no colour for a level whose first run asks for the automatic one. The
+// automatic colour is the colour the shape holding the text asks for, and every shape that takes
+// this level asks for its own, so freezing one run's answer into the level hands it to them all.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testAutomaticColorStaysOutOfAListStyle)
+{
+    createSdImpressDoc("pptx/tdf157740.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pMaster = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    assertXPath(pMaster, "//p:sp/p:txBody/a:lstStyle//a:defRPr/a:solidFill", 0);
+
+    // The text itself still names a colour, because OOXML has no automatic one for a reader to
+    // resolve.
+    CPPUNIT_ASSERT(countXPathNodes(pMaster, "//p:sp/p:txBody/a:p/a:r/a:rPr/a:solidFill") > 0);
+}
+
+// The top and bottom insets of a shape stay where they are. A shape that states no height of its
+// own was taken to have a text area of no height, and the insets were then written as what they
+// would have to be to fit inside it, which is a negative distance.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTextInsetsOfAShapeWithNoHeight)
+{
+    createSdImpressDoc("pptx/subtitle-animation-save.pptx");
+
+    auto aTopInset = [this]() -> sal_Int32 {
+        uno::Reference<drawing::XMasterPagesSupplier> xSupplier(mxComponent, uno::UNO_QUERY_THROW);
+        uno::Reference<drawing::XDrawPage> xShapes(xSupplier->getMasterPages()->getDrawPageByIndex(0),
+                                                 uno::UNO_SET_THROW);
+        uno::Reference<beans::XPropertySet> xShape(xShapes->getShapeByIndex(0), uno::UNO_QUERY_THROW);
+        sal_Int32 nTop = 0;
+        xShape->getPropertyValue(u"TextUpperDistance"_ustr) >>= nTop;
+        return nTop;
+    };
+
+    const sal_Int32 nBefore = aTopInset();
+    CPPUNIT_ASSERT_GREATER(sal_Int32(0), nBefore);
+
+    saveAndReload(TestFilter::PPTX);
+
+    CPPUNIT_ASSERT_EQUAL(nBefore, aTopInset());
+}
+
+// A shape 1cm tall holding 2cm of spacing above and below its text. The slide is drawn with half
+// of what the spacing reaches past the shape taken off each side, so the file states that.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testCrossedTextInsets)
+{
+    createSdImpressDoc("odp/crossed-text-insets.odp");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pSlide = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pSlide, "//p:sp[2]/p:txBody/a:bodyPr", "tIns", u"180000");
+    assertXPath(pSlide, "//p:sp[2]/p:txBody/a:bodyPr", "bIns", u"180000");
+}
+
+// The line on the master of this one has no height at all and goes into every layout, so the
+// spacing on it reaches past the shape wherever it lands.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testCrossedTextInsetsOfALineWithNoHeight)
+{
+    createSdImpressDoc("pptx/tdf169088.pptx");
+    save(TestFilter::PPTX);
+
+    for (sal_Int32 i = 1; i <= 11; ++i)
+    {
+        xmlDocUniquePtr pLayout = parseExport(u"ppt/slideLayouts/slideLayout"_ustr
+                                              + OUString::number(i) + u".xml"_ustr);
+        assertXPath(pLayout, "//a:bodyPr[starts-with(@tIns, '-')]", 0);
+        assertXPath(pLayout, "//a:bodyPr[starts-with(@bIns, '-')]", 0);
+    }
+}
+
+// The pages of a Draw document keep their identity across sessions the same way the slides of
+// a presentation do.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testPageGuidODG)
+{
+    createSdDrawDoc();
+    auto* pXImpressDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pXImpressDocument);
+    SdDrawDocument* pDoc = pXImpressDocument->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    const OUString sPageGuid = pDoc->GetSdPage(0, PageKind::Standard)->GetGuid().getOUString();
+    const OUString sMasterGuid
+        = pDoc->GetMasterSdPage(0, PageKind::Standard)->GetGuid().getOUString();
+
+    saveAndReload(TestFilter::ODG);
+
+    xmlDocUniquePtr pContentXml = parseExport(u"content.xml"_ustr);
+    assertXPath(pContentXml, "/office:document-content/office:body/office:drawing/draw:page[1]",
+                "guid", sPageGuid);
+    xmlDocUniquePtr pStylesXml = parseExport(u"styles.xml"_ustr);
+    assertXPath(pStylesXml, "/office:document-styles/office:master-styles/style:master-page[1]",
+                "guid", sMasterGuid);
+
+    pXImpressDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pXImpressDocument);
+    pDoc = pXImpressDocument->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+    CPPUNIT_ASSERT_EQUAL(sPageGuid,
+                         pDoc->GetSdPage(0, PageKind::Standard)->GetGuid().getOUString());
+    CPPUNIT_ASSERT_EQUAL(sMasterGuid,
+                         pDoc->GetMasterSdPage(0, PageKind::Standard)->GetGuid().getOUString());
+}
+
+// The globally unique identifier of every page is written to ODF and read back, so a page keeps
+// its identity across sessions.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testPageGuidODP)
+{
+    createSdImpressDoc();
+    auto* pXImpressDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pXImpressDocument);
+    SdDrawDocument* pDoc = pXImpressDocument->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    const OUString sSlideGuid = pDoc->GetSdPage(0, PageKind::Standard)->GetGuid().getOUString();
+    const OUString sNotesGuid = pDoc->GetSdPage(0, PageKind::Notes)->GetGuid().getOUString();
+    const OUString sMasterGuid
+        = pDoc->GetMasterSdPage(0, PageKind::Standard)->GetGuid().getOUString();
+    const OUString sNotesMasterGuid
+        = pDoc->GetMasterSdPage(0, PageKind::Notes)->GetGuid().getOUString();
+    const OUString sHandoutMasterGuid
+        = pDoc->GetMasterSdPage(0, PageKind::Handout)->GetGuid().getOUString();
+
+    saveAndReload(TestFilter::ODP);
+
+    xmlDocUniquePtr pContentXml = parseExport(u"content.xml"_ustr);
+    static constexpr OString sPagePath
+        = "/office:document-content/office:body/office:presentation/draw:page[1]"_ostr;
+    assertXPath(pContentXml, sPagePath, "guid", sSlideGuid);
+    assertXPath(pContentXml, sPagePath + "/presentation:notes", "guid", sNotesGuid);
+
+    xmlDocUniquePtr pStylesXml = parseExport(u"styles.xml"_ustr);
+    static constexpr OString sMasterStylesPath
+        = "/office:document-styles/office:master-styles"_ostr;
+    assertXPath(pStylesXml, sMasterStylesPath + "/style:master-page[1]", "guid", sMasterGuid);
+    assertXPath(pStylesXml, sMasterStylesPath + "/style:master-page[1]/presentation:notes", "guid",
+                sNotesMasterGuid);
+    assertXPath(pStylesXml, sMasterStylesPath + "/style:handout-master", "guid",
+                sHandoutMasterGuid);
+
+    // The reloaded document holds the same identifiers.
+    pXImpressDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pXImpressDocument);
+    pDoc = pXImpressDocument->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+    CPPUNIT_ASSERT_EQUAL(sSlideGuid,
+                         pDoc->GetSdPage(0, PageKind::Standard)->GetGuid().getOUString());
+    CPPUNIT_ASSERT_EQUAL(sNotesGuid,
+                         pDoc->GetSdPage(0, PageKind::Notes)->GetGuid().getOUString());
+    CPPUNIT_ASSERT_EQUAL(sMasterGuid,
+                         pDoc->GetMasterSdPage(0, PageKind::Standard)->GetGuid().getOUString());
+    CPPUNIT_ASSERT_EQUAL(sNotesMasterGuid,
+                         pDoc->GetMasterSdPage(0, PageKind::Notes)->GetGuid().getOUString());
+    CPPUNIT_ASSERT_EQUAL(sHandoutMasterGuid,
+                         pDoc->GetMasterSdPage(0, PageKind::Handout)->GetGuid().getOUString());
+}
+
+// The identifier is also written to OOXML, in an extension list entry of the slide and of the
+// slide master.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testPageGuidPPTX)
+{
+    createSdImpressDoc();
+    auto* pXImpressDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pXImpressDocument);
+    SdDrawDocument* pDoc = pXImpressDocument->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    const OUString sSlideGuid = pDoc->GetSdPage(0, PageKind::Standard)->GetGuid().getOUString();
+    const OUString sMasterGuid
+        = pDoc->GetMasterSdPage(0, PageKind::Standard)->GetGuid().getOUString();
+
+    saveAndReload(TestFilter::PPTX);
+
+    xmlDocUniquePtr pSlideXml = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pSlideXml, "/p:sld/p:extLst/p:ext/coextml:pageGuid", "val", sSlideGuid);
+
+    xmlDocUniquePtr pMasterXml = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    assertXPath(pMasterXml, "/p:sldMaster/p:extLst/p:ext/coextml:pageGuid", "val", sMasterGuid);
+
+    // The reloaded slide and master hold the identifiers they were saved with.
+    pXImpressDocument = dynamic_cast<SdXImpressDocument*>(mxComponent.get());
+    CPPUNIT_ASSERT(pXImpressDocument);
+    pDoc = pXImpressDocument->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+    CPPUNIT_ASSERT_EQUAL(sSlideGuid,
+                         pDoc->GetSdPage(0, PageKind::Standard)->GetGuid().getOUString());
+    CPPUNIT_ASSERT_EQUAL(sMasterGuid,
+                         pDoc->GetMasterSdPage(0, PageKind::Standard)->GetGuid().getOUString());
+}
+
+// A shape that takes its fill and its line from the theme keeps naming the theme, so that
+// changing the theme still recolours it.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testShapeStyleThemeColor)
+{
+    createSdImpressDoc("pptx/connectors.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:sp[1]/p:spPr/a:solidFill/a:schemeClr", "val",
+                u"lt1");
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:sp[1]/p:spPr/a:ln/a:solidFill/a:schemeClr",
+                "val", u"dk1");
+
+    // The font reference of the style names the theme color the text of the shape takes.
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:sp[1]/p:style/a:fontRef", "idx", u"minor");
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:sp[1]/p:style/a:fontRef/a:schemeClr", "val",
+                u"dk1");
+
+    // A connector carries the style the same way.
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:cxnSp[1]/p:style/a:lnRef", "idx", u"1");
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:cxnSp[1]/p:style/a:lnRef/a:schemeClr", "val",
+                u"accent1");
+}
+
+// The border of a table cell whose color comes from the theme keeps naming the theme.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTableCellBorderThemeColor)
+{
+    createSdImpressDoc("pptx/tablescale.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    static constexpr OString aCell
+        = "/p:sld/p:cSld/p:spTree/p:graphicFrame/a:graphic/a:graphicData/a:tbl/a:tr[1]/a:tc[1]/"
+          "a:tcPr"_ostr;
+    assertXPath(pXmlDoc, aCell + "/a:lnL/a:solidFill/a:schemeClr", "val", u"dk1");
+    assertXPath(pXmlDoc, aCell + "/a:lnT/a:solidFill/a:schemeClr", "val", u"dk1");
+}
+
+// The master holds the text style of its title and of all nine outline levels.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testMasterTextStyles)
+{
+    createSdImpressDoc("pptx/tdf112209.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    assertXPath(pXmlDoc, "/p:sldMaster/p:txStyles/p:titleStyle/a:lvl1pPr/a:defRPr", "sz", u"2600");
+    assertXPath(pXmlDoc, "/p:sldMaster/p:txStyles/p:bodyStyle/a:lvl1pPr/a:defRPr", "sz", u"2000");
+    assertXPath(pXmlDoc,
+                "/p:sldMaster/p:txStyles/p:bodyStyle/a:lvl1pPr/a:defRPr/a:solidFill/a:schemeClr",
+                "val", u"accent2");
+
+    // The level a placeholder has no paragraph for is the one that used to go missing.
+    assertXPath(pXmlDoc, "/p:sldMaster/p:txStyles/p:bodyStyle/a:lvl9pPr/a:defRPr", 1);
+}
+
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testMasterTextStyleIndents)
+{
+    // The slide master's bodyStyle indents each level 0.5 inch further than the one above it,
+    // starting at 0.25 inch, export counterpart of testMasterOutlineLevelIndents
+    createSdImpressDoc("pptx/master-and-eleven-layouts.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    for (sal_Int32 nLevel = 1; nLevel <= 9; ++nLevel)
+    {
+        const OString aLevel
+            = "/p:sldMaster/p:txStyles/p:bodyStyle/a:lvl" + OString::number(nLevel) + "pPr";
+        // Without the fix in place, this test would have failed: no attribute 'marL' exist
+        assertXPath(pXmlDoc, aLevel, "marL", OUString::number(228600 + 457200 * (nLevel - 1)));
+        assertXPath(pXmlDoc, aLevel, "indent", u"-228600");
+    }
+}
+
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testMasterTextStylesStateEveryValue)
+{
+    // Each level of the master's text styles states its alignment, spacing and bullet, so a
+    // reader lays the text out with the values of the document and not with defaults of its own
+    createSdImpressDoc("pptx/master-and-eleven-layouts.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    static constexpr OString aTitle = "/p:sldMaster/p:txStyles/p:titleStyle/a:lvl1pPr"_ostr;
+    assertXPath(pXmlDoc, aTitle + "[@algn][@marL][@indent]", 1);
+    assertXPath(pXmlDoc, aTitle + "/a:lnSpc/a:spcPct", "val", u"90000");
+    assertXPath(pXmlDoc, aTitle + "/a:spcBef/a:spcPts", "val", u"0");
+    assertXPath(pXmlDoc, aTitle + "/a:spcAft/a:spcPts", "val", u"0");
+    assertXPath(pXmlDoc, aTitle + "/a:buNone", 1);
+
+    for (sal_Int32 nLevel = 1; nLevel <= 9; ++nLevel)
+    {
+        const OString aLevel
+            = "/p:sldMaster/p:txStyles/p:bodyStyle/a:lvl" + OString::number(nLevel) + "pPr";
+        assertXPath(pXmlDoc, aLevel, "algn", u"l");
+        assertXPath(pXmlDoc, aLevel, "marL", OUString::number(228600 + 457200 * (nLevel - 1)));
+        assertXPath(pXmlDoc, aLevel, "indent", u"-228600");
+        assertXPath(pXmlDoc, aLevel + "/a:lnSpc/a:spcPct", "val", u"90000");
+        assertXPath(pXmlDoc, aLevel + "/a:spcBef/a:spcPts", 1);
+        assertXPath(pXmlDoc, aLevel + "/a:spcAft/a:spcPts", "val", u"0");
+        assertXPath(pXmlDoc, aLevel + "/a:buChar", 1);
+    }
+}
+
+// A line that counts itself keeps its number where its level shows a picture instead.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testNumberedLinesKeepTheirNumbers)
+{
+    // Given an outline level whose bullet is a picture, holding two lines that count themselves:
+    createSdImpressDoc("pptx/numbered-lines-under-a-picture-bullet.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, the saved file gave both lines the picture of their level and
+    // said nothing of the counting, so the numbers were gone when the file was read back.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[1]/a:pPr/a:buAutoNum", "type", u"arabicPeriod");
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[2]/a:pPr/a:buAutoNum", "type", u"arabicPeriod");
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p/a:pPr/a:buBlip", 0);
+}
+
+// A subtitle comes back from a PPTX file with the paragraph spacing of its own style. A reader
+// takes the values of a subtitle from the body level of the master's text styles otherwise.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testSubtitleKeepsItsParagraphSpacing)
+{
+    createSdImpressDoc();
+    uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(1, 0));
+    CPPUNIT_ASSERT_EQUAL(u"com.sun.star.presentation.SubtitleShape"_ustr,
+                         uno::Reference<drawing::XShape>(xShape, uno::UNO_QUERY_THROW)->getShapeType());
+    uno::Reference<text::XTextRange>(xShape, uno::UNO_QUERY_THROW)->setString(u"a"_ustr);
+    uno::Reference<beans::XPropertySet> xStyle(xShape->getPropertyValue(u"Style"_ustr),
+                                               uno::UNO_QUERY_THROW);
+    const sal_Int32 nTopMargin = xStyle->getPropertyValue(u"ParaTopMargin"_ustr).get<sal_Int32>();
+    const style::LineSpacing aLineSpacing
+        = xStyle->getPropertyValue(u"ParaLineSpacing"_ustr).get<style::LineSpacing>();
+
+    saveAndReload(TestFilter::PPTX);
+
+    uno::Reference<beans::XPropertySet> xParagraph(
+        getParagraphFromShape(0, getShapeFromPage(1, 0)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(nTopMargin,
+                         xParagraph->getPropertyValue(u"ParaTopMargin"_ustr).get<sal_Int32>());
+    const style::LineSpacing aReloadedLineSpacing
+        = xParagraph->getPropertyValue(u"ParaLineSpacing"_ustr).get<style::LineSpacing>();
+    CPPUNIT_ASSERT_EQUAL(aLineSpacing.Mode, aReloadedLineSpacing.Mode);
+    CPPUNIT_ASSERT_EQUAL(aLineSpacing.Height, aReloadedLineSpacing.Height);
+}
+
+// A list style level with no numbering, such as that of a subtitle or a title, states the indent of
+// its own style.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testListStyleLevelWithoutNumberingKeepsItsIndent)
+{
+    createSdImpressDoc();
+    for (int nShape : { 0, 1 })
+    {
+        uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(nShape, 0));
+        uno::Reference<text::XTextRange>(xShape, uno::UNO_QUERY_THROW)->setString(u"a"_ustr);
+        uno::Reference<beans::XPropertySet> xStyle(xShape->getPropertyValue(u"Style"_ustr),
+                                                   uno::UNO_QUERY_THROW);
+        xStyle->setPropertyValue(u"ParaLeftMargin"_ustr, uno::Any(sal_Int32(1000)));
+        xStyle->setPropertyValue(u"ParaFirstLineIndent"_ustr, uno::Any(sal_Int32(-500)));
+    }
+    save(TestFilter::PPTX);
+
+    // 1000 and -500 in 1/100 mm are 360000 and -180000 EMU
+    xmlDocUniquePtr pSlide = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    static constexpr OString aSubtitle
+        = "//p:sp[p:nvSpPr/p:nvPr/p:ph/@type='subTitle']/p:txBody/a:lstStyle/a:lvl1pPr"_ostr;
+    assertXPath(pSlide, aSubtitle, "marL", u"360000");
+    assertXPath(pSlide, aSubtitle, "indent", u"-180000");
+
+    xmlDocUniquePtr pMaster = parseExport(u"ppt/slideMasters/slideMaster1.xml"_ustr);
+    static constexpr OString aTitle = "/p:sldMaster/p:txStyles/p:titleStyle/a:lvl1pPr"_ostr;
+    assertXPath(pMaster, aTitle, "marL", u"360000");
+    assertXPath(pMaster, aTitle, "indent", u"-180000");
+}
+
+// A form control on a slide is written with the data that makes it a control, and is read back
+// as one.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testFormControlExport)
+{
+    createSdImpressDoc("pptx/activex_checkbox.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:controls/p:control", 3);
+
+    saveAndReload(TestFilter::PPTX);
+
+    uno::Reference<drawing::XDrawPage> xPage(getPage(0));
+    std::vector<OUString> aNames;
+    for (sal_Int32 nShape = 0; nShape < xPage->getCount(); ++nShape)
+    {
+        uno::Reference<drawing::XControlShape> xControlShape(xPage->getShapeByIndex(nShape),
+                                                             uno::UNO_QUERY);
+        if (!xControlShape.is())
+            continue;
+        uno::Reference<beans::XPropertySet> xModel(xControlShape->getControl(), uno::UNO_QUERY);
+        OUString aName;
+        xModel->getPropertyValue(u"Name"_ustr) >>= aName;
+        aNames.push_back(aName);
+    }
+    CPPUNIT_ASSERT_EQUAL(size_t(3), aNames.size());
+    CPPUNIT_ASSERT_EQUAL(u"CheckBox1"_ustr, aNames[0]);
+}
+
+// A fill whose theme color went out of date keeps the color it shows.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testFillWithStaleThemeColor)
+{
+    // Given a document with two shapes filled with #c2d2e1: the first still carries the theme
+    // color dark1 (#062033), the second carries light2 at 90% brightness, which gives #c2d2e1.
+    createSdImpressDoc("odp/fill-stale-theme-color.fodp");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    // Without the fix in place, this test would have failed with:
+    // - In <>, XPath '/p:sld/p:cSld/p:spTree/p:sp[1]/p:spPr/a:solidFill/a:srgbClr' number of
+    //   nodes is incorrect
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:sp[1]/p:spPr/a:solidFill/a:srgbClr", "val",
+                u"C2D2E1");
+    assertXPath(pXmlDoc, "/p:sld/p:cSld/p:spTree/p:sp[2]/p:spPr/a:solidFill/a:schemeClr", "val",
+                u"lt2");
+}
+
+// A run given a plain color keeps that color, even when its style names a theme color.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testCharColorOverThemedStyle)
+{
+    // Given a document with a text box whose graphic style colors its text with the theme color
+    // accent1, and whose first run is colored #ff0000 with no theme color:
+    createSdImpressDoc("odp/char-color-over-theme-style.fodp");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    // Without the fix in place, this test would have failed with:
+    // - In <>, XPath '//p:txBody/a:p/a:r[1]/a:rPr/a:solidFill/a:srgbClr' number of nodes is
+    //   incorrect
+    // i.e. the run was written as the theme color accent1.
+    assertXPath(pXmlDoc, "//p:txBody/a:p/a:r[1]/a:rPr/a:solidFill/a:srgbClr", "val", u"FF0000");
+}
+
+// A placeholder whose text does not wrap keeps that answer through a save.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testPlaceholderKeepsItsWrapping)
+{
+    // Given a document whose layout holds two placeholders that state that their text does not
+    // wrap:
+    createSdImpressDoc("pptx/narrow-placeholder-no-wrap.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pLayout = parseExport(u"ppt/slideLayouts/slideLayout1.xml"_ustr);
+    // Without the fix in place, this test would have failed with:
+    // - Attribute 'wrap' not found on element
+    // i.e. the answer was left out and the text of the placeholder wrapped when the document was
+    // read again.
+    assertXPath(pLayout, "/p:sldLayout/p:cSld/p:spTree/p:sp[1]/p:txBody/a:bodyPr", "wrap",
+                u"none");
+    assertXPath(pLayout, "/p:sldLayout/p:cSld/p:spTree/p:sp[2]/p:txBody/a:bodyPr", "wrap",
+                u"none");
+}
+
+// The distance text keeps from the edges of a shape survives a save.
+// Text that stands on its side keeps the distances it is given over a save.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTextDistancesOfSidewaysTextSurviveASave)
+{
+    // Given a shape whose text stands on its side and keeps a quarter of a millimetre from each
+    // edge:
+    createSdImpressDoc("pptx/vertical-text-distances.pptx");
+    uno::Reference<beans::XPropertySet> xBefore(getShapeFromPage(1, 0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(250),
+                         xBefore->getPropertyValue(u"TextLeftDistance"_ustr).get<sal_Int32>());
+
+    saveAndReload(TestFilter::PPTX);
+
+    // A text standing on its side is read with the distances the format states wherever the file
+    // names none, so the file names each one and the shape comes back as it was.
+    uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(1, 0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(250),
+                         xShape->getPropertyValue(u"TextLeftDistance"_ustr).get<sal_Int32>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(250),
+                         xShape->getPropertyValue(u"TextRightDistance"_ustr).get<sal_Int32>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(250),
+                         xShape->getPropertyValue(u"TextUpperDistance"_ustr).get<sal_Int32>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(250),
+                         xShape->getPropertyValue(u"TextLowerDistance"_ustr).get<sal_Int32>());
+}
+
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTextDistancesSurviveASave)
+{
+    // Given a document whose shape states the distances the format itself assumes, a tenth of an
+    // inch at the sides and half of that above and below:
+    createSdImpressDoc("pptx/numfmt.pptx");
+
+    saveAndReload(TestFilter::PPTX);
+
+    // Without the fix in place, this test would have failed with:
+    // - Expected: 254
+    // - Actual  : 250
+    // i.e. the distances were left out of the file and the shape came back with the ones a shape
+    // starts from.
+    uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(0, 0));
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(254),
+                         xShape->getPropertyValue(u"TextLeftDistance"_ustr).get<sal_Int32>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(254),
+                         xShape->getPropertyValue(u"TextRightDistance"_ustr).get<sal_Int32>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(127),
+                         xShape->getPropertyValue(u"TextUpperDistance"_ustr).get<sal_Int32>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int32(127),
+                         xShape->getPropertyValue(u"TextLowerDistance"_ustr).get<sal_Int32>());
+}
+
+// A paragraph that ends in a line break states that break's size for its end.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testParagraphEndsInTheSizeOfItsLastBreak)
+{
+    // Given a paragraph of text at 12 point that ends in a line break at 28 point:
+    createSdImpressDoc("pptx/line-break-size.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, this test would have failed with:
+    // - Expected: 2800
+    // - Actual  : 1200
+    // i.e. the paragraph gave its end the size of the text instead of the size of the break,
+    // and the blank line the break makes came back short.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p/a:br/a:rPr", "sz", u"2800");
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p/a:endParaRPr", "sz", u"2800");
+}
+
+// A font keeps the pitch and the family it is classified by across a round trip.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testFontKeepsItsPitchAndFamily)
+{
+    // Given one paragraph in a fixed pitch font of the modern family and one in a variable pitch
+    // font of the swiss family:
+    createSdImpressDoc("pptx/font-pitch-family.pptx");
+
+    saveAndReload(TestFilter::PPTX);
+
+    // Without the fix in place, this test would have failed with:
+    // - Expected: 2
+    // - Actual  : 0
+    // i.e. the saved file stated no classification at all and both fonts came back unknown.
+    uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(0, 0));
+    uno::Reference<beans::XPropertySet> xFixed(
+        getRunFromParagraph(0, getParagraphFromShape(0, xShape)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(awt::FontPitch::FIXED,
+                         xFixed->getPropertyValue(u"CharFontPitch"_ustr).get<sal_Int16>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int16(awt::FontFamily::MODERN),
+                         xFixed->getPropertyValue(u"CharFontFamily"_ustr).get<sal_Int16>());
+
+    uno::Reference<beans::XPropertySet> xVariable(
+        getRunFromParagraph(0, getParagraphFromShape(1, xShape)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(awt::FontPitch::VARIABLE,
+                         xVariable->getPropertyValue(u"CharFontPitch"_ustr).get<sal_Int16>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int16(awt::FontFamily::SWISS),
+                         xVariable->getPropertyValue(u"CharFontFamily"_ustr).get<sal_Int16>());
+
+    // The eastern font of the third paragraph keeps its own classification the same way.
+    uno::Reference<beans::XPropertySet> xEastern(
+        getRunFromParagraph(0, getParagraphFromShape(2, xShape)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(awt::FontPitch::FIXED,
+                         xEastern->getPropertyValue(u"CharFontPitchAsian"_ustr).get<sal_Int16>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int16(awt::FontFamily::ROMAN),
+                         xEastern->getPropertyValue(u"CharFontFamilyAsian"_ustr).get<sal_Int16>());
+
+    // The fourth paragraph is western text carrying a complex font, which is kept along with its
+    // own classification.
+    uno::Reference<beans::XPropertySet> xComplex(
+        getRunFromParagraph(0, getParagraphFromShape(3, xShape)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(u"Mangal"_ustr,
+                         xComplex->getPropertyValue(u"CharFontNameComplex"_ustr).get<OUString>());
+    CPPUNIT_ASSERT_EQUAL(awt::FontPitch::VARIABLE,
+                         xComplex->getPropertyValue(u"CharFontPitchComplex"_ustr).get<sal_Int16>());
+    CPPUNIT_ASSERT_EQUAL(sal_Int16(awt::FontFamily::ROMAN),
+                         xComplex->getPropertyValue(u"CharFontFamilyComplex"_ustr).get<sal_Int16>());
+}
+
+// A paragraph states whether it hangs its punctuation, whichever way round it is.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testParagraphStatesItsHangingPunctuation)
+{
+    // Given one paragraph that keeps its punctuation inside the margin and one that hangs it:
+    createSdImpressDoc("pptx/hanging-punctuation.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, the first paragraph said nothing, and a paragraph that says
+    // nothing hangs its punctuation, so the state of the first one was read back as the state of
+    // the second.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[1]/a:pPr", "hangingPunct", u"0");
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[2]/a:pPr", "hangingPunct", u"1");
+}
+
+// A paragraph states whether its Latin text may break between lines, whichever way round it is.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testParagraphStatesItsLatinLineBreak)
+{
+    // Given one paragraph that keeps its Latin text whole and one that lets it break:
+    createSdImpressDoc("pptx/latin-line-break.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, neither paragraph said anything, and the setting of a paragraph
+    // that says nothing is the one the reader holds rather than the one the document gave.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[1]/a:pPr", "latinLnBrk", u"0");
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[2]/a:pPr", "latinLnBrk", u"1");
+}
+
+// A paragraph keeps the room it holds its text away from the right edge in.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testParagraphKeepsItsRightIndent)
+{
+    // Given a paragraph held half an inch away from the left edge and an inch from the right:
+    createSdImpressDoc("pptx/paragraph-right-indent.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, the saved file stated the left side alone, so the text reached
+    // the right edge of its frame when it was read back.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p/a:pPr", "marR", u"914400");
+}
+
+// The text of a bulleted paragraph begins where its bullet ends.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testBulletedTextBeginsWhereItsBulletEnds)
+{
+    // Given a paragraph that carries a bullet and keeps no room for it to the left of the text:
+    createSdImpressDoc("pptx/bullet-without-room-of-its-own.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, the saved file said the bullet hangs six millimetres to the left
+    // of a text that begins at the edge of its frame, and reading that back moved the text six
+    // millimetres to the right to make the room.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPathNoAttribute(pXmlDoc, "//p:sp/p:txBody/a:p/a:pPr", "indent");
+}
+
+// Text that stands upright stays upright where the level it belongs to leans.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testUprightTextStaysUpright)
+{
+    // Given a shape that follows an outline level whose text leans, holding one paragraph that
+    // leans with the level and one that stands upright on its own:
+    createSdImpressDoc("pptx/upright-run-in-a-leaning-level.pptx");
+
+    saveAndReload(TestFilter::PPTX);
+
+    uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(0, 0));
+    uno::Reference<beans::XPropertySet> xLeaning(
+        getRunFromParagraph(0, getParagraphFromShape(0, xShape)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(awt::FontSlant_ITALIC,
+                         xLeaning->getPropertyValue(u"CharPosture"_ustr).get<awt::FontSlant>());
+
+    // Without the fix in place, this test would have failed with:
+    // - Expected: 0
+    // - Actual  : 2
+    // i.e. the saved file said nothing of the upright paragraph, which then took the lean that
+    // the level gives every paragraph following it.
+    uno::Reference<beans::XPropertySet> xUpright(
+        getRunFromParagraph(0, getParagraphFromShape(1, xShape)), uno::UNO_QUERY_THROW);
+    CPPUNIT_ASSERT_EQUAL(awt::FontSlant_NONE,
+                         xUpright->getPropertyValue(u"CharPosture"_ustr).get<awt::FontSlant>());
+}
+
+// A run keeps both of the languages it names.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testRunKeepsBothOfItsLanguages)
+{
+    // Given a run naming English for the text it holds and Japanese beside it:
+    createSdImpressDoc("pptx/two-languages.pptx");
+
+    saveAndReload(TestFilter::PPTX);
+
+    // Without the fix in place, the saved file named the English alone, so the eastern language
+    // came back as the one the program falls back to.
+    uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(0, 0));
+    uno::Reference<beans::XPropertySet> xRun(
+        getRunFromParagraph(0, getParagraphFromShape(0, xShape)), uno::UNO_QUERY_THROW);
+    lang::Locale aWestern;
+    xRun->getPropertyValue(u"CharLocale"_ustr) >>= aWestern;
+    CPPUNIT_ASSERT_EQUAL(u"en"_ustr, aWestern.Language);
+    lang::Locale aEastern;
+    xRun->getPropertyValue(u"CharLocaleAsian"_ustr) >>= aEastern;
+    CPPUNIT_ASSERT_EQUAL(u"ja"_ustr, aEastern.Language);
+}
+
+// The notes pages of a presentation keep the size it states for them.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testNotesPagesKeepTheirSize)
+{
+    // Given a presentation that states a size for its notes pages, carries notes for its second
+    // page only, and lays its first page out on a layout of its own:
+    createSdImpressDoc("pptx/notes-size-on-another-layout.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, the size reached only the notes pages the document carries, so
+    // the first page kept the size a new notes page is made with, and the save read the stated
+    // size off that page.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/presentation.xml"_ustr);
+    assertXPath(pXmlDoc, "/p:presentation/p:notesSz", "cx", u"6797675");
+    assertXPath(pXmlDoc, "/p:presentation/p:notesSz", "cy", u"9926638");
+}
+
+// A notes page states the number of the slide it belongs to.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testNotesPageStatesItsSlideNumber)
+{
+    // Given a presentation whose notes pages number themselves:
+    createSdImpressDoc("pptx/tdf104788.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, a save with nothing on screen found no page for the number, and
+    // the text the program shows in its place went to the file instead.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/notesSlides/notesSlide3.xml"_ustr);
+    assertXPathContent(pXmlDoc, "//a:fld[@type='slidenum']/a:t", u"3");
+}
+
+// A line break keeps the look of the text it breaks.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testLineBreakKeepsItsFormatting)
+{
+    // Given a paragraph broken in two by a break of its own language and weight:
+    createSdImpressDoc("pptx/formatted-line-break.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, the saved break stated its size and nothing else, so the
+    // language and the weight it stood in were gone.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//a:p/a:br/a:rPr", "lang", u"en-ZA");
+    assertXPath(pXmlDoc, "//a:p/a:br/a:rPr", "b", u"1");
+}
+
+// A paragraph that keeps no space above itself keeps none after a save.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testParagraphKeepsNoSpaceAbove)
+{
+    // Given two paragraphs that keep no space above, in a document whose master keeps six
+    // points above every paragraph of its kind:
+    createSdImpressDoc("pptx/paragraph-without-space-above.pptx");
+
+    saveAndReload(TestFilter::PPTX);
+
+    // Without the fix in place, the saved file was silent about the space, so reading it back
+    // gave both paragraphs the six points of the master.
+    uno::Reference<beans::XPropertySet> xShape(getShapeFromPage(0, 0));
+    for (sal_Int32 nParagraph = 0; nParagraph < 2; ++nParagraph)
+    {
+        uno::Reference<beans::XPropertySet> xParagraph(getParagraphFromShape(nParagraph, xShape),
+                                                       uno::UNO_QUERY_THROW);
+        CPPUNIT_ASSERT_EQUAL(
+            sal_Int32(0), xParagraph->getPropertyValue(u"ParaTopMargin"_ustr).get<sal_Int32>());
+    }
+}
+
+// An empty paragraph after a link stays empty.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testEmptyParagraphAfterALinkStaysEmpty)
+{
+    // Given a paragraph holding a link and an empty paragraph under it:
+    createSdImpressDoc("pptx/empty-paragraph-after-a-link.pptx");
+
+    save(TestFilter::PPTX);
+
+    // Without the fix in place, the empty paragraph was saved with the words of the link above
+    // it and a link of its own, so the slide gained a line of text.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPathContent(pXmlDoc, "//p:sp/p:txBody/a:p[1]/a:r/a:t", u"A link");
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[2]/a:r", 0);
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[2]//a:hlinkClick", 0);
+}
+
+// A link that states no colour of its own is saved stating the colour the theme gives links.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testLinkWithoutAColourOfItsOwnKeepsTheThemeColour)
+{
+    // Given a paragraph holding a link that states no colour:
+    createSdImpressDoc("pptx/empty-paragraph-after-a-link.pptx");
+
+    save(TestFilter::PPTX);
+
+    // The colour saved with the link is the one the theme holds for links, so the link reads
+    // the way the theme says and follows it when the theme changes.
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//p:sp/p:txBody/a:p[1]/a:r/a:rPr/a:solidFill/a:schemeClr", "val",
+                u"hlink");
+}
+
+// A table cell that states a border has no line of its own is drawn without that border, and
+// stays that way over a save.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTableCellWithoutBordersKeepsNone)
+{
+    // Given a table that names a style and a cell that states no line on its left and top:
+    createSdImpressDoc("pptx/table-cell-that-states-no-line.pptx");
+
+    auto aLeftBorderOfTheFirstCell = [this]() {
+        const SdrPage* pPage = GetPage(1);
+        CPPUNIT_ASSERT(pPage != nullptr);
+        sdr::table::SdrTableObj* pTableObj
+            = dynamic_cast<sdr::table::SdrTableObj*>(pPage->GetObj(0));
+        CPPUNIT_ASSERT(pTableObj != nullptr);
+        uno::Reference<table::XCellRange> xTable(pTableObj->getTable(), uno::UNO_QUERY_THROW);
+        uno::Reference<beans::XPropertySet> xCell(xTable->getCellByPosition(0, 0),
+                                                  uno::UNO_QUERY_THROW);
+        table::BorderLine2 aBorderLine;
+        xCell->getPropertyValue(u"LeftBorder"_ustr) >>= aBorderLine;
+        return aBorderLine;
+    };
+
+    CPPUNIT_ASSERT_EQUAL(sal_Int16(table::BorderLineStyle::NONE),
+                         aLeftBorderOfTheFirstCell().LineStyle);
+
+    saveAndReload(TestFilter::PPTX);
+
+    // The cell is still drawn without a border, because the save states again that the border
+    // has no line of its own.
+    CPPUNIT_ASSERT_EQUAL(sal_Int16(table::BorderLineStyle::NONE),
+                         aLeftBorderOfTheFirstCell().LineStyle);
+}
+
+// A table states again the name of the style the document draws it in, and the document keeps
+// what it says about that style.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTableKeepsTheNameOfItsStyle)
+{
+    // Given a table that names a style the document holds:
+    createSdImpressDoc("pptx/bnc910045.pptx");
+
+    save(TestFilter::PPTX);
+
+    static constexpr OUString aStyleName = u"{69012ECD-51FC-41F1-AA8D-1B2483CD663E}"_ustr;
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPathContent(pXmlDoc, "//a:tbl/a:tblPr/a:tableStyleId", aStyleName);
+
+    // The part holding the styles is written out as well, so the name the table gives points at
+    // the style the document means.
+    xmlDocUniquePtr pStyles = parseExport(u"ppt/tableStyles.xml"_ustr);
+    assertXPath(pStyles, "//a:tblStyleLst/a:tblStyle[@styleId='" + aStyleName.toUtf8() + "']", 1);
+}
+
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testStrictTableStylesAreNotKept)
+{
+    // A strict OOXML presentation saves no table styles part, because the saved package is
+    // transitional, and the whole file would fail validation.
+    // If the conversion of such table styles part to transitional gets implemented, this test
+    // can be removed.
+    createSdImpressDoc("pptx/table_strict.pptx");
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pContentTypes = parseExport(u"[Content_Types].xml"_ustr);
+    assertXPath(pContentTypes,
+                "/ContentType:Types/ContentType:Override[@PartName='/ppt/tableStyles.xml']", 0);
+    xmlDocUniquePtr pRels = parseExport(u"ppt/_rels/presentation.xml.rels"_ustr);
+    assertXPath(pRels, "/rels:Relationships/rels:Relationship[@Target='tableStyles.xml']", 0);
+}
+
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTableStylesWithoutTablesAreKept)
+{
+    // A presentation that has no table can still have a table styles part, which
+    // should be kept during roundtrip.
+    createSdImpressDoc("pptx/empty-title-placeholder.pptx");
+
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pRels = parseExport(u"ppt/_rels/presentation.xml.rels"_ustr);
+    assertXPath(pRels, "/rels:Relationships/rels:Relationship[@Target='tableStyles.xml']", 1);
+
+    xmlDocUniquePtr pStyles = parseExport(u"ppt/tableStyles.xml"_ustr);
+    assertXPath(pStyles, "/a:tblStyleLst", "def", u"{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}");
+    assertXPath(pStyles, "/a:tblStyleLst/a:tblStyle", 3);
+}
+
+// A table cell that lets its text run on past its edge still says so after a save.
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testTableCellKeepsLettingItsTextRunOn)
+{
+    // Given a table whose cells state that their text is not cut off at the edge of the cell:
+    createSdImpressDoc("pptx/n80340.pptx");
+
+    save(TestFilter::PPTX);
+
+    xmlDocUniquePtr pXmlDoc = parseExport(u"ppt/slides/slide1.xml"_ustr);
+    assertXPath(pXmlDoc, "//a:tbl/a:tr[1]/a:tc[1]/a:tcPr", "horzOverflow", u"overflow");
+    assertXPath(pXmlDoc, "//a:tbl/a:tr[1]/a:tc[2]/a:tcPr", "horzOverflow", u"overflow");
+}
+
+CPPUNIT_TEST_FIXTURE(SdOOXMLExportTest6, testLayoutsOfOneMasterKeepDistinctNames)
+{
+    // Given two slides with different layouts on one master named Cobalt, whose layouts are
+    // written under the master's name and come back as two masters:
+    createSdImpressDoc();
+    mxComponent.queryThrow<drawing::XMasterPagesSupplier>()
+        ->getMasterPages()
+        ->getDrawPageByIndex(0)
+        .queryThrow<container::XNamed>()
+        ->setName(u"Cobalt"_ustr);
+    uno::Reference<drawing::XDrawPages> xPages
+        = mxComponent.queryThrow<drawing::XDrawPagesSupplier>()->getDrawPages();
+    xPages->insertNewByIndex(0);
+    xPages->getDrawPageByIndex(0).queryThrow<beans::XPropertySet>()->setPropertyValue(
+        u"Layout"_ustr, uno::Any(sal_Int16(AUTOLAYOUT_TITLE)));
+    xPages->getDrawPageByIndex(1).queryThrow<beans::XPropertySet>()->setPropertyValue(
+        u"Layout"_ustr, uno::Any(sal_Int16(AUTOLAYOUT_TITLE_CONTENT)));
+
+    saveAndReload(TestFilter::PPTX);
+
+    // Then every master has a name of its own, made from the master's name.
+    auto xMasterPages = mxComponent.queryThrow<drawing::XMasterPagesSupplier>()->getMasterPages();
+    CPPUNIT_ASSERT_GREATEREQUAL(sal_Int32(2), xMasterPages->getCount());
+    std::set<OUString> aNames;
+    for (sal_Int32 i = 0; i < xMasterPages->getCount(); ++i)
+        aNames.insert(xMasterPages->getDrawPageByIndex(i).queryThrow<container::XNamed>()->getName());
+    CPPUNIT_ASSERT_EQUAL(static_cast<std::size_t>(xMasterPages->getCount()), aNames.size());
+    CPPUNIT_ASSERT(aNames.contains(u"Cobalt"_ustr));
+    CPPUNIT_ASSERT(aNames.contains(u"Cobalt 2"_ustr));
+}
+
+CPPUNIT_PLUGIN_IMPLEMENT();
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

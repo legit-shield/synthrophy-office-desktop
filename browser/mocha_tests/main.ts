@@ -1,0 +1,147 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+// The tests build for an older language level than the browser code. Add the WeakRef and
+// FinalizationRegistry types, which Node provides at run time.
+/// <reference lib="es2021.weakref" />
+
+// Load the interfaces first.
+/// <reference path="../src/control/jsdialog/Definitions.Types.ts" />
+/// <reference path="../src/app/iface/Clipboard.Interface.ts" />
+/// <reference path="../src/app/iface/Control.Interface.ts" />
+/// <reference path="../src/app/iface/DocLayer.Interface.ts" />
+/// <reference path="../src/app/iface/Map.Interface.ts" />
+/// <reference path="../src/app/iface/MapZoom.Interface.ts" />
+/// <reference path="../src/app/iface/SocketTypes.Interface.ts" />
+/// <reference path="../src/app/iface/TraceEvents.Interface.ts" />
+/// <reference path="../src/app/iface/Welcome.Interface.ts" />
+/// <reference path="../src/global.d.ts" />
+
+/// <reference path="./refs/globals.ts" />
+/// <reference path="./sources.ts" />
+/// <reference path="./helper/canvasContainerSetup.ts" />
+/// <reference path="./helper/matchMediaMock.ts" />
+/// <reference path="./helper/fakeClock.ts" />
+/// <reference path="./helper/requestCleanup.ts" />
+/// <reference path="./helper/liveHandles.ts" />
+/// <reference path="./helper/SocketRecorder.ts" />
+/// <reference path="./helper/rectUtil.ts" />
+/// <reference path="./helper/Events.ts"/>
+/// <reference path="./helper/util.ts"/>
+/// <reference path="./helper/titleCase.ts"/>
+/// <reference path="./helper/DocumentPage.ts"/>
+/// <reference path="./helper/CanvasRecorder.ts"/>
+/// <reference path="./helper/ScratchCanvasStub.ts"/>
+/// <reference path="./helper/Path2DRecorder.ts"/>
+/// <reference path="./helper/HitTestContext.ts"/>
+/// <reference path="./helper/ImageRecorder.ts"/>
+/// <reference path="./helper/VectorRenderingReference.ts"/>
+/// <reference path="./helper/aiChat.ts"/>
+/// <reference path="./helper/jsDialog.ts"/>
+/// <reference path="./data/LOUtilTestData.ts"/>
+/// <reference path="./data/SheetGeometryTestData.ts" />
+
+/// <reference path="./DPIChangeListener.test.ts" />
+/// <reference path="./CanvasSectionContainer.test.ts" />
+/// <reference path="./TileMemory.test.ts" />
+/// <reference path="./CanvasTileUtils.test.ts" />
+/// <reference path="./CBounds.test.ts" />
+/// <reference path="./CleanupSidebar.test.ts" />
+/// <reference path="./SlideAvatars.test.ts" />
+/// <reference path="./CPointSet.test.ts" />
+/// <reference path="./Events.test.ts" />
+/// <reference path="./LOUtil.test.ts" />
+/// <reference path="./JSDialogAria.test.ts" />
+/// <reference path="./A11yValidator.test.ts" />
+/// <reference path="./UIManager.test.ts" />
+/// <reference path="./Rectangle.test.ts" />
+/// <reference path="./SheetGeometry.test.ts" />
+/// <reference path="./Util.test.ts" />
+/// <reference path="./ViewLayout.test.ts" />
+/// <reference path="./ServerCommand.test.ts" />
+/// <reference path="./SocketReload.test.ts" />
+/// <reference path="./AccessibilityNotice.test.ts" />
+/// <reference path="./SocketSaveFailed.test.ts" />
+/// <reference path="./DomUtil.test.ts" />
+/// <reference path="./Shortcuts.test.ts" />
+/// <reference path="./VectorPrimitiveRenderer.test.ts" />
+/// <reference path="./Matrix2D.test.ts" />
+/// <reference path="./InputSequence.test.ts" />
+/// <reference path="./RequestTracker.test.ts" />
+/// <reference path="./Point.test.ts" />
+/// <reference path="./Range2D.test.ts" />
+/// <reference path="./PathFit.test.ts" />
+/// <reference path="./DragSelect.test.ts" />
+/// <reference path="./MotionPaths.test.ts" />
+/// <reference path="./PathEditing.test.ts" />
+/// <reference path="./PathDrawing.test.ts" />
+/// <reference path="./VectorGradientFrame.test.ts" />
+/// <reference path="./VectorColorModifiers.test.ts" />
+/// <reference path="./VectorColorFilters.test.ts" />
+/// <reference path="./VectorModifiedImages.test.ts" />
+/// <reference path="./VectorGradientPrimitives.test.ts" />
+/// <reference path="./VectorHatchPrimitives.test.ts" />
+/// <reference path="./VectorImageFillPrimitives.test.ts" />
+/// <reference path="./VectorPatternFillPrimitives.test.ts" />
+/// <reference path="./VectorEffectPrimitives.test.ts" />
+/// <reference path="./VectorImageBlur.test.ts" />
+/// <reference path="./VectorResourceWalker.test.ts" />
+/// <reference path="./VectorArrowPrimitives.test.ts" />
+/// <reference path="./VectorHitTest.test.ts" />
+/// <reference path="./TextPageVectorSection.test.ts" />
+/// <reference path="./InternUtil.test.ts" />
+/// <reference path="./Plural.test.ts" />
+/// <reference path="./ImpressVectorManager.test.ts" />
+/// <reference path="./ShapeTransitionMask.test.ts" />
+/// <reference path="./VectorSlideLayers.test.ts" />
+/// <reference path="./MorphMatcher.test.ts" />
+/// <reference path="./SlideMorph.test.ts" />
+/// <reference path="./SlideAnimations.test.ts" />
+/// <reference path="./AnimatedContentRenderer.test.ts" />
+/// <reference path="./VectorCompositor.test.ts" />
+/// <reference path="./MessageParser.test.ts" />
+/// <reference path="./CalcObjectView.test.ts" />
+/// <reference path="./CalcBlockUpdate.test.ts" />
+/// <reference path="./CalcBlockPlacement.test.ts" />
+/// <reference path="./CalcVectorManager.test.ts" />
+/// <reference path="./LocalCellCursor.test.ts" />
+/// <reference path="./CellRangeMarkerSection.test.ts" />
+/// <reference path="./ChangeOutbox.test.ts" />
+/// <reference path="./RenderGeometrySection.test.ts" />
+/// <reference path="./ConnectorTieTarget.test.ts" />
+/// <reference path="./DocDispatcherExtensions.test.ts" />
+/// <reference path="./StateMachine.test.ts" />
+/// <reference path="./ContributedNotebookbarTabs.test.ts" />
+/// <reference path="./CDarkOverlay.test.ts" />
+/// <reference path="./AIChatMessageCodes.test.ts" />
+/// <reference path="./OtherViewCursorSection.test.ts" />
+/// <reference path="./TextSelectionSection.test.ts" />
+/// <reference path="./SlideImportSession.test.ts" />
+/// <reference path="./SlideLinks.test.ts" />
+/// <reference path="./SlideLinkToolbar.test.ts" />
+/// <reference path="./SlideImportPane.test.ts" />
+/// <reference path="./UserList.test.ts" />
+/// <reference path="./ExportFormats.test.ts" />
+/// <reference path="./Tooltip.test.ts" />
+/// <reference path="./CollabNotices.test.ts" />
+/// <reference path="./prediction/PredictionFixtures.ts" />
+/// <reference path="./prediction/CaretLookup.test.ts" />
+/// <reference path="./prediction/TextEdit.test.ts" />
+/// <reference path="./prediction/ParagraphWrap.test.ts" />
+/// <reference path="./prediction/CaretMove.test.ts" />
+/// <reference path="./CalcTyping.test.ts" />
+/// <reference path="./VectorColors.test.ts" />
+/// <reference path="./MochaHarness.test.ts" />
+/// <reference path="./AIChatSidebar.test.ts" />
+/// <reference path="./NotebookbarTabs.test.ts" />
+/// <reference path="./NotebookbarTitleCase.test.ts" />
+/// <reference path="./DocPartChanged.test.ts" />
+// NOTE: reference new tests here ...

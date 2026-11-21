@@ -1,0 +1,569 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * ContextToolbar - definition of context toolbar
+ * This toolbar should appear over selection when related selection is done using mouse
+ */
+
+class ContextToolbar extends JSDialogComponent {
+	declare container: HTMLElement;
+	initialized: boolean = false;
+	lastIinputEvent?: any = {};
+	pendingTask: TaskId | null = null;
+	pendingShow: boolean = false;
+	// Whether the toolbar is hidden while its text selection is dragged.
+	hiddenForDrag: boolean = false;
+	// roughly twice the height(76px) of default context toolbar in each direction from boundary
+	disappearingBoundary: number = 150; // px
+	additionalContextButtons: Array<ToolItemWidgetJSON> = [];
+
+	constructor(map: MapInterface) {
+		super(map, 'ContextToolbar', 'notebookbar');
+		this.createBuilder();
+		this.setupContainer(undefined);
+		this.registerMessageHandlers();
+		app.events.on('updatepermission', this.onUpdatePermission);
+		this.map.on('dropdownopen', this.onDropdownOpen, this);
+	}
+
+	onUpdatePermission = (): void => {
+		if (!this.initialized) return;
+		this._forceRebuild();
+	};
+
+	protected createBuilder() {
+		this.builder = new window.L.control.notebookbarBuilder({
+			windowId: WindowId.Notebookbar,
+			mobileWizard: this,
+			map: this.map,
+			cssClass: 'notebookbar',
+			suffix: 'context-toolbar',
+		} as JSBuilderOptions);
+	}
+
+	protected setupContainer(parentContainer?: HTMLElement /* ignored */): void {
+		this.container = window.L.DomUtil.createWithId(
+			'div',
+			'context-toolbar',
+			document.body,
+		);
+		window.L.DomUtil.addClass(this.container, 'notebookbar horizontal hidden');
+		// the toolbar stays usable while the context menu is open, close the
+		// menu once the toolbar is used, like a click anywhere else would
+		this.container.addEventListener('pointerdown', () => {
+			if (this.getContextMenuOverlay()) this.map.fire('closepopups');
+		});
+		// the pointer left the toolbar, the overlay takes the clicks again
+		this.container.addEventListener('pointerleave', () => {
+			this.getContextMenuOverlay()?.classList.remove(
+				'context-toolbar-passthrough',
+			);
+		});
+	}
+
+	showContextToolbar(): void {
+		if (this.lastIinputEvent.input === 'mouse') this.pendingShow = true;
+		if (this.lastIinputEvent.type !== 'buttonup') return;
+
+		this.showContextToolbarImpl();
+	}
+
+	showContextToolbarImpl(): void {
+		this.pendingShow = false;
+
+		const map = this.map;
+		if (!window.mode.isDesktop() || map.getDocType() === 'spreadsheet') return;
+		if (map.isReadOnlyMode() && map.getDocType() !== 'text') return;
+		if (map.isReadOnlyMode() && app.isReadOnly()) return;
+
+		if (this.pendingTask)
+			app.layoutingService.cancelLayoutingTask(this.pendingTask);
+
+		this.pendingTask = app.layoutingService.appendLayoutingTask(() => {
+			this.pendingTask = null;
+
+			if (!this.initialized) {
+				if (this.map.isReadOnlyMode()) {
+					this.builder?.build(this.container, this.getViewModeContext(), false);
+				} else {
+					const contextToolbarItems = this.getWriterTextContext();
+
+					for (const i in this.additionalContextButtons) {
+						const item = this.additionalContextButtons[i];
+						contextToolbarItems.push(item);
+					}
+
+					this.builder?.build(this.container, contextToolbarItems, false);
+				}
+
+				this.initialized = true;
+			}
+
+			document.addEventListener('pointermove', this.pointerMove);
+			document.addEventListener('pointermove', this.overlayPointerMove);
+			this.changeOpacity(1);
+			this.showHideToolbar(true);
+		});
+	}
+
+	// Hides the toolbar while its text selection is dragged.
+	hideForDrag(): void {
+		this.hiddenForDrag = true;
+		this.hideContextToolbar();
+	}
+
+	// Ends the drag of the selection. A selection that is still there gets its toolbar back: at
+	// once when the button came up or a key such as Escape ended the drag, otherwise at the next
+	// button-up.
+	endDrag(): void {
+		this.hiddenForDrag = false;
+		if (!TextSelections.isActive()) return;
+		const last = this.lastIinputEvent;
+		if (last.input !== 'mouse' || last.type === 'buttonup')
+			this.showContextToolbarImpl();
+		else this.pendingShow = true;
+	}
+
+	hideContextToolbar(): void {
+		document.removeEventListener('pointermove', this.pointerMove);
+		document.removeEventListener('pointermove', this.overlayPointerMove);
+
+		if (this.pendingTask)
+			app.layoutingService.cancelLayoutingTask(this.pendingTask);
+
+		this.pendingTask = app.layoutingService.appendLayoutingTask(() => {
+			this.pendingTask = null;
+			this.showHideToolbar(false);
+		});
+	}
+
+	private showHideToolbar(show: boolean): void {
+		if (!show) {
+			window.L.DomUtil.addClass(this.container, 'hidden');
+			return;
+		}
+
+		URLPopUpSection.closeURLPopUp();
+		const statRect = TextSelections.getStartRectangle();
+		if (!statRect) return;
+
+		Util.ensureValue(app.activeDocument);
+
+		// Go via SimplePoint(), which is aware of the active layout.
+		const point = new cool.SimplePoint(statRect.x1, statRect.y1);
+		const canvasRect = app.sectionContainer.getCanvasBoundingClientRect();
+		const pos = {
+			x: Math.round(point.vX / app.dpiScale) + canvasRect.x,
+			y: Math.round(point.vY / app.dpiScale) + canvasRect.y,
+		};
+
+		window.L.DomUtil.removeClass(this.container, 'hidden');
+		app.layoutingService.appendLayoutingTask(() => {
+			const contextualMenu = this.container.getBoundingClientRect();
+			if (contextualMenu.width + pos.x > window.innerWidth) {
+				pos.x -= contextualMenu.width + pos.x - window.innerWidth + 5;
+			}
+			this.container.style.top = pos.y + 'px';
+			this.container.style.left = pos.x + 'px';
+		});
+	}
+
+	getViewModeContext(): ToolItemWidgetJSON[] {
+		return [
+			{
+				id: 'context-switchtoedit',
+				type: 'customtoolitem',
+				inlineLabel: true,
+				text: _('Switch to Editing'),
+				command: 'switchtoedit',
+			} as ToolItemWidgetJSON,
+		];
+	}
+
+	getWriterTextContext(): ToolItemWidgetJSON[] {
+		const fontEntries = Object.keys(
+			this.map._docLayer._toolbarCommandValues['.uno:CharFontName'],
+		);
+		const sizeEntries = [
+			'6',
+			'7',
+			'8',
+			'9',
+			'10',
+			'10.5',
+			'11',
+			'12',
+			'13',
+			'14',
+			'15',
+			'16',
+			'18',
+			'20',
+			'21',
+			'22',
+			'24',
+			'26',
+			'28',
+			'32',
+			'36',
+			'40',
+			'44',
+			'48',
+			'54',
+			'60',
+			'66',
+			'72',
+			'80',
+			'88',
+			'96',
+		];
+		const currentFontName = this.map._getCurrentFontName();
+		const currentFontSize =
+			this.map['stateChangeHandler'].getItemValue('.uno:FontHeight');
+		const contextItems: ToolItemWidgetJSON[] = [
+			{
+				type: 'container',
+				children: [
+					{
+						type: 'container',
+						children: [
+							{
+								id: 'fontnamecombobox',
+								type: 'combobox',
+								text: currentFontName,
+								entries: fontEntries,
+								selectedCount: 1,
+								selectedEntries: [
+									fontEntries.findIndex(
+										(element) => element === currentFontName,
+									),
+								],
+								command: '.uno:CharFontName',
+								customEntryRenderer: true,
+							} as ComboBoxWidget,
+							{
+								id: 'fontsizecombobox',
+								type: 'combobox',
+								text: currentFontSize,
+								entries: sizeEntries,
+								selectedCount: 1,
+								selectedEntries: [
+									sizeEntries.findIndex(
+										(element) => element === currentFontSize,
+									),
+								],
+								command: '.uno:FontHeight',
+							} as ComboBoxWidget,
+							{
+								id: 'home-grow',
+								type: 'toolitem',
+								text: _UNO('.uno:Grow'),
+								command: '.uno:Grow',
+							} as ToolItemWidgetJSON,
+							{
+								id: 'home-shrink',
+								type: 'toolitem',
+								text: _UNO('.uno:Shrink'),
+								command: '.uno:Shrink',
+							} as ToolItemWidgetJSON,
+						],
+						vertical: false,
+					} as ContainerWidgetJSON,
+					{
+						type: 'container',
+						children: [
+							{
+								type: 'toolbox',
+								children: [
+									{
+										id: 'home-bold',
+										type: 'toolitem',
+										text: _UNO('.uno:Bold'),
+										command: '.uno:Bold',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-italic',
+										type: 'toolitem',
+										text: _UNO('.uno:Italic'),
+										command: '.uno:Italic',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-underline',
+										type: 'toolitem',
+										text: _UNO('.uno:Underline'),
+										command: '.uno:Underline',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-strikeout',
+										type: 'toolitem',
+										text: _UNO('.uno:Strikeout'),
+										command: '.uno:Strikeout',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-subscript',
+										type: 'toolitem',
+										text: _UNO('.uno:SubScript'),
+										command: '.uno:SubScript',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-superscript',
+										type: 'toolitem',
+										text: _UNO('.uno:SuperScript'),
+										command: '.uno:SuperScript',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-spacing:CharSpacingMenu',
+										type: 'menubutton',
+										noLabel: true,
+										text: _UNO('.uno:Spacing'),
+										command: '.uno:CharSpacing',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-back-color:ColorPickerMenu',
+										class: 'unospan-CharBackColor',
+										type: 'toolitem',
+										noLabel: true,
+										text: _UNO('.uno:CharBackColor', 'text'),
+										command: '.uno:CharBackColor',
+									} as ToolItemWidgetJSON,
+									{
+										id: 'home-color:ColorPickerMenu',
+										class: 'unospan-FontColor',
+										type: 'toolitem',
+										noLabel: true,
+										text: _UNO('.uno:Color'),
+										command: '.uno:Color',
+									} as ToolItemWidgetJSON,
+								],
+							},
+						],
+						vertical: false,
+					},
+				],
+				vertical: true,
+			} as ContainerWidgetJSON,
+			{
+				type: 'separator',
+				id: 'home-fontcombobox-break',
+				orientation: 'vertical',
+			} as SeparatorWidgetJSON,
+			{
+				id: 'home-insert-annotation',
+				type: 'bigtoolitem',
+				text: _UNO('.uno:InsertAnnotation'),
+				command: '.uno:InsertAnnotation',
+			} as ToolItemWidgetJSON,
+		];
+		return contextItems;
+	}
+
+	// Appends one item to additionalContextButtons, adding a separator ahead of it
+	// first if this is the first one, and skipping it entirely if an item with the
+	// same id is already there. Shared by insertAdditionalContextButton (a WOPI
+	// integrator's button, routed to a UNO command or a postMessage) and the
+	// contributes.contextToolbar entries an extension manifest declares (routed
+	// through the dispatcher instead) - the two differ only in how the item's
+	// `command`/`postmessage` fields get filled in before reaching here.
+	private _pushAdditionalContextButton(item: ToolItemWidgetJSON): void {
+		if (
+			this.additionalContextButtons.some((existing) => existing.id === item.id)
+		)
+			return;
+
+		if (this.additionalContextButtons.length === 0) {
+			this.additionalContextButtons.push({
+				type: 'separator',
+				id: 'home-insertannotation-break',
+				orientation: 'vertical',
+			} as SeparatorWidgetJSON);
+		}
+
+		this.additionalContextButtons.push(item);
+	}
+
+	// Discards the already-built toolbar so the next show rebuilds it from the
+	// current additionalContextButtons, since showContextToolbarImpl only ever
+	// reads that list once, the first time the toolbar is shown.
+	private _forceRebuild(): void {
+		document.removeEventListener('pointermove', this.pointerMove);
+		document.removeEventListener('pointermove', this.overlayPointerMove);
+		document.getElementById('context-toolbar')?.remove();
+		this.setupContainer(undefined);
+		this.initialized = false;
+	}
+
+	insertAdditionalContextButton(button: any) {
+		const isUnoCommand =
+			button.unoCommand && button.unoCommand.indexOf('.uno:') >= 0;
+		if (button.unoCommand && !isUnoCommand)
+			button.unoCommand = '.uno:' + button.unoCommand;
+
+		this._pushAdditionalContextButton({
+			id: button.id,
+			type: 'bigtoolitem',
+			text: button.label ? button.label : button.hint ? _(button.hint) : ' ',
+			command: button.unoCommand,
+			icon: button.imgurl,
+			postmessage: button.unoCommand ? undefined : true,
+		} as ToolItemWidgetJSON);
+
+		this._forceRebuild();
+	}
+
+	// Appends each loaded extension's contributes.contextToolbar entries as
+	// bigcustomtoolitems - unlike the plain bigtoolitem the built-in buttons above
+	// use, this type dispatches its command unconditionally rather than treating
+	// anything not starting with .uno: as a dialog event bound for core, so an
+	// ext: id reaches app.dispatcher.dispatch the same way a menu or notebookbar
+	// contribution's does. Called once, after extension discovery resolves (see
+	// ServerConnectionService's onDocumentLoaded) - there is no later point that
+	// needs to call this again, since the extension list itself is only ever
+	// populated once per document.
+	refresh(): void {
+		if (!window.enableExperimentalFeatures) return;
+		const exts = app.map._extensions || {};
+		let addedAny = false;
+		Object.keys(exts)
+			.sort()
+			.forEach((extId) => {
+				const manifest = exts[extId].options.manifest;
+				const contributed =
+					manifest.contributes && manifest.contributes.contextToolbar;
+				if (!contributed || !contributed.length) return;
+				const commands = manifest.contributes.commands || [];
+				const baseUrl = exts[extId].options.baseUrl;
+				contributed.forEach((entry: any) => {
+					const command = commands.filter(
+						(c: { id: string }) => c.id === entry.command,
+					)[0];
+					if (!command) {
+						console.warn(
+							'extension ' +
+								extId +
+								': context toolbar references unknown command "' +
+								entry.command +
+								'"',
+						);
+						return;
+					}
+					this._pushAdditionalContextButton({
+						id: 'ext:' + extId + ':' + entry.command,
+						type: 'bigcustomtoolitem',
+						text: command.title,
+						icon: command.icon ? baseUrl + command.icon : undefined,
+						command: 'ext:' + extId + ':' + entry.command,
+					} as ToolItemWidgetJSON);
+					addedAny = true;
+				});
+			});
+		if (addedAny) this._forceRebuild();
+	}
+
+	setLastInputEventType(e: any) {
+		this.lastIinputEvent = e;
+		if (e.type === 'buttonup' && e.input === 'mouse' && this.pendingShow) {
+			this.showContextToolbarImpl();
+			this.pendingShow = false;
+		}
+	}
+
+	calculateOpacity(e: PointerEvent): number {
+		const clientRect: DOMRect = this.container.getBoundingClientRect();
+
+		// distance from the pointer to the nearest point of the toolbar,
+		// zero when hovering over it, so the fade is the same in every direction
+		const xDistance = Math.max(
+			clientRect.left - e.clientX,
+			0,
+			e.clientX - clientRect.right,
+		);
+		const yDistance = Math.max(
+			clientRect.top - e.clientY,
+			0,
+			e.clientY - clientRect.bottom,
+		);
+		const distance = Math.hypot(xDistance, yDistance);
+
+		return Math.max(0, 1 - distance / this.disappearingBoundary);
+	}
+
+	// a dropdown opened elsewhere, e.g. from the notebookbar, takes over from the
+	// toolbar, but its own dropdowns and the context menu should keep it open
+	onDropdownOpen(e: {
+		id: string;
+		popupParent: string | HTMLElement | null;
+	}): void {
+		if (!this.pendingTask && this.container.classList.contains('hidden'))
+			return;
+		if (e.id === ContextMenuControl.menuID) return;
+
+		const parent =
+			typeof e.popupParent === 'string'
+				? document.getElementById(e.popupParent)
+				: e.popupParent;
+		if (parent && this.container.contains(parent)) return;
+
+		this.hideContextToolbar();
+	}
+
+	// the overlay of the context menu exists only while the menu is open
+	private getContextMenuOverlay(): HTMLElement | null {
+		return document.getElementById('jsd-context-menu-dropdown-overlay');
+	}
+
+	// The context menu sits inside an overlay that catches clicks on the whole
+	// page, so no z-index puts the toolbar above the overlay but below the menu.
+	// While the pointer is over the toolbar, let it pass through the overlay
+	// instead. The menu still gets the pointer where the two overlap.
+	overlayPointerMove = (e: PointerEvent): void => {
+		const overlay = this.getContextMenuOverlay();
+		if (!overlay || e.target !== overlay) return;
+
+		const clientRect: DOMRect = this.container.getBoundingClientRect();
+		if (
+			clientRect.left <= e.clientX &&
+			e.clientX <= clientRect.right &&
+			clientRect.top <= e.clientY &&
+			e.clientY <= clientRect.bottom
+		)
+			overlay.classList.add('context-toolbar-passthrough');
+	};
+
+	pointerMove = (e: PointerEvent): void => {
+		// keep the toolbar as it is while the pointer travels to the
+		// context menu, the fade resumes once the menu is closed
+		if (this.getContextMenuOverlay()) return;
+
+		app.layoutingService.appendLayoutingTask(() => {
+			const opacity: number = this.calculateOpacity(e);
+
+			if (opacity === 1) {
+				this.makeContextToolbarConstant();
+				return;
+			} else if (opacity === 0) {
+				this.hideContextToolbar();
+				return;
+			}
+
+			this.changeOpacity(opacity);
+		});
+	};
+
+	makeContextToolbarConstant(): void {
+		document.removeEventListener('pointermove', this.pointerMove);
+		this.changeOpacity(1);
+	}
+
+	changeOpacity(opacity: number) {
+		this.container.style.opacity = opacity.toString();
+	}
+}

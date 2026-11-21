@@ -1,0 +1,570 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include <config.h>
+
+#include <HostUtil.hpp>
+
+#include <common/ConfigUtil.hpp>
+#include <test/SavedEnvironmentVariable.hpp>
+#include <test/lokassert.hpp>
+#include <wsd/COOLWSD.hpp>
+
+#include <Poco/URI.h>
+#include <Poco/Util/LayeredConfiguration.h>
+#include <Poco/Util/MapConfiguration.h>
+
+#include <cppunit/extensions/HelperMacros.h>
+
+#include <cstdlib>
+#include <string>
+
+/// HostUtilTests unit-tests.
+class HostUtilTests : public CPPUNIT_NS::TestFixture
+{
+    CPPUNIT_TEST_SUITE(HostUtilTests);
+
+    CPPUNIT_TEST(testParseAlias);
+    CPPUNIT_TEST(testParseHostUri);
+    CPPUNIT_TEST(testFirstHostTrustedOnlyInFirstMode);
+    CPPUNIT_TEST(testGroupHostMatchesItsOwnName);
+    CPPUNIT_TEST(testWrittenPortIsMatched);
+    CPPUNIT_TEST(testGetNewUriBracketsIPv6Host);
+    CPPUNIT_TEST(testHostListWithGaps);
+    CPPUNIT_TEST(testAliasGroupExtraHosts);
+    CPPUNIT_TEST(testEveryAllowedKitHostIsAccepted);
+    CPPUNIT_TEST(testGroupsModeWithoutGroupIsReported);
+    CPPUNIT_TEST(testKitHostListHasNoPostAllowHost);
+    CPPUNIT_TEST(testWopiHostAuditStatus);
+
+    CPPUNIT_TEST_SUITE_END();
+
+    void testParseAlias();
+    void testParseHostUri();
+    void testFirstHostTrustedOnlyInFirstMode();
+    void testGroupHostMatchesItsOwnName();
+    void testWrittenPortIsMatched();
+    void testGetNewUriBracketsIPv6Host();
+    void testHostListWithGaps();
+    void testAliasGroupExtraHosts();
+    void testEveryAllowedKitHostIsAccepted();
+    void testGroupsModeWithoutGroupIsReported();
+    void testKitHostListHasNoPostAllowHost();
+    void testWopiHostAuditStatus();
+
+public:
+    /// Clear the parsed host state, matching the empty state it starts with, and
+    /// set whether WOPI is enabled.
+    static void resetHostState(bool wopiEnabled);
+};
+
+namespace
+{
+/// Install a config for the duration of a test and put the previous config, plus
+/// an empty and WOPI-disabled host state, back when the scope ends.
+class ScopedHostConfig
+{
+public:
+    explicit ScopedHostConfig(const Poco::Util::AbstractConfiguration* config)
+        : _previous(ConfigUtil::setConfigForTest(config))
+    {
+    }
+
+    ~ScopedHostConfig()
+    {
+        ConfigUtil::setConfigForTest(_previous);
+        HostUtilTests::resetHostState(false);
+    }
+
+private:
+    const Poco::Util::AbstractConfiguration* _previous;
+};
+}
+
+void HostUtilTests::resetHostState(bool wopiEnabled)
+{
+    HostUtil::WopiHosts.clear();
+    HostUtil::AliasHosts.clear();
+    HostUtil::hostList.clear();
+    HostUtil::FirstHost.clear();
+    HostUtil::FirstHostRejectionLogged = false;
+    HostUtil::WopiEnabled = wopiEnabled;
+    HostUtil::GroupsModeWithoutGroup = false;
+    HostUtil::GroupsIgnoredInFirstMode = false;
+}
+
+void HostUtilTests::testParseAlias()
+{
+    constexpr std::string_view testname = __func__;
+
+    LOK_ASSERT_EQUAL_STR("test2\\.local", HostUtil::parseAlias("test2.local"));
+    LOK_ASSERT_EQUAL_STR("test3\\.local", HostUtil::parseAlias("http://test3.local"));
+    LOK_ASSERT_EQUAL_STR("test3\\.local", HostUtil::parseAlias("https://test3.local"));
+    LOK_ASSERT_EQUAL_STR("test4\\.local", HostUtil::parseAlias("https://test4.local:8080"));
+    LOK_ASSERT_EQUAL_STR("test5\\.local", HostUtil::parseAlias("https://test5.local:8080/"));
+    LOK_ASSERT_EQUAL_STR("test6\\.local", HostUtil::parseAlias("https://test6.local:8080/path"));
+    LOK_ASSERT_EQUAL_STR("test7\\.local", HostUtil::parseAlias("test7.local/path"));
+    LOK_ASSERT_EQUAL_STR("test8", HostUtil::parseAlias("http://test8"));
+    LOK_ASSERT_EQUAL_STR("test9", HostUtil::parseAlias("http://test9:8080"));
+    LOK_ASSERT_EQUAL_STR("test10", HostUtil::parseAlias("http://test10:8080/"));
+    LOK_ASSERT_EQUAL_STR("test11", HostUtil::parseAlias("http://test11:8080/path"));
+
+    LOK_ASSERT_EQUAL_STR("test", HostUtil::parseAlias("test")); // identical result regardless of interpretation
+
+    LOK_ASSERT_EQUAL_STR("test[1-3]", HostUtil::parseAlias("test[1-3]")); // invalid hostname, interpret as regex
+    LOK_ASSERT_EQUAL_STR("test[0-9].local", HostUtil::parseAlias("test[0-9].local"));
+    LOK_ASSERT_EQUAL_STR("test[0-9]+.local", HostUtil::parseAlias("test[0-9]+.local"));
+    LOK_ASSERT_EQUAL_STR("", HostUtil::parseAlias("test[0-9.local")); // invalid regex
+
+    LOK_ASSERT_EQUAL_STR("https://:8080", HostUtil::parseAlias("https://:8080")); // not a valid url, no hostname
+    LOK_ASSERT_EQUAL_STR("/my-path", HostUtil::parseAlias("/my-path")); // not a valid url, no hostname
+
+    LOK_ASSERT_EQUAL_STR("https://aliasname[0-9]{1}:443", HostUtil::parseAlias("https://aliasname[0-9]{1}:443"));
+
+    // The port written after a host, plain or as a regular expression, is read out of it.
+    int port = -1;
+    LOK_ASSERT_EQUAL_STR("test12\\.local",
+                         HostUtil::parseAlias("https://test12.local:8080/path", port));
+    LOK_ASSERT_EQUAL(8080, port);
+    LOK_ASSERT_EQUAL_STR("test13\\.local", HostUtil::parseAlias("test13.local", port));
+    LOK_ASSERT_EQUAL(0, port);
+    LOK_ASSERT_EQUAL_STR("aliasname2.*\\.com",
+                         HostUtil::parseAlias("aliasname2.*\\.com:9443", port));
+    LOK_ASSERT_EQUAL(9443, port);
+    // The colons of an IPv6 address are not a port.
+    LOK_ASSERT_EQUAL_STR("2001:db8::1", HostUtil::parseAlias("2001:db8::1", port));
+    LOK_ASSERT_EQUAL(0, port);
+}
+
+void HostUtilTests::testParseHostUri()
+{
+    constexpr std::string_view testname = __func__;
+
+    // A full URI keeps its host and port.
+    {
+        const auto uri = HostUtil::parseHostUri("https://example.com:8080");
+        LOK_ASSERT(uri.has_value());
+        LOK_ASSERT_EQUAL_STR("example.com", uri->getHost());
+        LOK_ASSERT_EQUAL_STR("example.com:8080", uri->getAuthority());
+    }
+
+    // A host given without a scheme is accepted; only the host and port are used.
+    {
+        const auto uri = HostUtil::parseHostUri("example.com");
+        LOK_ASSERT(uri.has_value());
+        LOK_ASSERT_EQUAL_STR("example.com", uri->getHost());
+    }
+
+    // A custom port on a scheme-less host is preserved.
+    {
+        const auto uri = HostUtil::parseHostUri("example.com:8080");
+        LOK_ASSERT(uri.has_value());
+        LOK_ASSERT_EQUAL_STR("example.com:8080", uri->getAuthority());
+    }
+
+    // A regex in the host part is kept, with or without a scheme.
+    {
+        const auto uri = HostUtil::parseHostUri("example.*\\.com");
+        LOK_ASSERT(uri.has_value());
+        LOK_ASSERT_EQUAL_STR("example.*\\.com", uri->getHost());
+    }
+    {
+        const auto uri = HostUtil::parseHostUri("https://example.*\\.com:443");
+        LOK_ASSERT(uri.has_value());
+        LOK_ASSERT_EQUAL_STR("example.*\\.com", uri->getHost());
+    }
+
+    // A scheme-less IPv4 regex, as the shipped configuration uses, parses to that regex.
+    {
+        const auto uri = HostUtil::parseHostUri("192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}");
+        LOK_ASSERT(uri.has_value());
+        LOK_ASSERT_EQUAL_STR("192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}", uri->getHost());
+    }
+
+    // Values that are not valid URIs (a regex in the port, an IPv6 literal) are rejected rather
+    // than throwing and stopping the whole configuration from loading.
+    LOK_ASSERT(!HostUtil::parseHostUri("example.com:1.*").has_value());
+    LOK_ASSERT(!HostUtil::parseHostUri("::1").has_value());
+}
+
+void HostUtilTests::testFirstHostTrustedOnlyInFirstMode()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    config->setString("storage.wopi[@allow]", "true");
+
+    const ScopedHostConfig scopedConfig(config.get());
+
+    const Poco::URI uri("https://wopi.example.com:8443/");
+
+    // An administrator who selected groups mode but has not added a group yet.
+    config->setString("storage.wopi.alias_groups[@mode]", "groups");
+    resetHostState(true);
+    HostUtil::setFirstHost(uri);
+    LOK_ASSERT_MESSAGE("groups mode with no group must not record a first host",
+                       HostUtil::FirstHost.empty());
+    LOK_ASSERT_MESSAGE("groups mode with no group leaves the host list empty",
+                       HostUtil::isWopiHostsEmpty());
+    LOK_ASSERT_MESSAGE("groups mode with no group denies the connecting host",
+                       !HostUtil::allowedWopiHost(uri.getHost()));
+
+    // The same connection in first mode is adopted as the one trusted host.
+    config->setString("storage.wopi.alias_groups[@mode]", "first");
+    resetHostState(true);
+    HostUtil::setFirstHost(uri);
+    LOK_ASSERT_EQUAL_STR(uri.getHost(), HostUtil::FirstHost);
+    LOK_ASSERT_MESSAGE("first mode trusts the connecting host",
+                       HostUtil::allowedWopiHost(uri.getHost()));
+    LOK_ASSERT_MESSAGE("first mode trusts no other host",
+                       !HostUtil::allowedWopiHost("wopi-example.com"));
+}
+
+void HostUtilTests::testGroupHostMatchesItsOwnName()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    config->setString("storage.wopi[@allow]", "true");
+    config->setString("storage.wopi.alias_groups", "");
+    config->setString("storage.wopi.alias_groups[@mode]", "groups");
+    config->setString("storage.wopi.alias_groups.group[0]", "");
+    config->setString("storage.wopi.alias_groups.group[0].host", "https://wopi.example.com:443");
+    config->setString("storage.wopi.alias_groups.group[0].host[@allow]", "true");
+    config->setString("storage.wopi.alias_groups.group[1]", "");
+    config->setString("storage.wopi.alias_groups.group[1].host", "https://cloud.*\\.example\\.org");
+    config->setString("storage.wopi.alias_groups.group[1].host[@allow]", "true");
+
+    const ScopedHostConfig scopedConfig(config.get());
+    resetHostState(true);
+
+    Poco::AutoPtr<Poco::Util::LayeredConfiguration> layered(new Poco::Util::LayeredConfiguration);
+    layered->add(Poco::Util::AbstractConfiguration::Ptr(config.get(), true));
+    HostUtil::parseAliases(*layered);
+
+    // A plain host name is trusted as that name only.
+    LOK_ASSERT(HostUtil::allowedWopiHost("wopi.example.com"));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("wopi-example.com"));
+
+    // A host written as a regular expression still matches as one.
+    LOK_ASSERT(HostUtil::allowedWopiHost("cloud1.example.org"));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("cloud1.example.com"));
+}
+
+/// A port written on a group host or an alias allows that host on that port only. An entry without
+/// a port allows its host on any port, and a check that knows no port sees every entry by host.
+void HostUtilTests::testWrittenPortIsMatched()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    config->setString("storage.wopi[@allow]", "true");
+    config->setString("storage.wopi.alias_groups", "");
+    config->setString("storage.wopi.alias_groups[@mode]", "groups");
+    config->setString("storage.wopi.alias_groups.group[0]", "");
+    config->setString("storage.wopi.alias_groups.group[0].host", "https://wopi.example.com:8443");
+    config->setString("storage.wopi.alias_groups.group[0].host[@allow]", "true");
+    config->setString("storage.wopi.alias_groups.group[0].alias[0]",
+                      "https://alias.example.com:9443");
+    config->setString("storage.wopi.alias_groups.group[0].alias[1]", "any.example.com");
+    config->setString("storage.wopi.alias_groups.group[0].alias[2]",
+                      "cloud.*\\.example\\.net:8443");
+    config->setString("storage.wopi.alias_groups.group[1]", "");
+    config->setString("storage.wopi.alias_groups.group[1].host", "open.example.com");
+    config->setString("storage.wopi.alias_groups.group[1].host[@allow]", "true");
+    config->setString("storage.wopi.alias_groups.group[2]", "");
+    config->setString("storage.wopi.alias_groups.group[2].host",
+                      "https://blocked.example.com:443");
+    config->setString("storage.wopi.alias_groups.group[2].host[@allow]", "false");
+
+    const ScopedHostConfig scopedConfig(config.get());
+    resetHostState(true);
+
+    Poco::AutoPtr<Poco::Util::LayeredConfiguration> layered(new Poco::Util::LayeredConfiguration);
+    layered->add(Poco::Util::AbstractConfiguration::Ptr(config.get(), true));
+    HostUtil::parseAliases(*layered);
+
+    // The group host, on its port and on another.
+    LOK_ASSERT(HostUtil::allowedWopiHost("wopi.example.com", 8443));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("wopi.example.com", 443));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("wopi.example.com", 9200));
+
+    // A plain alias with a port, a plain alias without one, and a regular expression with one.
+    LOK_ASSERT(HostUtil::allowedWopiHost("alias.example.com", 9443));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("alias.example.com", 443));
+    LOK_ASSERT(HostUtil::allowedWopiHost("any.example.com", 443));
+    LOK_ASSERT(HostUtil::allowedWopiHost("any.example.com", 12345));
+    LOK_ASSERT(HostUtil::allowedWopiHost("cloud1.example.net", 8443));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("cloud1.example.net", 443));
+
+    // A group host written without a port.
+    LOK_ASSERT(HostUtil::allowedWopiHost("open.example.com", 443));
+    LOK_ASSERT(HostUtil::allowedWopiHost("open.example.com", 8080));
+
+    // A host that is not listed, and a blocked one, which is blocked on every port.
+    LOK_ASSERT(!HostUtil::allowedWopiHost("other.example.com", 8443));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("blocked.example.com", 443));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("blocked.example.com", 8443));
+
+    // A check without a port sees every entry by host.
+    LOK_ASSERT(HostUtil::allowedWopiHost("wopi.example.com"));
+    LOK_ASSERT(HostUtil::allowedWopiHost("alias.example.com"));
+    LOK_ASSERT(HostUtil::allowedWopiHost("open.example.com"));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("other.example.com"));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("blocked.example.com"));
+}
+
+void HostUtilTests::testGetNewUriBracketsIPv6Host()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    config->setString("storage.wopi[@allow]", "true");
+
+    const ScopedHostConfig scopedConfig(config.get());
+    resetHostState(true);
+
+    // An IPv6 host must keep its brackets, or the port separator is indistinguishable
+    // from the colons inside the address.
+    const Poco::URI uri("https://[3fff:f1:abcd::1]:8443/wopi/files/1");
+    LOK_ASSERT_EQUAL_STR("https://[3fff:f1:abcd::1]:8443/wopi/files/1", HostUtil::getNewUri(uri));
+
+    // An ordinary IPv4/hostname URI is unaffected.
+    const Poco::URI uriV4("https://example.com:8443/wopi/files/1");
+    LOK_ASSERT_EQUAL_STR("https://example.com:8443/wopi/files/1", HostUtil::getNewUri(uriV4));
+}
+
+void HostUtilTests::testHostListWithGaps()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    config->setString("storage.wopi[@allow]", "true");
+    // Integrators append to the shipped list by index, assuming its old length,
+    // e.g. --o:net.lok_allow.host[14]=... on top of a shorter default list.
+    // Such entries must not be lost because indexes 2 to 13 do not exist.
+    config->setString("storage.wopi.host", "first.example");
+    config->setString("storage.wopi.host[@allow]", "true");
+    config->setString("storage.wopi.host[1]", "second.example");
+    config->setString("storage.wopi.host[1][@allow]", "true");
+    config->setString("storage.wopi.host[14]", "appended.example");
+    config->setString("storage.wopi.host[14][@allow]", "true");
+    config->setString("storage.wopi.host[10]", "denied.example");
+    config->setString("storage.wopi.host[10][@allow]", "false");
+    // Not part of the list.
+    config->setString("storage.wopi.host[x]", "garbage.example");
+    config->setString("storage.wopi.hostname", "garbage2.example");
+
+    const ScopedHostConfig scopedConfig(config.get());
+
+    const std::vector<std::string> keys = ConfigUtil::getIndexedKeys("storage.wopi", "host");
+    LOK_ASSERT_EQUAL(static_cast<std::size_t>(4), keys.size());
+    LOK_ASSERT_EQUAL_STR("storage.wopi.host", keys[0]);
+    LOK_ASSERT_EQUAL_STR("storage.wopi.host[1]", keys[1]);
+    LOK_ASSERT_EQUAL_STR("storage.wopi.host[10]", keys[2]);
+    LOK_ASSERT_EQUAL_STR("storage.wopi.host[14]", keys[3]);
+
+    resetHostState(false);
+    HostUtil::parseWopiHost();
+    LOK_ASSERT(HostUtil::allowedWopiHost("first.example"));
+    LOK_ASSERT(HostUtil::allowedWopiHost("second.example"));
+    LOK_ASSERT(HostUtil::allowedWopiHost("appended.example"));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("denied.example"));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("garbage.example"));
+    LOK_ASSERT(!HostUtil::allowedWopiHost("garbage2.example"));
+}
+
+/// Only the first <host> of an alias_groups <group> is used. The others are found, to warn about
+/// them: before, they were ignored without a word, and their documents rejected.
+/// An allow attribute given as an option, as richdocumentscode gives it, is not another host.
+void HostUtilTests::testAliasGroupExtraHosts()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    const std::string group = "storage.wopi.alias_groups.group[0]";
+    config->setString(group + ".host", "https://first.example:443");
+    config->setString(group + ".host[@allow]", "true");
+    config->setString(group + ".host[1]", "https://second.example:443");
+    config->setString(group + ".host[2]", "https://third.example:443");
+    config->setString(group + ".host[2][@allow]", "true");
+    config->setString(group + ".alias", "https://alias.example:443");
+    config->setString("storage.wopi.alias_groups.group[1].host", "https://other.example:443");
+    config->setString("storage.wopi.alias_groups.group[1].host[@allow]", "true");
+
+    const std::vector<std::string> extraHosts = HostUtil::getExtraGroupHosts(*config, group);
+    LOK_ASSERT_EQUAL(static_cast<std::size_t>(2), extraHosts.size());
+    LOK_ASSERT_EQUAL_STR("https://second.example:443", extraHosts[0]);
+    LOK_ASSERT_EQUAL_STR("https://third.example:443", extraHosts[1]);
+
+    LOK_ASSERT(
+        HostUtil::getExtraGroupHosts(*config, "storage.wopi.alias_groups.group[1]").empty());
+}
+
+void HostUtilTests::testEveryAllowedKitHostIsAccepted()
+{
+    constexpr std::string_view testname = __func__;
+
+    const SavedEnvironmentVariable allowlist("KIT_HOST_ALLOWLIST");
+
+    ::setenv("KIT_HOST_ALLOWLIST", "192.168.0.0/16\n127.0.0.1/32\n::1/128\nlocalhost", 1);
+
+    // Every entry of the list allows its hosts, whether it is the first one or the last.
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("192.168.1.5"));
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("127.0.0.1"));
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("::1"));
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("localhost"));
+
+    // A host the list does not name stays forbidden.
+    LOK_ASSERT(HostUtil::isForbiddenKitHost("example.com"));
+    LOK_ASSERT(HostUtil::isForbiddenKitHost("10.0.0.1"));
+
+    // An empty list allows no hosts.
+    ::setenv("KIT_HOST_ALLOWLIST", "", 1);
+    LOK_ASSERT(HostUtil::isForbiddenKitHost("example.com"));
+
+    // No list at all allows every host.
+    ::unsetenv("KIT_HOST_ALLOWLIST");
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("example.com"));
+}
+
+/// Groups mode with no group refuses every WOPI host, and that is reported. A group, or first mode,
+/// lets a host in, and nothing is reported.
+void HostUtilTests::testGroupsModeWithoutGroupIsReported()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    config->setString("storage.wopi[@allow]", "true");
+    config->setString("storage.wopi.alias_groups", "");
+    config->setString("storage.wopi.alias_groups[@mode]", "groups");
+
+    const ScopedHostConfig scopedConfig(config.get());
+    Poco::AutoPtr<Poco::Util::LayeredConfiguration> layered(new Poco::Util::LayeredConfiguration);
+    layered->add(Poco::Util::AbstractConfiguration::Ptr(config.get(), true));
+
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    LOK_ASSERT_MESSAGE("groups mode with no group is reported",
+                       HostUtil::isGroupsModeWithoutGroup());
+
+    config->setString("storage.wopi.alias_groups.group[0]", "");
+    config->setString("storage.wopi.alias_groups.group[0].host", "https://wopi.example.com");
+    config->setString("storage.wopi.alias_groups.group[0].host[@allow]", "true");
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    LOK_ASSERT_MESSAGE("groups mode with a group is not reported",
+                       !HostUtil::isGroupsModeWithoutGroup());
+
+    // As --o: options give it: the group's host with no group[0] key of its own
+    config->remove("storage.wopi.alias_groups.group[0]");
+    config->setString("storage.wopi.alias_groups.group[0].host", "wopi.example.com");
+    config->setString("storage.wopi.alias_groups.group[0].host[@allow]", "true");
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    LOK_ASSERT_MESSAGE("a group given only by its host is not reported",
+                       !HostUtil::isGroupsModeWithoutGroup());
+
+    config->remove("storage.wopi.alias_groups.group[0]");
+    config->setString("storage.wopi.alias_groups[@mode]", "first");
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    LOK_ASSERT_MESSAGE("first mode with no group is not reported",
+                       !HostUtil::isGroupsModeWithoutGroup());
+}
+
+/// The kit may fetch from the net.lok_allow hosts and the allowed WOPI hosts, but not from the
+/// clients that net.post_allow lets call convert-to, even with an allow attribute on post_allow.
+void HostUtilTests::testKitHostListHasNoPostAllowHost()
+{
+    constexpr std::string_view testname = __func__;
+
+    const SavedEnvironmentVariable allowlist("KIT_HOST_ALLOWLIST");
+    const SavedEnvironmentVariable exemptVerifyHost("KIT_HOST_ALLOWLIST_EXEMPT_VERIFY_HOST");
+    const SavedEnvironmentVariable extRefPaths("KIT_ALLOWED_EXTREF_PATHS");
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> map(new Poco::Util::MapConfiguration);
+    map->setString("net.lok_allow.host", "data.example");
+    map->setString("net.post_allow[@allow]", "true");
+    map->setString("net.post_allow.host", "10.0.0.0/8");
+    map->setString("net.post_allow.host[1]", "client.example");
+    map->setString("storage.wopi[@allow]", "true");
+    map->setString("storage.wopi.alias_groups.group[0].host", "https://wopi.example:443");
+    map->setString("storage.wopi.alias_groups.group[0].host[@allow]", "true");
+    map->setString("storage.wopi.alias_groups.group[0].alias[0]", "https://alias.example:443");
+
+    Poco::AutoPtr<Poco::Util::LayeredConfiguration> config(new Poco::Util::LayeredConfiguration);
+    config->add(map);
+    COOLWSD::setLokitEnvironmentVariables(*config);
+
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("data.example"));
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("wopi.example"));
+    LOK_ASSERT(!HostUtil::isForbiddenKitHost("alias.example"));
+
+    LOK_ASSERT(HostUtil::isForbiddenKitHost("10.1.2.3"));
+    LOK_ASSERT(HostUtil::isForbiddenKitHost("client.example"));
+}
+
+/// The server audit names the WOPI host problem whether or not a host has connected. The options
+/// richdocumentscode passes to coolwsd configure one group, so neither problem is reported for it.
+void HostUtilTests::testWopiHostAuditStatus()
+{
+    constexpr std::string_view testname = __func__;
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config(new Poco::Util::MapConfiguration);
+    config->setString("storage.wopi[@allow]", "true");
+    config->setString("storage.wopi.alias_groups", "");
+
+    const ScopedHostConfig scopedConfig(config.get());
+    Poco::AutoPtr<Poco::Util::LayeredConfiguration> layered(new Poco::Util::LayeredConfiguration);
+    layered->add(Poco::Util::AbstractConfiguration::Ptr(config.get(), true));
+
+    const Poco::URI uri("https://cloud.example.com/wopi/files/1");
+
+    // Groups mode with no group: every host is refused
+    config->setString("storage.wopi.alias_groups[@mode]", "groups");
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    LOK_ASSERT_EQUAL_STR("nogroups", HostUtil::getWopiHostAuditStatus());
+
+    // First mode is reported before any host connects, and still once one is trusted
+    config->setString("storage.wopi.alias_groups[@mode]", "first");
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    LOK_ASSERT_EQUAL_STR("not_recommended", HostUtil::getWopiHostAuditStatus());
+    HostUtil::setFirstHost(uri);
+    LOK_ASSERT_EQUAL_STR("not_recommended", HostUtil::getWopiHostAuditStatus());
+
+    // A group in coolwsd.xml with mode left at "first" is ignored
+    config->setString("storage.wopi.alias_groups.group[0]", "");
+    config->setString("storage.wopi.alias_groups.group[0].host", "cloud.example.com");
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    LOK_ASSERT_EQUAL_STR("groupsignored", HostUtil::getWopiHostAuditStatus());
+    config->remove("storage.wopi.alias_groups.group[0]");
+
+    // The options richdocumentscode passes: groups mode, Nextcloud's names as the aliases of one
+    // group, and one plain name as the group host
+    config->setString("storage.wopi.alias_groups[@mode]", "groups");
+    config->setString("storage.wopi.alias_groups.group[0].host", "cloud.example.com");
+    config->setString("storage.wopi.alias_groups.group[0].host[@allow]", "true");
+    config->setString("storage.wopi.alias_groups.group[0].alias[0]", "cloud\\.example\\.com");
+    config->setString("storage.wopi.alias_groups.group[0].alias[1]", "localhost");
+    resetHostState(true);
+    HostUtil::parseAliases(*layered);
+    HostUtil::setFirstHost(uri);
+    LOK_ASSERT_EQUAL_STR("", HostUtil::getWopiHostAuditStatus());
+    LOK_ASSERT_MESSAGE("the Nextcloud host is allowed", HostUtil::allowedWopiHost(uri.getHost()));
+}
+
+CPPUNIT_TEST_SUITE_REGISTRATION(HostUtilTests);
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

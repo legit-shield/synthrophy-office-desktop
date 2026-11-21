@@ -1,0 +1,963 @@
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * Client session management in WSD process.
+ * Classes: ClientSession
+ */
+
+#pragma once
+
+#include <common/Rectangle.hpp>
+#include <common/RotatingToken.hpp>
+#include <common/Session.hpp>
+#include <common/TilePrioritizer.hpp>
+#include <common/Uri.hpp>
+#include <common/Util.hpp>
+#include <wsd/DocumentBroker.hpp>
+#include <wsd/SenderQueue.hpp>
+#include <wsd/ServerURL.hpp>
+#include <wsd/Storage.hpp>
+#include <wsd/TileCache.hpp>
+#if !MOBILEAPP
+#include <wsd/wopi/WopiStorage.hpp>
+#endif
+
+#include <Poco/JSON/Array.h>
+#include <Poco/JSON/Object.h>
+#include <Poco/SharedPtr.h>
+#include <Poco/URI.h>
+
+#include <deque>
+#include <optional>
+#include <utility>
+
+class DocumentBroker;
+// wsd/AIChatSession.cpp is only compiled into builds that have an HTTP
+// transport for the AI proxy: COOL (!MOBILEAPP), CODA-Q (QTAPP), CODA-M
+// (MACOSAPP) and CODA-W (_WIN32). The other MOBILEAPP variants
+// (iOS/Android/cowasm) build without it.
+#if !MOBILEAPP || defined(QTAPP) || defined(MACOSAPP) || defined(_WIN32)
+class AIChatSession;
+#endif
+
+/// Represents a session to a COOL client, in the WSD process.
+class ClientSession final : public Session
+{
+#if !MOBILEAPP || defined(QTAPP) || defined(MACOSAPP) || defined(_WIN32)
+    friend class AIChatSession;
+#endif
+public:
+    ClientSession(const std::shared_ptr<ProtocolHandlerInterface>& ws, const std::string& id,
+                  const std::shared_ptr<DocumentBroker>& docBroker, const Poco::URI& uriPublic,
+                  bool isReadOnly, const RequestDetails& requestDetails,
+                  const AdditionalFilePocoUris& additionalFileUrisPublic = {});
+    void construct();
+    virtual ~ClientSession();
+
+    void setReadOnly(bool value) override;
+
+    /// readOnlyFile: the document is read-only because its file cannot be written.
+    void sendFileMode(bool readOnly, bool editComments, bool manageRedlines,
+                      bool readOnlyFile = false);
+
+    void setLockFailed(const std::string& reason);
+
+    STATE_ENUM(SessionState,
+               DETACHED, // initial
+               LOADING, // attached to a DocBroker & waiting for load
+               LIVE, // Document is loaded & editable or viewable.
+               WAIT_DISCONNECT // closed and waiting for Kit's disconnected message
+    );
+
+    /// Returns true if this session has loaded a view (i.e. we got status message).
+    bool isViewLoaded() const { return _state == SessionState::LIVE; }
+
+    /// returns true if we're waiting for the kit to acknowledge disconnect.
+    bool inWaitDisconnected() const { return _state == SessionState::WAIT_DISCONNECT; }
+
+    /// transition to a new state
+    void setState(SessionState newState);
+
+    void setDocumentOwner(const bool documentOwner) { _isDocumentOwner = documentOwner; }
+    bool isDocumentOwner() const { return _isDocumentOwner; }
+
+    /// Returns true iff the view is loaded and not disconnected
+    /// from either the client or the Kit.
+    bool isLive() const { return _state == SessionState::LIVE && !isCloseFrame(); }
+
+    /// Handle kit-to-client message.
+    bool handleKitToClientMessage(const std::shared_ptr<Message>& payload);
+
+    std::optional<bool>
+    handleOpenDocKitToClientMessage(const std::shared_ptr<Message>& payload,
+                                    const std::shared_ptr<DocumentBroker>& docBroker,
+                                    const std::shared_ptr<StreamSocket>& saveAsSocket);
+
+    /// Integer id of the view in the kit process, or -1 if unknown
+    int getKitViewId() const { return _kitViewId; }
+
+    /// This view's current and previous reconnect tokens.
+    const RotatingToken& getReconnectTokens() const { return _reconnectTokens; }
+
+    /// Make a new reconnect token and keep the old one as the previous token, sending the new one
+    /// to the browser when notifyClient is set.
+    void rotateReconnectToken(bool notifyClient);
+
+    /// True while the browser's connection is gone and the session waits for it to come back. A
+    /// session that is leaving, with its close frame set or in WAIT_DISCONNECT, is not parked any
+    /// more.
+    bool isParked() const
+    {
+        return _state == SessionState::LIVE && !isCloseFrame() &&
+               _parkedSince != std::chrono::steady_clock::time_point();
+    }
+
+    std::chrono::steady_clock::time_point parkedSince() const { return _parkedSince; }
+
+    /// Keep the session and its kit view after the connection ended without the client leaving on
+    /// purpose.
+    void park();
+
+    /// Give the session the browser's new connection and the authorization that came with it. A
+    /// live connection it still holds is closed first.
+    void unpark(const std::shared_ptr<ProtocolHandlerInterface>& ws, const Poco::URI& uriPublic);
+
+    /// Disconnect the session and do final cleanup, @returns true if we should not wait.
+    bool disconnectFromKit();
+
+    // sendTextFrame that takes std::string and string literal.
+    using Session::sendTextFrame;
+
+    bool sendBinaryFrame(const char* buffer, int length) override
+    {
+        if (!isCloseFrame())
+        {
+            enqueueSendMessage(std::make_shared<Message>(buffer, length, Message::Dir::Out));
+            return true;
+        }
+
+        return false;
+    }
+
+    void resetTileSeq(const TileDesc &desc)
+    {
+        _tracker.resetTileSeq(desc);
+    }
+
+    // no tile data - just notify the client the ids/versions updated
+    bool sendUpdateNow(const TileDesc &desc)
+    {
+        TileWireId lastSentId = _tracker.updateTileSeq(desc);
+        std::string header = desc.serialize("update:", "\n");
+        LOG_TRC("Sending update from " << lastSentId << " to " << header);
+        return sendTextFrame(header.data(), header.size());
+    }
+
+    bool sendTileNow(const TileDesc &desc, const Tile &tile)
+    {
+        // The tracker is left alone for a tile that stays here, so the client and our record of
+        // what it holds keep matching and a later delta still applies.
+        if (!canSendTile(desc))
+        {
+            LOG_TRC("Keeping tile in the cache for now: " << desc.serialize());
+            return false;
+        }
+
+        TileWireId lastSentId = _tracker.updateTileSeq(desc);
+
+        std::string header;
+        if (tile->needsKeyframe(lastSentId) || tile->isPng())
+            header = desc.serialize("tile:", "\n");
+        else
+            header = desc.serialize("delta:", "\n");
+
+        // FIXME: performance - optimize away this copy ...
+        std::vector<char> output;
+
+        // copy in the header
+        output.resize(header.size());
+        std::memcpy(output.data(), header.data(), header.size());
+
+        bool hasContent = tile->appendChangesSince(output, tile->isPng() ? 0 : lastSentId);
+        LOG_TRC("Sending tile message: " << header << " lastSendId " << lastSentId << " content " << hasContent);
+        if (!sendBinaryFrame(output.data(), output.size()))
+            return false;
+
+        // The load timing marks the first tile that reached a client, so it is taken here, where
+        // every tile a client receives passes through. The kit hears of this session's first
+        // tile the same way, whether the tile came from the cache or was rendered for another
+        // session, and only now, so what it sends in reply follows the tile.
+        if (const std::shared_ptr<DocumentBroker> docBroker = getDocumentBroker())
+        {
+            docBroker->recordFirstTileSent();
+            if (!_firstTileSent)
+            {
+                _firstTileSent = true;
+                docBroker->forwardToChild(client_from_this(), "firsttilesent");
+            }
+        }
+
+        return true;
+    }
+
+    bool sendBlob(const std::string &header, const Blob &blob)
+    {
+        // FIXME: performance - optimize away this copy ...
+        std::vector<char> output;
+
+        output.resize(header.size() + blob->size());
+        std::memcpy(output.data(), header.data(), header.size());
+        std::memcpy(output.data() + header.size(), blob->data(), blob->size());
+
+        return sendBinaryFrame(output.data(), output.size());
+    }
+
+    bool sendTextFrame(const char* buffer, const int length) override
+    {
+        if (!isCloseFrame())
+        {
+            enqueueSendMessage(std::make_shared<Message>(buffer, length, Message::Dir::Out));
+            return true;
+        }
+
+        return false;
+    }
+
+    void enqueueSendMessage(const std::shared_ptr<Message>& data);
+
+    /// Set the save-as socket which is used to send convert-to results.
+    void setSaveAsSocket(const std::shared_ptr<StreamSocket>& socket)
+    {
+        _saveAsSocket = socket;
+        _isConvertTo = static_cast<bool>(socket);
+    }
+
+    std::shared_ptr<DocumentBroker> getDocumentBroker() const { return _docBroker.lock(); }
+
+    /// Exact URI (including query params - access tokens etc.) with which
+    /// client made the request to us
+    ///
+    /// Note: This URI is unsafe - when connecting to existing sessions, we must
+    /// ignore everything but the access_token, and use the access_token with
+    /// the URI of the initial request.
+    const Poco::URI& getPublicUri() const { return _uriPublic; }
+
+    const AdditionalFilePocoUris& getAdditionalFilePublicUri() const { return _additionalFileUrisPublic; }
+
+    /// The access token of this session.
+    const Authorization& getAuthorization() const { return _auth; }
+
+    void invalidateAuthorizationToken()
+    {
+        LOG_DBG("Session [" << getId() << "] expiring its authorization token");
+        _auth.expire();
+    }
+
+    /// Sends the client an internal error of the given kind, after the messages already queued
+    /// for it, and closes the connection.
+    void closeWithError(const std::string& kind);
+
+    /// Start waiting for a token refresh from the host.
+    void startTokenRefresh(const std::chrono::seconds timeout = std::chrono::seconds(30))
+    {
+        LOG_DBG("Session [" << getId() << "] starting token refresh wait (attempt #"
+                            << (_tokenRefreshAttempts + 1) << ')');
+        ++_tokenRefreshAttempts;
+        _auth.startTokenRefresh(timeout);
+    }
+
+    /// Returns the number of consecutive refresh attempts since the last successful upload.
+    int tokenRefreshAttempts() const { return _tokenRefreshAttempts; }
+
+    /// Reset the consecutive token-refresh attempt counter. Call on successful upload.
+    void resetTokenRefreshAttempts() { _tokenRefreshAttempts = 0; }
+
+    /// Returns true iff this session is waiting for a token refresh.
+    bool isRefreshingToken() const { return _auth.isRefreshingToken(); }
+
+    /// Returns true if the token refresh wait has timed out.
+    bool isTokenRefreshTimedOut(
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const
+    {
+        return _auth.isTokenRefreshTimedOut(now);
+    }
+
+#if !MOBILEAPP || defined(QTAPP) || defined(MACOSAPP) || defined(_WIN32)
+    /// Give up on an AI chat design fetch the kit has not answered by its
+    /// deadline, so the request does not stall until the client gives up.
+    void checkAIRequestTimeout(std::chrono::steady_clock::time_point now);
+#endif
+
+    /// Set WOPI fileinfo object
+    void setWopiFileInfo(std::unique_ptr<WopiStorage::WOPIFileInfo> wopiFileInfo) { _wopiFileInfo = std::move(wopiFileInfo); }
+
+    /// True if the WOPI host asked for AI UI / features to be disabled for this document.
+    bool isDisableAISettings() const;
+
+    /// Get requested tiles waiting for sending to the client
+    std::deque<TileDesc>& getRequestedTiles() { return _requestedTiles; }
+
+    /// Mark a new tile as sent
+    void addTileOnFly(TileWireId wireId);
+    size_t getTilesOnFlyCount() const { return _tilesOnFly.size(); }
+    size_t getTilesOnFlyUpperLimit() const;
+    void removeOutdatedTilesOnFly(std::chrono::steady_clock::time_point now);
+    void onTileProcessed(TileWireId wireId);
+    /// Remove a tile from the on-fly tracking (no logging if absent).
+    /// Returns true if the wireId was found and removed.
+    bool removeTileOnFly(TileWireId wireId);
+
+    /// Whether a tile goes to the client now. A client that is keeping up receives every tile it
+    /// asked for. One that is behind receives the tiles at and around its visible area, while a
+    /// tile it has scrolled away from keeps its place in the cache and goes out when asked for
+    /// again.
+    bool canSendTile(const TileDesc& tile) const;
+
+    /// Where a tile sits in what this client is looking at, ranked the same way the kit ranks the
+    /// tiles it renders.
+    TilePrioritizer::Priority getTilePriority(const TileDesc& tile) const;
+
+    const Util::Rectangle& getVisibleArea() const { return _clientVisibleArea; }
+
+    /// The identifier of the part this client is showing, empty when it has not said.
+    /// Writer documents have no parts and leave it empty.
+    const std::string& getClientSelectedPart() const { return _clientSelectedPart; }
+
+    /// The zoom this client is showing at, as a percentage, or 0 when it has not said.
+    int getClientZoomPercent() const { return _clientZoomPercent; }
+
+    /// True while the client is in editing mode rather than viewing mode, and unset until
+    /// the client has said which.
+    std::optional<bool> getClientEditMode() const { return _clientEditMode; }
+
+    /// Where the text cursor of this view is, in document twips, empty until the kit says.
+    const Util::Rectangle& getClientCursor() const { return _clientCursor; }
+
+    /// The two ends of this view's text selection, in document twips.
+    const Util::Rectangle& getClientSelectionStart() const { return _clientSelectionStart; }
+    const Util::Rectangle& getClientSelectionEnd() const { return _clientSelectionEnd; }
+
+    /// The cell the cursor of this view is on, such as "D24". Empty in a document with no cells.
+    const std::string& getClientCellAddress() const { return _clientCellAddress; }
+
+    /// Tell the client, once, the zoom and the scroll offset the last view left.
+    void sendLastViewPosition(const std::shared_ptr<DocumentBroker>& docBroker);
+
+    /// Put the cursor and any selection back where the last view of this document had them.
+    void restoreLastViewSelection(const std::shared_ptr<DocumentBroker>& docBroker);
+    /// Visible area can have negative value as position, but we have tiles only in the positive range
+    Util::Rectangle getNormalizedVisibleArea() const;
+
+    /// The client's visible area can be divided into a maximum of 4 panes.
+    enum SplitPaneName : std::uint8_t
+    {
+        TOPLEFT_PANE,
+        TOPRIGHT_PANE,
+        BOTTOMLEFT_PANE,
+        BOTTOMRIGHT_PANE
+    };
+
+    /// Returns true if the given split-pane is currently valid.
+    bool isSplitPane(SplitPaneName) const;
+
+    /// Returns the normalized visible area of a given split-pane.
+    Util::Rectangle getNormalizedVisiblePaneArea(SplitPaneName) const;
+
+    int getTileWidthInTwips() const { return _tileWidthTwips; }
+    int getTileHeightInTwips() const { return _tileHeightTwips; }
+
+    bool isTextDocument() const { return _isTextDocument; }
+
+    /// True when the session is read-only only because the file has a view-only extension, such
+    /// as PDF, and it could edit the document otherwise.
+    bool isReadOnlyForViewFile() const { return _isReadOnlyForViewFile; }
+    void setReadOnlyForViewFile(bool value) { _isReadOnlyForViewFile = value; }
+
+    void setThumbnailSession(const bool val) { _thumbnailSession = val; }
+
+    void setThumbnailTarget(const std::string& target) { _thumbnailTarget = target; }
+
+    const std::string& getThumbnailTarget() const { return _thumbnailTarget; }
+
+    void setThumbnailPosition(const std::pair<int, int>& pos) { _thumbnailPosition = pos; }
+
+    const std::pair<int, int>& getThumbnailPosition() const { return _thumbnailPosition; }
+
+    bool thumbnailSession() const { return _thumbnailSession; }
+
+    /// Do we recognize this clipboard ?
+    bool matchesClipboardKeys(const std::string &viewId, const std::string &tag);
+
+    /// Handle presentation info request
+    bool handlePresentationInfo(const std::shared_ptr<Message>& payload, const std::shared_ptr<DocumentBroker>& docBroker);
+
+#if !MOBILEAPP
+    /// Takes the source documents named by the slide links the document reports, so that a
+    /// source the storage listed no remote link for is still known by its name.
+    void recordSlideLinkSources(const std::shared_ptr<Message>& payload,
+                                const std::shared_ptr<DocumentBroker>& docBroker);
+
+    /// Called for each file asked of the storage, with its path relative to the document and
+    /// the name of the copy staged in the jail, or an empty name when there is no copy.
+    using LinkedFileStaged =
+        std::function<void(const std::string& relativePath, const std::string& stagedName)>;
+
+    /// Forwards a message of the kit about the linked files to the client without the URLs that
+    /// name the files in the jail.
+    bool forwardWithoutJailUrls(const std::shared_ptr<Message>& payload);
+
+    /// Asks the storage for the linked files the linkedfiles: answer of the kit names as not
+    /// readable, or for every one with refresh, as the kit reads a copy of one it was given.
+    void requestLinkedFiles(const std::shared_ptr<Message>& payload,
+                            const std::shared_ptr<DocumentBroker>& docBroker, bool refresh);
+
+    /// Asks the storage of the document for the files with the paths relativePaths, relative
+    /// to the document, and stages a copy of each one in the jail.
+    void fetchLinkedFiles(const std::vector<std::string>& relativePaths,
+                          const std::shared_ptr<DocumentBroker>& docBroker,
+                          const LinkedFileStaged& onStaged);
+
+    /// Takes the answer of the storage for the linked files in asked, and downloads each file
+    /// it names.
+    void completeLinkedFiles(const std::vector<std::string>& asked, unsigned statusCode,
+                             const std::string& body, const LinkedFileStaged& onStaged);
+
+    /// Downloads the file with the path relativePath from a URL on the WOPI host of the
+    /// document into the jail. Follows up to redirectLimit redirects on that host.
+    void downloadLinkedFile(const std::string& relativePath, const Poco::URI& uri,
+                            const std::string& accessToken, int redirectLimit,
+                            const LinkedFileStaged& onStaged);
+
+    /// Takes the answer of the client to a link pick of the kit: the path of the picked file
+    /// relative to the document, which the integrator gave, or none when the user cancelled.
+    /// The file is staged from the storage and given to the kit.
+    bool linkPickerResult(const StringVector& tokens,
+                          const std::shared_ptr<DocumentBroker>& docBroker);
+#endif // !MOBILEAPP
+
+    /// Handle a clipboard fetch / put request. stagedClipFile owns clipFile when it was staged
+    /// outside the jail, and is null otherwise.
+    void handleClipboardRequest(DocumentBroker::ClipboardRequest     type,
+                                const std::shared_ptr<StreamSocket> &socket,
+                                const std::string                   &tag,
+                                const std::string                   &clipFile,
+                                const std::shared_ptr<FileUtil::OwnedFile>& stagedClipFile);
+
+    /// Create URI for transient clipboard content.
+    std::string getClipboardURI(bool encode = true);
+
+    /// Utility to create a publicly accessible URI. The query, if any, is more parameters that
+    /// follow Tag, each with its leading '&'.
+    std::string createPublicURI(const std::string& subPath, const std::string& tag, bool encode,
+                                const std::string& query = std::string());
+
+    /// Create the public URI of the embedded media with the given id, for this view. Its query
+    /// parameters are encoded like those of the clipboard URI.
+    std::string createMediaURI(const std::string& subPath, const std::string& id);
+
+    /// Adds and/or modified the copied payload before sending on to the client.
+    void postProcessCopyPayload(const std::shared_ptr<Message>& payload);
+    bool postProcessCopyPayload(std::istream&, std::ostream&);
+
+    /// Removes the <meta name="origin" ...> tag which was added in
+    /// ClientSession::postProcessCopyPayload().
+    bool preProcessSetClipboardPayload(std::istream&, std::ostream&);
+
+    /// Returns true if we're expired waiting for a clipboard and should be removed
+    bool staleWaitDisconnect(std::chrono::steady_clock::time_point now);
+
+    /// Generate and rotate a new clipboard hash, sending it if appropriate
+    void rotateClipboardKey(bool notifyClient);
+
+    /// Generate a fresh one-time token that authorizes a POST to
+    /// /cool/links for this view, sending it to the client when
+    /// notifyClient is set. Each accepted POST consumes and rotates it.
+    void rotateLinkToken(bool notifyClient);
+
+    /// The storage of the document answers for the files that sections of a text document link
+    /// to, by their path relative to the document, so the files the kit cannot read are copied
+    /// into the jail for it.
+    void enableLinkedFiles() { _linkedFilesEnabled = true; }
+
+    /// True when the given token is this view's current link POST
+    /// token, and not empty.
+    bool matchesLinkToken(const std::string& token) const
+    {
+        return !token.empty() && token == _linkToken;
+    }
+
+    /// True when the given key is the one this view's media URLs carry, and not empty.
+    bool matchesMediaKey(const std::string& key) const
+    {
+        return !key.empty() && key == _mediaKey;
+    }
+
+    /// Generate an access token for this session via proxy protocol.
+    const std::string &getOrCreateProxyAccess();
+
+#if ENABLE_FEATURE_LOCK
+    void sendLockedInfo();
+#endif
+
+#if ENABLE_FEATURE_RESTRICTION
+    void sendRestrictionInfo();
+#endif
+
+    /// Process an SVG to replace embedded file:/// media URIs with public http URLs.
+    std::string processSVGContent(const std::string& svg);
+
+    CanonicalViewId getCanonicalViewId() const { return _canonicalViewId; }
+
+    bool getSentBrowserSetting() const { return _sentBrowserSetting; }
+
+    void setSentBrowserSetting(const bool sentBrowserSetting)
+    {
+        _sentBrowserSetting = sentBrowserSetting;
+    }
+
+    void setBrowserSettingsJSON(const Poco::SharedPtr<Poco::JSON::Object>& jsonObject)
+    {
+        _browserSettingsJSON = jsonObject;
+    }
+
+    Poco::SharedPtr<Poco::JSON::Object> getBrowserSettingJSON() const
+    {
+        return _browserSettingsJSON;
+    }
+
+    void uploadBrowserSettingsToWopiHost();
+
+    void setViewSettingsJSON(const Poco::SharedPtr<Poco::JSON::Object>& jsonObject)
+    {
+        _viewSettingsJSON = jsonObject;
+    }
+
+    Poco::SharedPtr<Poco::JSON::Object> getViewSettingsJSON() const
+    {
+        return _viewSettingsJSON;
+    }
+
+    void uploadViewSettingsToWopiHost();
+
+    void uploadServerPrivateInfoToWopiHost();
+
+    /// Resolve AI credentials with precedence:
+    ///   viewSettings[aiProviderAPIKey|Model|URL]
+    ///   -> userPrivateInfoObj[AIProviderAPIKey|Model|URL]
+    ///   -> coolwsd.xml ai.api_key / ai.model / ai.api_url
+    /// When ai.allow_user_settings is false the per-user sources are skipped
+    /// and only the coolwsd.xml values are used, locking every user to the
+    /// central endpoint.
+    /// Applies the resolved values to this session. If viewSettings is non-null
+    /// and a field is filled from userPrivateInfoObj, viewSettings is mutated
+    /// (and viewSettingsMutated set to true) so callers can persist the
+    /// migration. outModel receives the resolved model name when aiConfigured,
+    /// otherwise an empty string. outRating receives the ethical AI rating
+    /// (A/B/C/U).
+    /// Returns aiConfigured: ai.enabled AND all three fields non-empty.
+    bool resolveAndApplyAICredentials(
+        Poco::JSON::Object::Ptr& viewSettings,
+        const Poco::JSON::Object::Ptr& userPrivateInfoObj,
+        bool disableAISettings,
+        bool& viewSettingsMutated,
+        std::string& outModel,
+        std::string& outRating);
+
+    /// Resolve AI image-generation credentials with the same precedence as
+    /// resolveAndApplyAICredentials:
+    ///   viewSettings[aiImageProviderAPIKey|URL|aiImageModel|aiImageSize]
+    ///   -> userPrivateInfoObj[AIImageProviderAPIKey|URL|AIImageModel|AIImageSize]
+    ///   -> coolwsd.xml ai.image_api_key / ai.image_api_url / ai.image_model / ai.image_size
+    /// As with resolveAndApplyAICredentials, ai.allow_user_settings=false skips
+    /// the per-user sources and uses only the coolwsd.xml values.
+    /// Applies the resolved values to this session. If viewSettings is non-null
+    /// and a field is filled from userPrivateInfoObj, viewSettings is mutated
+    /// (and viewSettingsMutated set to true) so callers can persist the
+    /// migration.
+    void resolveAndApplyAIImageCredentials(Poco::JSON::Object::Ptr& viewSettings,
+                                           const Poco::JSON::Object::Ptr& userPrivateInfoObj,
+                                           bool& viewSettingsMutated);
+
+    /// Override parsedDocOption values we get from browser setting json
+    /// Because when client sends `load url` it doesn't have information about browser setting json
+    void overrideDocOption();
+
+#if !MOBILEAPP
+    void updateBrowserSettingsJSON(const std::string& json);
+#endif
+
+    /// Marks the view as one through which another document reads this one.
+    void setRemoteDocumentConnection() { _isRemoteDocumentConnection = true; }
+
+private:
+    /// Puts the set clipboard content in clipFile where the kit can read it, and tells the kit to
+    /// use it. False when it cannot be put there.
+    bool forwardSetClipboard(DocumentBroker& docBroker, const std::string& clipFile);
+
+    /// The value of one AI setting: the user's view setting, else their user private info, which is
+    /// then copied into the view settings, else the coolwsd.xml value.
+    std::string resolveAISetting(Poco::JSON::Object::Ptr& viewSettings,
+                                 const Poco::JSON::Object::Ptr& userPrivateInfoObj,
+                                 bool& viewSettingsMutated, const std::string& vsKey,
+                                 const std::string& upiKey, const std::string& cfgKey) const;
+
+    std::shared_ptr<ClientSession> client_from_this()
+    {
+        return std::static_pointer_cast<ClientSession>(shared_from_this());
+    }
+
+    void uploadSettingsToWopiHost(const std::string& filePath, const std::string& jsonBody,
+                                  const std::string& settingName);
+
+    /// SocketHandler: disconnection event.
+    void onDisconnect() override;
+
+    /// True when the connection that just ended is to be kept for a reconnect.
+    bool shouldPark(const std::shared_ptr<DocumentBroker>& docBroker) const;
+
+    /// True for a connection that can come back with a reconnect token. The app builds have no
+    /// network between the browser and the server to lose, and the headless connection belongs to
+    /// another server.
+    bool isReconnectable() const { return !Util::isMobileApp() && !_isRemoteDocumentConnection; }
+
+    /// The load a reconnected browser sends refreshes its view instead of loading again.
+    bool resyncAfterReconnect(const StringVector& tokens,
+                              const std::shared_ptr<DocumentBroker>& docBroker);
+
+    /// Does SocketHandler: have messages to send ?
+    bool hasQueuedMessages() const override { return !_senderQueue.empty(); }
+
+    /// SocketHandler: send those messages
+    void writeQueuedMessages(std::size_t capacity) override;
+
+    virtual bool _handleInput(const char* buffer, int length) override;
+
+    bool handleSignatureAction(const StringVector& tokens);
+
+    /// Compares the document against one at a URL on the WOPI host of the document. The file is
+    /// downloaded here with the WOPI proof headers and staged in the jail. A URL on any other
+    /// host goes to the kit unchanged.
+    bool handleCompareDocumentsUrl(const std::string& firstLine, const StringVector& tokens,
+                                   const std::shared_ptr<DocumentBroker>& docBroker);
+
+    /// Downloads the document to compare against from a URL on the WOPI host of the document
+    /// into the jail and asks the kit to compare against it. Follows up to redirectLimit
+    /// redirects.
+    void downloadCompareDocument(const Poco::URI& uri, int redirectLimit);
+
+    bool handleUpdateViewSettings(const std::string& firstLine);
+
+    /// Put back the secrets the browser asked to keep. A secret the user did not
+    /// change arrives with an empty value and a "<field>Stored": true flag; this
+    /// replaces it with the value the session already holds (or the stored
+    /// settings) and removes the flag, so applying the update does not wipe it.
+    void restoreKeptViewSettingSecrets(Poco::JSON::Object::Ptr& viewSettings);
+
+    /// Persist the last-used Impress view mode (Normal/Notes) for the current
+    /// document, keyed by docKey, inside the per-user viewsetting.json. The
+    /// per-user dimension is implicit in where that file lives; we only add the
+    /// per-document key here.
+    bool handleUpdateViewMode(const StringVector& tokens);
+
+    bool loadDocument(const char* buffer, int length, const StringVector& tokens,
+                      const std::shared_ptr<DocumentBroker>& docBroker);
+    bool getStatus(const char* buffer, int length,
+                   const std::shared_ptr<DocumentBroker>& docBroker);
+    bool getCommandValues(const char* buffer, int length, const StringVector& tokens,
+                          const std::shared_ptr<DocumentBroker>& docBroker);
+    /// Command values can be localized (style names), so views of one document
+    /// in different languages must not share a cached entry.
+    std::string commandValuesCacheKey(const std::string& command) const
+    {
+        return command + " lang=" + getLang();
+    }
+    bool sendTile(const char* buffer, int length, const StringVector& tokens,
+                  const std::shared_ptr<DocumentBroker>& docBroker);
+    bool sendCombinedTiles(const char* buffer, int length, const StringVector& tokens,
+                           const std::shared_ptr<DocumentBroker>& docBroker);
+
+    bool handleGetSlideRequest(const StringVector& tokens,
+                               const std::shared_ptr<DocumentBroker>& docBroker);
+
+    bool forwardToChild(const std::string& message,
+                        const std::shared_ptr<DocumentBroker>& docBroker);
+
+    /// Run the extension call of a callextension message in the kit:
+    bool runExtensionCall(
+        std::string_view message, StringVector const & tokens,
+        std::shared_ptr<DocumentBroker> const & docBroker);
+
+    bool forwardToClient(const std::shared_ptr<Message>& payload);
+
+    /// Returns true if given message from the client should be allowed or not
+    /// Eg. in readonly mode only few messages should be allowed
+    bool filterMessage(const std::string& msg) const;
+
+    /// Returns true if the download message of type 'id' should be allowed or not
+    bool filterDownloadAs(const std::string& id) const;
+
+    /// Whether the host lets the content of the document leave in a file of its own,
+    /// unwatermarked. The content may not leave when the host disables export or copy,
+    /// or when a watermark must stay over it.
+    bool allowsCleanExport() const
+    {
+        return !_wopiFileInfo || _wopiFileInfo->allowsCleanExport();
+    }
+
+    /// Whether the session may run extension scripts. Extensions are off when experimental
+    /// features are off, when the session is read-only, or when the host disables copy, export or
+    /// print.
+    bool allowsExtensions() const
+    {
+        // (EnableExperimental is always false for MOBILEAPP, so ignore it in that case:)
+        return (EnableExperimental || Util::isMobileAppBuild()) && !isReadOnly() &&
+               (!_wopiFileInfo ||
+                (!_wopiFileInfo->getDisableCopy() && !_wopiFileInfo->getDisableExport() &&
+                 !_wopiFileInfo->getDisablePrint()));
+    }
+
+    void dumpState(std::ostream& os) override;
+
+    /// Handle invalidation message coming from a kit and transfer it to a tile request.
+    void handleTileInvalidation(const std::string& message,
+                                const std::shared_ptr<DocumentBroker>& docBroker);
+
+    /// If this session is read-only because of failed lock, try to unlock and make it read-write.
+    bool attemptLock(const std::shared_ptr<DocumentBroker>& docBroker);
+
+    std::string getIsAdminUserStatus() const;
+
+    /// Abort conversion due to failure.
+    void abortConversion(const std::shared_ptr<DocumentBroker>& docBroker,
+                         const std::shared_ptr<StreamSocket>& saveAsSocket, std::string errorKind);
+
+#if !MOBILEAPP
+
+    /// Handles saveas: and exportas: in handleKitToClientMessage.
+    bool handleSaveAs(const std::shared_ptr<Message>& payload,
+                      const std::shared_ptr<DocumentBroker>& docBroker,
+                      const std::shared_ptr<StreamSocket>& saveAsSocket);
+
+#if (defined(ENABLE_PYTHON_COMPUTE) && ENABLE_PYTHON_COMPUTE)
+    /// Kit-initiated =PY() request: hand it to the DocumentBroker, which owns it.
+    bool handlePythonComputeFromKit(const std::shared_ptr<Message>& payload);
+#endif
+#endif // !MOBILEAPP
+
+private:
+    /// URI with which client made request to us
+    const Poco::URI _uriPublic;
+
+    const AdditionalFilePocoUris _additionalFileUrisPublic;
+
+    SenderQueue<std::shared_ptr<Message>> _senderQueue;
+
+    /// Requested tiles are stored in this list, before we can send them to the client
+    std::deque<TileDesc> _requestedTiles;
+
+    /// How to find our service from the client.
+    const ServerURL _serverURL;
+
+    /// Authorization data - either access_token or access_header.
+    Authorization _auth;
+
+    /// Number of consecutive token-refresh attempts triggered by upload 401s
+    /// since the last successful upload. Bounds the refresh-on-unauthorize retry loop.
+    int _tokenRefreshAttempts;
+
+    /// Rotating clipboard remote access identifiers - protected by GlobalSessionMapMutex
+    RotatingToken _clipboardKeys;
+
+    /// Target used for thumbnail rendering
+    std::string _thumbnailTarget;
+
+    /// Secure session id token for proxyprotocol authentication
+    std::string _proxyAccess;
+
+    /// The current one-time token that authorizes a POST to
+    /// /cool/links for this view. Empty until the first is generated.
+    std::string _linkToken;
+
+    /// The token that lets a new connection take over this view, as 64 hex digits.
+    RotatingToken _reconnectTokens;
+
+    /// The key that every media URL of this view carries, as 32 hex digits. It stays the same for
+    /// the life of the view, so a player can keep seeking with the one URL.
+    const std::string _mediaKey;
+
+    /// Store last sent payload of form field button, so we can filter out redundant messages.
+    std::string _lastSentFormFielButtonMessage;
+
+    std::weak_ptr<DocumentBroker> _docBroker;
+
+    /// The socket to which the converted (saveas) doc is sent.
+    std::weak_ptr<StreamSocket> _saveAsSocket;
+
+    /// Time of last state transition
+    std::chrono::steady_clock::time_point _lastStateTime;
+
+    /// When the browser's connection was lost, while the session waits for it to come back. The
+    /// zero time point while the session has a connection.
+    std::chrono::steady_clock::time_point _parkedSince;
+
+    /// Wopi FileInfo object
+    std::unique_ptr<WopiStorage::WOPIFileInfo> _wopiFileInfo;
+
+    /// wire-ids's of the in-flight tiles. Push by sending and pop by tileprocessed message from the client.
+    std::vector<std::pair<TileWireId, std::chrono::steady_clock::time_point>> _tilesOnFly;
+
+    /// Sockets to send binary selection content to
+    std::vector<std::weak_ptr<StreamSocket>> _clipSockets;
+
+    /// Delta tile tracker.
+    ClientDeltaTracker _tracker;
+
+    /// Visible area of the client
+    Util::Rectangle _clientVisibleArea;
+
+    /// The part and the edit mode the visible area above was reported for. They are the values the
+    /// client had selected when it last told us what it was looking at, so they equal the selected
+    /// part and mode until either of those changes.
+    std::string _visibleAreaPart;
+    int _visibleAreaMode;
+
+    Poco::SharedPtr<Poco::JSON::Object> _browserSettingsJSON;
+
+    /// Time when loading of view started
+    std::chrono::steady_clock::time_point _viewLoadStart;
+
+    /// Count of key-strokes
+    uint64_t _keyEvents;
+
+    /// Epoch of the client's performance.now() function, as microseconds since Unix epoch
+    uint64_t _performanceCounterEpoch;
+
+    /// Split position that defines the current split panes
+    int _splitX;
+    int _splitY;
+
+    /// Selected part of the document viewed by the client, as its part identifier: a page
+    /// GUID for a presentation or drawing document, a decimal index for a spreadsheet.
+    /// Empty before any part is known (and always for Writer, which has no parts).
+    std::string _clientSelectedPart;
+
+    /// Selected mode of the presentation viewed by the client (in Impress)
+    int _clientSelectedMode;
+
+    /// Zoom properties of the client
+    int _tileWidthPixel;
+    int _tileHeightPixel;
+    int _tileWidthTwips;
+    int _tileHeightTwips;
+
+    /// The zoom the client is showing at, as a percentage, or 0 before it has said.
+    int _clientZoomPercent;
+
+    /// True while the client is in editing mode. The client says which mode it is in when
+    /// its page has loaded and again on each change, so this stays unset until then.
+    std::optional<bool> _clientEditMode;
+
+    /// True once this session has been put where the last view of the document was.
+    bool _restoredLastViewPosition;
+
+    /// Where the text cursor of this view is, in document twips.
+    Util::Rectangle _clientCursor;
+
+    /// The two ends of this view's text selection, in document twips.
+    Util::Rectangle _clientSelectionStart;
+    Util::Rectangle _clientSelectionEnd;
+
+    std::string _clientCellAddress;
+
+    /// Read a "x, y, width, height" rectangle in twips. False when the text is not one.
+    static bool parseRectangle(const std::string& text, Util::Rectangle& rectangle);
+
+    /// The integer id of the view in the Kit process
+    int _kitViewId;
+
+    /// the canonical id unique to the set of rendering properties of this session
+    CanonicalViewId _canonicalViewId;
+
+    // Position used for thumbnail rendering
+    std::pair<int, int> _thumbnailPosition;
+
+    /// The phase of our lifecycle that we're in.
+    SessionState _state;
+
+    /// Whether this session is the owner of currently opened document
+    bool _isDocumentOwner;
+
+    /// If it is allowed to try to switch from read-only to edit mode,
+    /// because it's read-only just because of transient lock failure.
+    bool _isLockFailed = false;
+
+    /// Client is using a text document?
+    bool _isTextDocument;
+
+    /// The storage answers for the files the document links to, see enableLinkedFiles().
+    bool _linkedFilesEnabled = false;
+    /// The linked files were asked for in this view, once the user allowed the links to be
+    /// updated.
+    bool _linkedFilesAsked = false;
+    /// The list of linked files the kit answers next is the one this session asked for.
+    bool _linkedFilesListPending = false;
+    /// The kit was told that the storage gives the file the user picks for a new link.
+    bool _linkPicksEnabled = false;
+    /// The number of linked files given to the kit that it did not answer for yet.
+    int _linkedFileSourcesPending = 0;
+    /// The id of the pick of a file to link to that the kit asked the client for and the client
+    /// did not answer yet, or -1. The client keeps one such request at a time.
+    int _openLinkPick = -1;
+
+    /// The session is read-only only because the file has a view-only extension.
+    bool _isReadOnlyForViewFile = false;
+
+    /// The client draws from vector primitives and gets no tiles until it sends .uno:DrawFromTiles.
+    bool _isVectorRendering = false;
+
+    /// Session used to generate thumbnail
+    bool _thumbnailSession;
+
+    // Saves time from setting/fetching user info multiple times using zotero API
+    bool _isZoteroUserInfoSet = false;
+
+    /// If server audit was already sent
+    bool _sentAudit;
+
+    /// If browser setting was already sent
+    bool _sentBrowserSetting;
+
+    /// If Session is for convert-to
+    bool _isConvertTo;
+
+    /// True for a view through which another document reads this one: a headless connection,
+    /// whose load names a connection chain, or the view of a preview.
+    bool _isRemoteDocumentConnection;
+
+    /// True after a reconnect, until the browser's next load has refreshed the view.
+    bool _resyncOnNextLoad;
+
+    /// True from the resync of a reconnected view until the next status goes to the browser.
+    bool _nextStatusReattached;
+
+    /// True once a tile has gone to this session's client.
+    bool _firstTileSent;
+
+    Poco::SharedPtr<Poco::JSON::Object> _viewSettingsJSON;
+
+#if !MOBILEAPP || defined(QTAPP) || defined(MACOSAPP) || defined(_WIN32)
+    /// AI chat orchestrator - multi-round LLM tool loop.
+    std::unique_ptr<AIChatSession> _aiChat;
+#endif
+};
+
+/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

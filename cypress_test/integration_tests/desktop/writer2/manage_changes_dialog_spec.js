@@ -1,0 +1,68 @@
+/* global describe it cy beforeEach require expect */
+
+var helper = require('../../common/helper');
+var desktopHelper = require('../../common/desktop_helper');
+
+describe(['tagdesktop', 'tagnextcloud', 'tagscreenshot'], 'Manage Changes Dialog', function () {
+
+	beforeEach(function () {
+		helper.withoutBrandTheme();
+		helper.setupAndLoadDocument('writer/manage_tracking_changes.odt');
+		cy.getFrameWindow().then((win) => {
+			this.win = win;
+		});
+	});
+
+	it('Manage changes dialog visual test', function () {
+		cy.cGet('.notebookbar #Review-tab-label').click();
+		desktopHelper.openOverflowGroup('overflow-button-review-tracking');
+		desktopHelper.getNbIcon('AcceptTrackedChanges', 'Review').click();
+		cy.cGet('#AcceptRejectChangesDialog').should('be.visible');
+		cy.cGet('#writerchanges .ui-treeview-entry.ui-treeview-expandable[aria-level="1"] .ui-treeview-expander-column').click();
+		helper.processToIdle(this.win);
+		cy.cGet('#writerchanges .ui-treeview-entry.ui-treeview-expandable[aria-level="2"][aria-expanded="false"] .ui-treeview-expander-column')
+			.eq(0).click();
+		helper.processToIdle(this.win);
+		cy.cGet('#writerchanges .ui-treeview-entry.ui-treeview-expandable[aria-level="2"][aria-expanded="false"] .ui-treeview-expander-column')
+			.eq(0).click();
+		cy.cGet('#writerchanges').compareSnapshot('writer_manage_changes_tree', 0.1);
+		// test sort feature
+		cy.cGet('#writerchanges .ui-treeview-header-sort-icon').should('be.not.visible');
+		cy.cGet('#writerchanges .ui-treeview-header-button').contains('Author').click();
+		cy.cGet('#writerchanges .ui-treeview-header-sort-icon').should('be.visible');
+		cy.cGet('#sortbycombobox option:selected').should('have.text', 'Author');
+		cy.cGet('#writerchanges').compareSnapshot('writer_manage_changes_tree_sorted', 0.1);
+	});
+});
+
+describe(['tagdesktop'], 'Manage Changes Dialog comments', function () {
+
+	beforeEach(function () {
+		helper.setupAndLoadDocument('writer/writer-edit.fodt');
+		desktopHelper.switchUIToNotebookbar();
+		cy.getFrameWindow().then(function (win) {
+			this.win = win;
+		}.bind(this));
+	});
+
+	it('A change comment of several paragraphs shows on one line', function () {
+		cy.cGet('.notebookbar #Review-tab-label').click();
+		desktopHelper.openOverflowGroup('overflow-button-review-tracking');
+		desktopHelper.getNbIcon('AcceptTrackedChanges', 'Review').click();
+		cy.cGet('#AcceptRejectChangesDialog').should('be.visible');
+		helper.processToIdle(this.win);
+
+		// The comment of this change is "Comment deleted" followed by empty paragraphs.
+		cy.cGet('#writerchanges .ui-treeview-cell-text-content')
+			.should('have.length.greaterThan', 0)
+			.should(function ($cells) {
+				var comment = Array.from($cells).find(function (cell) {
+					return cell.textContent.startsWith('Comment deleted');
+				});
+				expect(comment, 'comment cell').to.exist;
+				Array.from($cells).forEach(function (cell) {
+					expect(cell.querySelector('br'), cell.textContent).to.be.null;
+				});
+			});
+	});
+});

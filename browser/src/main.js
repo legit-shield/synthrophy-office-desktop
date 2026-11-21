@@ -1,0 +1,458 @@
+/* -*- js-indent-level: 8 -*- */
+
+/*
+ * Copyright the Collabora Office contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/* global globalThis UIManager */
+/* global errorMessages accessToken accessTokenTTL noAuthHeader accessHeader createOnlineModule */
+/* global app $ host idleTimeoutSecs outOfFocusTimeoutSecs _ LocaleService LayoutingService DropFileOverlay */
+/* global ServerConnectionService */
+/*eslint indent: [error, "tab", { "outerIIFEBody": 0 }]*/
+
+(function (global) {
+
+
+var wopiParams = {};
+var wopiSrc = global.coolParams.get('WOPISrc');
+
+if (wopiSrc !== '' && accessToken !== '') {
+	wopiParams = { 'access_token': accessToken, 'access_token_ttl': accessTokenTTL };
+	if (noAuthHeader == "1" || noAuthHeader == "true") {
+		wopiParams.no_auth_header = noAuthHeader;
+	}
+}
+else if (wopiSrc !== '' && accessHeader !== '') {
+	wopiParams = { 'access_header': accessHeader };
+}
+
+// Debug-only: an explicit user id, sent as a WOPI param (a sibling of the
+// access token, NOT part of WOPISrc, so the doc key and collaboration are
+// unaffected). The test WOPI host reads it as the UserId. This lets us debug
+// multi-user scenarios that the single hard-coded test user cannot. An
+// explicit owner id goes the same way and names the OwnerId.
+if (window.enableDebug) {
+	var debugUserId = global.coolParams.get('userid');
+	if (wopiSrc !== '' && debugUserId)
+		wopiParams.userid = debugUserId;
+	const debugOwnerId = global.coolParams.get('ownerid');
+	if (wopiSrc !== '' && debugOwnerId)
+		wopiParams.ownerid = debugOwnerId;
+}
+
+var filePath = global.coolParams.get('file_path');
+
+app.localeService = new LocaleService();
+app.setPermission(global.coolParams.get('permission') || (window.mode.isInteractivePreview() ? 'readonly' : 'edit'));
+app.serverConnectionService = new ServerConnectionService();
+app.layoutingService = new LayoutingService();
+app.pendingOnDemandRenders = 0;
+app.pendingOnDemandRenderRequests = new Set();
+
+var timestamp = global.coolParams.get('timestamp');
+var target = global.coolParams.get('target') || '';
+// Should the document go inactive or not
+var alwaysActive = global.coolParams.get('alwaysactive');
+// Cool Debug mode
+var debugMode = global.coolParams.get('debug');
+
+var docURL, docParams;
+var isWopi = false;
+if (wopiSrc != '') {
+	docURL = decodeURIComponent(wopiSrc);
+	docParams = wopiParams;
+	isWopi = true;
+} else {
+	docURL = filePath;
+	docParams = {};
+}
+
+var notWopiButIframe = global.coolParams.get('NotWOPIButIframe') != '';
+var map = window.L.map('map', {
+	server: host,
+	doc: docURL,
+	docParams: docParams,
+	timestamp: timestamp,
+	docTarget: target,
+	documentContainer: 'document-container',
+	debug: debugMode,
+	// the wopi and wopiSrc properties are in sync: false/true : empty/non-empty
+	wopi: isWopi,
+	wopiSrc: wopiSrc,
+	notWopiButIframe: notWopiButIframe,
+	alwaysActive: alwaysActive,
+	idleTimeoutSecs: idleTimeoutSecs,  // Dim when user is idle.
+	outOfFocusTimeoutSecs: outOfFocusTimeoutSecs, // Dim after switching tabs.
+});
+
+////// Controls /////
+
+window.L.Map.THIS = map;
+app.map = map;
+
+map.uiManager = new UIManager();
+map.addControl(map.uiManager);
+if (!window.L.Browser.cypressTest || global.coolParams.get('tooltips') === 'true') {
+	map.tooltip = window.L.control.tooltip();
+	// An open dropdown shows what its button offers, so the button's tooltip goes at once.
+	map.on('dropdownopen', function () { map.tooltip.dismiss(); });
+}
+
+app.idleHandler.map = map;
+
+// The native shell toggles these while a file is dragged over the window, so
+// they must exist in both the starter screen and an open document.
+app.showDropOverlay = function () { DropFileOverlay.show(); };
+app.hideDropOverlay = function () { DropFileOverlay.hide(); };
+
+if (window.coolParams.get('starterMode')) {
+	if (window.ThisIsTheQtApp && !window.bridgeReady) {
+		window.addEventListener('bridgeready', () => {
+			map.uiManager.initializeBackstageView();
+		}, { once: true });
+	} else {
+		map.uiManager.initializeBackstageView();
+	}
+	return;
+}
+
+var initEmscriptenModule = function(docKind, docDescriptor) {
+	globalThis.Module = { arguments: [docKind, docDescriptor] };
+	globalThis.Module.onRuntimeInitialized = function() {
+		map.loadDocument(global.socket);
+	};
+	createOnlineModule(globalThis.Module);
+};
+
+var initUI = function() {
+	if (window.coolParams.get('welcome'))
+		map.uiManager.initializeNonInteractiveUI();
+	else
+		map.uiManager.initializeBasicUI();
+
+	if (wopiSrc === '' && filePath === '' && !window.ThisIsAnApp) {
+		map.uiManager.showInfoModal('wrong-wopi-src-modal', '', errorMessages.wrongwopisrc, '', _('OK'), null, false);
+	}
+	if (host === '' && !window.ThisIsAnApp) {
+		map.uiManager.showInfoModal('empty-host-url-modal', '', errorMessages.emptyhosturl, '', _('OK'), null, false);
+	}
+};
+
+const _codaUpload = function(fileBytes, force) {
+	const ws = global.collab.ws;
+	const info = window._codaRemoteInfo;
+	if (!info || (ws && ws.readyState !== WebSocket.CLOSED))
+		return global.collab.uploadFile(fileBytes, force);
+
+	return global.collab.connect(info.wopiSrc, info.accessToken, info.coolServer).then(function() {
+		// A restarted coolwsd no longer knows that we are editing.
+		if (!global.collab.editingActive)
+			window.collab.sendMessage({type: 'editing_started'}); 
+		return global.collab.uploadFile(fileBytes, force);
+	});
+};
+
+// Local save callback shared by COWASM and CODA remote-doc paths.
+// Both flavours have already saved the document bytes locally; this
+// pushes them up to the integrator via /co/collab/put, then runs any
+// queued "save-and-switch-to-server-mode" hand-off.
+var _codaUploadOnSave = function(fileBytes, tag, force) {
+	window.app.console.log(tag + ': uploading ' + fileBytes.length + ' bytes');
+	map.fire('showbusy', {label: _('Saving...')});
+	return _codaUpload(fileBytes, force).then(function() {
+		window.app.console.log(tag + ': upload completed');
+		map.fire('hidebusy');
+		if (window._switchToServerAfterSave) {
+			window._switchToServerAfterSave = false;
+			window.app.console.log(tag + ': switching to server mode after save');
+			window.collab.sendMessage({type: 'saved_and_switching'});
+			window.switchToServerMode();
+		}
+	}).catch(function(err) {
+		window.app.console.error(tag + ': upload failed: ' + err.message);
+		map.fire('hidebusy');
+		// Stay with the local document, which is the only copy of the changes:
+		err.wasSwitching = window._switchToServerAfterSave;
+		window._switchToServerAfterSave = false;
+		throw err;
+	});
+};
+
+// Common per-doc collab-notification wiring (peer joins, peer-driven
+// switch requests, etc.).  Used by both COWASM and CODA after the
+// /co/collab fetch resolves.
+var _codaWireCollabNotifications = function() {
+	// If a collaborative editing session is already active, ask the
+	// new user whether they want to join.  Defer to the next tick
+	// after updatepermission, because _enterReadOnlyMode fires
+	// closealldialogs right after updatepermission.
+	if (global.collab.editingActive) {
+		var showCollabDialog = function () {
+			app.events.off('updatepermission', showCollabDialog);
+			setTimeout(function () {
+				map._onCollabEditingActive();
+			}, 0);
+		};
+		app.events.on('updatepermission', showCollabDialog);
+	}
+
+	global.collab.addNotificationListener(function(msg) {
+		if (msg.type === 'editing_started' && msg.user) {
+			map._onOtherUserEditingStarted(
+				msg.user.name || msg.user.id,
+				msg.user.avatar);
+		} else if (msg.type === 'switch_to_collab') {
+			map._onSwitchToCollabRequest(msg.user ? msg.user.name || msg.user.id : '');
+		} else if (msg.type === 'saved_and_switching') {
+			map._onEditorSavedAndSwitching();
+		} else if (msg.type === 'user_left') {
+			map._onCollabUserLeft();
+		} else if (msg.type === 'user_joined' && msg.user) {
+			map._onCollabUserJoined(msg.user.name || msg.user.id, msg.user.avatar);
+		}
+	});
+};
+
+if (window.ThisIsTheQtApp || window.ThisIsTheWindowsApp || window.codaRemotePage) {
+	// A CODA-Q remote doc in local-edit mode uploads before the host hears the result.
+	map.on('commandresult', function(ev) {
+		if (ev.commandName !== '.uno:Save')
+			return;
+		// A save with nothing to write reports failure with this result.
+		var unmodified = ev.result && ev.result.value === 'unmodified';
+		if (!ev.success && !unmodified) {
+			// The engine puts the reason of a failed save in the result.
+			map._nativeSaveFailed(ev.isAutosave, ev.result && ev.result.value);
+			return;
+		}
+		var done = function() {
+			map._nativeSaveSucceeded(ev.isAutosave);
+		};
+		const isLocalEdit = window._codaRemoteInfo && !global.collab.switchedToServer;
+		if (unmodified || !window.bridge || !isLocalEdit) {
+			done();
+			return;
+		}
+		new Promise(function(r) {
+			window.bridge.readLocalDocBytes(r);
+		}).then(function(b64) {
+			if (!b64) {
+				done();
+				return;
+			}
+			var bin = atob(b64);
+			var arr = new Uint8Array(bin.length);
+			for (var i = 0; i < bin.length; i++)
+				arr[i] = bin.charCodeAt(i);
+			const force = window._codaForceNextUpload;
+			window._codaForceNextUpload = false;
+			_codaUploadOnSave(arr, 'CODA', force).then(done, (err) => {
+				// A save that a switch to server mode asked for always gets its prompt (the
+				// in-process server can report it as its autosave, when it joined one):
+				map._nativeSaveFailed(
+					ev.isAutosave && !err.wasSwitching, err.message,
+					err.status === 409 ? {wasSwitching: err.wasSwitching} : undefined);
+			});
+		}, done);
+	});
+}
+
+// Every Qt page has window.bridge over the web channel. On the other apps,
+// only a remote page in an integrator's editor frame has one.
+const opensThroughBridge = window.ThisIsTheQtApp || !!window.codaRemotePage;
+
+if (window.ThisIsTheEmscriptenApp) {
+	// Ensure the access token is available on the global object
+	// for switchToServerMode (AppInitializer does not set
+	// window.accessToken, unlike BrowserAppInitializer).
+	if (typeof accessToken !== 'undefined') {
+		global.accessToken = accessToken;
+		global.accessTokenTTL = accessTokenTTL;
+	}
+
+	if (isWopi) {
+		// Use collab WebSocket endpoint to get a download URL
+		var docParamsString = $.param(docParams);
+		var docParamsPart = docParamsString ? (docURL.includes('?') ? '&' : '?') + docParamsString : '';
+		var fullDocUrl = docURL + docParamsPart;
+
+		// Set up save callback before initializing the module.
+		// The C++ saveToServer() calls this via MAIN_THREAD_EM_ASM
+		// with the file bytes.
+		globalThis.collabSaveToServer = function(fileBytes) {
+			_codaUploadOnSave(fileBytes, 'WASM').catch(() => {});
+		};
+
+		global.collab.fetchFile(fullDocUrl, accessToken).then(function(result) {
+			window.app.console.log('WASM: Using collab fetch URL: ' + result.url);
+			if (result.filename) {
+				map['wopi'].BaseFileName = result.filename;
+				map['wopi'].BreadcrumbDocName = result.filename;
+				globalThis.collabFilename = result.filename;
+			}
+			initUI();
+			initEmscriptenModule('collab', result.url);
+			_codaWireCollabNotifications();
+		}).catch(function(err) {
+			if (err.cleanExport === false) {
+				window.app.console.log('WASM: no local copy allowed, opening through the server');
+				initUI();
+				window.switchToServerMode();
+				return;
+			}
+			window.app.console.error('WASM: Collab fetch failed: ' + err.message + ', falling back to direct fetch');
+			initUI();
+			// Fallback to old /wasm/ endpoint
+			var encodedWOPI = encodeURIComponent(fullDocUrl);
+			initEmscriptenModule('server', encodedWOPI);
+		});
+	} else {
+		initUI();
+		// Local file, use directly
+		initEmscriptenModule('local', docURL);
+	}
+} else if (opensThroughBridge) {
+	// The page opens its document through window.bridge. For a remote document, getRemoteInfo
+	// returns the WOPI values (wopiSrc, accessToken, coolServer, coolPath). The page fetches the
+	// file through /co/collab and hands the bytes to native code with writeRemoteDocFile, so the
+	// engine loads them through the standard fake socket. A local document takes the default
+	// path: initUI and map.loadDocument.
+	var _codaBridgeBootstrap = function() {
+		const remoteInfo = new Promise(function(resolve) {
+			window.bridge.getRemoteInfo(resolve);
+		});
+
+		remoteInfo.then(function(infoJson) {
+			if (!infoJson) {
+				// Local-only document: standard path.
+				initUI();
+				map.loadDocument(global.socket);
+				return;
+			}
+			var info = JSON.parse(infoJson);
+			// Cache for Permission.js's switchToServerMode override,
+			// which rebuilds the cool-server /cool/ws URL from these
+			// values.
+			window._codaRemoteInfo = info;
+			window.app.console.log('CODA: remote doc, wopiSrc=' + info.wopiSrc);
+			global.collab.fetchFile(info.wopiSrc, info.accessToken, info.coolServer).then(function(result) {
+				if (!result.filename)
+					throw new Error('CheckFileInfo returned an empty BaseFileName');
+
+				// The file properties come before initUI, so controls such as Share follow them.
+				if (result.fileInfo) {
+					window.codaRemoteFileInfo = result.fileInfo;
+					if (!result.fileInfo.UserCanWrite)
+						app.setPermission('readonly');
+					map.fire('wopiprops', result.fileInfo);
+				} else {
+					// coolwsd sends the file properties since I8848669273ed6b50d8869b25fa32f9ef654c1b8f.
+					map.once('docloaded', function() {
+						const text = _('This server is too old for %APP, so some features may not work.');
+						const advice = _('Please ask the administrator to update it.');
+						const message = text.replace('%APP', window.brandProductName) + ' ' + advice;
+						map.uiManager.showSnackbar(message, null, null, -1, false, true);
+					});
+				}
+				initUI();
+				window.app.console.log('CODA: fetch URL: ' + result.url);
+				map['wopi'].BaseFileName = result.filename;
+				map['wopi'].BreadcrumbDocName = result.filename;
+				return fetch(result.url).then(function(r) {
+					if (!r.ok)
+						throw new Error('GET ' + result.url + ' returned ' + r.status);
+					return r.arrayBuffer();
+				}).then(function(buf) {
+					// The bridge carries text, so the body crosses to native code as base64.
+					var bytes = new Uint8Array(buf);
+					var binary = '';
+					for (var i = 0; i < bytes.length; i++)
+						binary += String.fromCharCode(bytes[i]);
+					var b64 = btoa(binary);
+					return new Promise(function(r) {
+						window.bridge.writeRemoteDocFile(result.filename, b64, r);
+					});
+				}).then(function(localPath) {
+					if (!localPath)
+						throw new Error('the app could not write a local copy of the document');
+					window.app.console.log('CODA: wrote local temp file ' + localPath);
+					// Point the FakeWebSocket's load message at the
+					// just-written file before opening the socket.
+					global.docURL = 'file://' + localPath;
+					map.options.doc = global.docURL;
+					document.title = result.filename + ' - ' + window.brandProductName;
+					// Mirror the auto-fire in global.js (now gated on
+					// docURL being non-empty): now that we have a path,
+					// kick HULLO + the FakeWebSocket's onopen so
+					// coolwsd gets a non-empty 'load url=' message.
+					// Must happen *before* map.loadDocument hands the
+					// socket to app.socket.connect, which replaces
+					// onopen without firing it.
+					window.postMobileMessage('HULLO');
+					global.socket.onopen();
+					map.loadDocument(global.socket);
+					_codaWireCollabNotifications();
+				});
+			}).catch(function(err) {
+				if (err && err.cleanExport === false) {
+					window.app.console.log('CODA: no local copy allowed, opening through the server');
+					window.switchToServerMode();
+					return;
+				}
+				var msg = err && err.message ? err.message : String(err);
+				window.app.console.error(
+					'CODA: remote bootstrap failed: ' + msg);
+				// Surface the failure as a native error dialog on the
+				// doc window rather than just a console message: the
+				// page has no visible affordance to report it, so the
+				// window would otherwise sit on its pre-load screen.
+				window.postMobileMessage(
+					'REMOTEBOOTSTRAPFAILED ' + msg);
+			});
+		});
+	};
+	if (window.bridgeReady)
+		_codaBridgeBootstrap();
+	else
+		window.addEventListener('bridgeready', _codaBridgeBootstrap);
+} else {
+	initUI();
+	map.loadDocument(global.socket);
+}
+
+window.addEventListener('beforeunload', function () {
+	if (map && app.socket) {
+		if (app.map)
+			app.map.acceptPendingCellEdit();
+		// A preference changed in the last few seconds is still waiting in the
+		// batch, so send it before the socket closes below.
+		window.prefs.sendPendingBrowserSettingsUpdate();
+		if (app.socket.setUnloading)
+			app.socket.setUnloading();
+		app.socket.close();
+	}
+});
+
+window.bundlejsLoaded = true;
+
+
+////// Unsupported Browser Warning /////
+
+var uaLowerCase = navigator.userAgent.toLowerCase();
+if (uaLowerCase.indexOf('msie') != -1 || uaLowerCase.indexOf('trident') != -1) {
+	map.uiManager.showInfoModal(
+		'browser-not-supported-modal', '',
+		_('Warning! The browser you are using is not supported.'),
+		'', _('OK'), null, false);
+}
+
+if (window.ThisIsAnApp && !window.ThisIsTheEmscriptenApp && !window.ThisIsTheiOSApp && !window.ThisIsTheAndroidApp)
+	window.postMobileMessage('SYNCSETTINGS');
+
+}(window));

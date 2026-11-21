@@ -1,0 +1,294 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * window.L.Map.StateChanges stores the state changes commands coming from core
+ * LOK_CALLBACK_STATE_CHANGED callback
+ */
+/* global $ app cool _ RenderManager HandleTravel PreviewEditSection OverviewPreviewsSection OverviewNavigation RenderGeometrySection */
+/*eslint no-extend-native:0*/
+window.L.Map.mergeOptions({
+	stateChangeHandler: true
+});
+
+window.L.Map.StateChangeHandler = window.L.Handler.extend({
+
+	initialize: function (map) {
+		this._map = map;
+		// Contains the items for which state will be tracked
+		// Stores the last received value from core ('true', 'false', 'enabled', 'disabled')
+		this._items = {};
+	},
+
+	addHooks: function () {
+		this._map.on('commandstatechanged', this._onStateChanged, this);
+	},
+
+	removeHooks: function () {
+		this._map.off('commandstatechanged', this._onStateChanged, this);
+	},
+
+	_onStateChanged: function(e) {
+		if (e.uiOnly) {
+			// A UI-only override from our JS code for an editeng widget, ignore that.
+			return;
+		}
+
+		var slideMasterPageItem = this._map['stateChangeHandler'].getItemValue('.uno:SlideMasterPage');
+		var state;
+
+		if (typeof (e.state) == 'object') {
+			state = e.state;
+		} else if (typeof (e.state) == 'string') {
+			state = e.state; // fallback if we don't find JSON
+
+			var firstIndex = state.indexOf('{');
+			var lastIndex = state.lastIndexOf('}');
+
+			if (firstIndex !== -1 && lastIndex !== -1) {
+				const substring = state.substring(firstIndex, lastIndex + 1);
+				try {
+					state = JSON.parse(substring);
+				} catch (e) {
+					console.error('Failed to parse state JSON: "' + substring + '" : ' + e);
+				}
+			}
+		}
+		const commandName = this.ensureUnoCommandPrefix(e.commandName);
+
+		// How fast a cursor blinks on the desktop of the person using this, which whatever the
+		// client draws blinking follows, so that it all blinks together.
+		if (commandName === '.uno:CursorBlinkTime') {
+			HandleTravel.setBlinkTime(parseInt(state, 10));
+			return;
+		}
+
+		this._items[commandName] = state;
+		if (e.commandName === '.uno:CurrentTrackedChangeId') {
+			var redlineId = 'change-' + state;
+			const annotations = app.sectionContainer.getSectionWithName(app.CSections.CommentList.name);
+			if (annotations) annotations.selectById(redlineId);
+			else console.error('_onStateChanged: section "CommentList" missing');
+			// sent on a move to the next or the previous change
+			this._map.fire('trackedchangereached');
+		}
+
+		// the form controls are objects in design mode and controls out of it, so a switch of the
+		// mode asks the hit test again and draws the page anew; the switch itself shows only where
+		// the office reports a mode
+		if (commandName === '.uno:SwitchControlDesignMode') {
+			if (RenderManager.isVectorRendering())
+				RenderGeometrySection.formControlModeChanged();
+			this._map.showFormControlDesignModeSwitch();
+		}
+
+		if (e.commandName === '.uno:SlideMasterPage') {
+			const mode = (state === true || state === 'true') ? 1 : 0;
+			app.activeDocument.activeModes = [mode];
+
+			// A vector-rendered view draws the page the mode names, so the
+			// new mode has to reach the canvas as a repaint.
+			if (RenderManager.isVectorRendering() && app.sectionContainer)
+				app.sectionContainer.requestReDraw();
+		}
+
+		if (e.commandName === '.uno:FormatPaintbrush') {
+			if (state === 'true')
+				$('#document-canvas').addClass('bucket-cursor');
+			else {
+				$('#document-canvas').removeClass('bucket-cursor');
+			}
+		}
+
+		if (e.commandName === '.uno:StartWithPresentation' && (state === true || state === 'true')) {
+			let startPresentationParam = window.coolParams.get('startPresentation');
+			if (startPresentationParam === '' || startPresentationParam === 'true' || startPresentationParam === '1') {
+				app.dispatcher.dispatch('presentation');
+			}
+		}
+
+		if (e.commandName === '.uno:LeftRightParaMargin') {
+			if (app.UI.horizontalRuler) app.UI.horizontalRuler._updateParagraphIndentations();
+			if (app.UI.verticalRuler) app.UI.verticalRuler._updateParagraphIndentations();
+		}
+
+		if (commandName == '.uno:PageLinks') {
+			let links = [];
+			if (state && state.links) {
+				for (const link of state.links) {
+					const end1 = link.rectangle.indexOf('x');
+					const end2 = link.rectangle.indexOf('@');
+					const end3 = link.rectangle.indexOf(',');
+					const new_link = {
+						rectangle: new cool.SimpleRectangle(
+							parseFloat(link.rectangle.substring(end2 + 2, end3)),
+							parseFloat(link.rectangle.substring(end3 + 1)),
+							parseFloat(link.rectangle.substring(0, end1)),
+							parseFloat(link.rectangle.substring(end1 + 1, end2))
+						),
+						uri: link.uri
+					};
+					links.push(new_link);
+				}
+			}
+			this._items[commandName] = links;
+		}
+
+		if (commandName == '.uno:CanvasPageVisArea') {
+			if (!OverviewNavigation.consumeLandingRequest()) {
+				const x = parseInt(state.x);
+				const y = parseInt(state.y);
+
+				const point = new cool.SimplePoint(x, y);
+				app.activeDocument.activeLayout.setOverviewPageVisArea(point);
+			}
+		}
+
+		if (commandName == '.uno:CanvasPageCenter') {
+			if (!OverviewNavigation.consumeLandingRequest()) {
+				const pageCenterX = app.activeDocument.fileSize.x / 2;
+				const pageCenterY = app.activeDocument.fileSize.y / 2;
+
+				const viewedRect = app.activeDocument.activeLayout.viewedRectangle;
+
+				// Calculate the top-left position that would center the view on the page center
+				const scrollX = pageCenterX - (viewedRect.width / 2);
+				const scrollY = pageCenterY - (viewedRect.height / 2);
+
+				const scrollPoint = new cool.SimplePoint(scrollX, scrollY);
+				app.activeDocument.activeLayout.scrollTo(scrollPoint.pX, scrollPoint.pY);
+			}
+		}
+
+		if (commandName == '.uno:HasOverviewPage') {
+			app.impress.hasOverviewPage = e.state === "true";
+		}
+
+		if (commandName == '.uno:CanvasPreviewRects') {
+			const previews = [];
+			if (state && state.previews) {
+				for (const preview of state.previews) {
+					previews.push({
+						part: parseInt(preview.part),
+						rectangle: new cool.SimpleRectangle(
+							parseInt(preview.x),
+							parseInt(preview.y),
+							parseInt(preview.width),
+							parseInt(preview.height),
+						),
+					});
+				}
+			}
+			app.impress.previewRects = previews;
+			OverviewPreviewsSection.ensure();
+			app.sectionContainer.requestReDraw();
+			this._map.fire('canvaspreviewrects');
+		}
+
+		if (commandName == '.uno:PreviewEditMode') {
+			if (state && state.active) {
+				app.impress.previewEditMode = {
+					active: true,
+					part: parseInt(state.part),
+					rectangle: new cool.SimpleRectangle(
+						parseInt(state.x),
+						parseInt(state.y),
+						parseInt(state.width),
+						parseInt(state.height),
+					),
+					slideWidth: parseInt(state.slideWidth),
+					slideHeight: parseInt(state.slideHeight),
+				};
+			} else {
+				app.impress.previewEditMode = {
+					active: false,
+					part: -1,
+					rectangle: null,
+					slideWidth: 0,
+					slideHeight: 0,
+				};
+			}
+			if (app.impress.previewEditMode.active) {
+				PreviewEditSection.ensure();
+				// The bar teaches the way out; re-showing on a preview switch updates the
+				// slide number.
+				if (this._previewEditHintShown) app.map.uiManager.closeSnackbar();
+				app.map.uiManager.showSnackbar(
+					_('Editing slide %1 - click outside or press Esc to finish').replace(
+						'%1',
+						String(app.impress.previewEditMode.part),
+					),
+					null,
+					null,
+					-1,
+					false,
+					true,
+				);
+				this._previewEditHintShown = true;
+			} else {
+				PreviewEditSection.remove();
+				if (this._previewEditHintShown) {
+					app.map.uiManager.closeSnackbar();
+					this._previewEditHintShown = false;
+				}
+			}
+			app.sectionContainer.requestReDraw();
+			this._map.fire('previeweditmode');
+		}
+
+		if (commandName == '.uno:PreviewShapeSelection') {
+			if (state && state.empty === false) {
+				app.impress.previewShapeSelection = new cool.SimpleRectangle(
+					parseInt(state.x),
+					parseInt(state.y),
+					parseInt(state.width),
+					parseInt(state.height),
+				);
+			} else {
+				app.impress.previewShapeSelection = null;
+			}
+			if (app.sectionContainer.doesSectionExist(app.CSections.PreviewEdit.name))
+				app.sectionContainer.requestReDraw();
+			this._map.fire('previewshapeselection');
+		}
+
+		const docContainer = document.getElementById('document-container');
+		if (!docContainer) {
+			window.app.console.warn('HTML element with ID document-container doesn\'t exist.');
+			return;
+		}
+		docContainer.classList.remove('slide-master-mode');
+		docContainer.classList.add('slide-normal-mode');
+		if (slideMasterPageItem) {
+			docContainer.classList.remove('slide-normal-mode');
+			docContainer.classList.add('slide-master-mode');
+		}
+		if (!slideMasterPageItem || slideMasterPageItem == 'false' || slideMasterPageItem == 'undefined') {
+			docContainer.classList.remove('slide-master-mode');
+			docContainer.classList.add('slide-normal-mode');
+		}
+	},
+
+	getItems: function() {
+		return this._items;
+	},
+
+	getItemValue: function(unoCmd) {
+		unoCmd = this.ensureUnoCommandPrefix(unoCmd);
+
+		return this._items[unoCmd];
+	},
+
+	setItemValue: function(unoCmd, value) {
+		unoCmd = this.ensureUnoCommandPrefix(unoCmd);
+
+		this._items[unoCmd] = value;
+	},
+
+	ensureUnoCommandPrefix(unoCmd) {
+		if (unoCmd && unoCmd.substring(0, 5) !== '.uno:') {
+			return '.uno:' + unoCmd;
+		}
+		return unoCmd;
+	}
+});
+
+window.L.Map.addInitHook('addHandler', 'stateChangeHandler', window.L.Map.StateChangeHandler);
